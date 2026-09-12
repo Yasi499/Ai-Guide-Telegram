@@ -10,8 +10,6 @@ const TELEGRAM_API = BOT_TOKEN
 // ПАМЯТЬ
 // =====================================================
 
-// globalThis помогает сохранить память,
-// пока Vercel instance остаётся живым.
 const conversations =
   globalThis.__geminiConversations || new Map();
 
@@ -21,7 +19,7 @@ const MAX_HISTORY_MESSAGES = 12;
 
 
 // =====================================================
-// TELEGRAM API
+// TELEGRAM
 // =====================================================
 
 async function tg(method, payload) {
@@ -38,12 +36,12 @@ async function tg(method, payload) {
   });
 
   if (!response.ok) {
-    const errorText = await response.text();
+    const text = await response.text();
 
     console.error(
       "Telegram API error:",
       response.status,
-      errorText
+      text
     );
 
     throw new Error("Telegram API error");
@@ -53,30 +51,20 @@ async function tg(method, payload) {
 }
 
 
-// =====================================================
-// ОТПРАВКА СООБЩЕНИЯ
-// =====================================================
-
 async function sendMessage(chatId, text) {
   if (!text) {
     text = "Не удалось получить ответ.";
   }
 
   for (let i = 0; i < text.length; i += 4000) {
-    const part = text.slice(i, i + 4000);
-
     await tg("sendMessage", {
       chat_id: chatId,
-      text: part,
+      text: text.slice(i, i + 4000),
       disable_web_page_preview: true
     });
   }
 }
 
-
-// =====================================================
-// ПАУЗА
-// =====================================================
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -120,101 +108,615 @@ function clearHistory(chatId) {
 
 
 // =====================================================
-// НУЖЕН ЛИ GOOGLE SEARCH?
+// ОПРЕДЕЛЕНИЕ ТИПА ЗАПРОСА
 // =====================================================
 
-function needsWebSearch(text) {
+function isWeatherRequest(text) {
   const t = text.toLowerCase();
 
-  const searchPatterns = [
-    // ПОГОДА
-    /погода/,
-    /температур/,
-    /дожд/,
-    /снег/,
-    /ветер/,
-    /прогноз погод/,
-    /weather/,
-    /temperature/,
-    /forecast/,
+  return (
+    /погод/.test(t) ||
+    /температур/.test(t) ||
+    /дожд/.test(t) ||
+    /дощ/.test(t) ||
+    /снег/.test(t) ||
+    /сніг/.test(t) ||
+    /weather/.test(t) ||
+    /forecast/.test(t)
+  );
+}
 
-    // НОВОСТИ / СВЕЖИЕ СОБЫТИЯ
-    /новост/,
-    /последние событ/,
-    /свежие событ/,
-    /что произошло сегодня/,
-    /что случилось сегодня/,
-    /останні новини/,
-    /новини/,
-    /latest news/,
-    /breaking news/,
-    /what happened today/,
 
-    // ТЕКУЩЕЕ ВРЕМЯ
-    /сколько сейчас времени/,
-    /который сейчас час/,
-    /который час/,
-    /скільки зараз часу/,
-    /котра година/,
-    /current time/,
-    /what time is it/,
-    /time in /,
+function isTimeRequest(text) {
+  const t = text.toLowerCase();
 
-    // КУРСЫ / ЦЕНЫ
-    /курс доллар/,
-    /курс евро/,
-    /курс валют/,
-    /курс гривн/,
-    /цена биткоин/,
-    /курс биткоин/,
-    /bitcoin price/,
-    /btc price/,
-    /ethereum price/,
-    /eth price/,
-    /current price/,
-    /акции сегодня/,
-    /stock price/,
+  return (
+    /который час/.test(t) ||
+    /сколько сейчас времени/.test(t) ||
+    /скільки зараз часу/.test(t) ||
+    /котра година/.test(t) ||
+    /який зараз час/.test(t) ||
+    /what time/.test(t) ||
+    /current time/.test(t)
+  );
+}
 
-    // СПОРТ
-    /кто выиграл/,
-    /кто победил/,
-    /результат матч/,
-    /счёт матч/,
-    /счет матч/,
-    /последний матч/,
-    /таблица чемпионата/,
-    /турнирная таблица/,
-    /who won/,
-    /match result/,
-    /latest match/,
-    /score /,
 
-    // ИГРЫ / ОБНОВЛЕНИЯ
-    /последнее обновление/,
-    /новое обновление/,
-    /вышло обновление/,
-    /патч/,
-    /обновление fortnite/,
-    /новости fortnite/,
-    /фортнайт новости/,
-    /fortnite news/,
-    /fortnite update/,
-    /fortnite patch/,
+function isCurrencyRequest(text) {
+  const t = text.toLowerCase();
 
-    // ЯВНАЯ ПРОСЬБА ПОИСКАТЬ
-    /найди в интернете/,
-    /поищи в интернете/,
-    /проверь в интернете/,
-    /найди в гугле/,
-    /погугли/,
-    /пошукай в інтернеті/,
-    /перевір в інтернеті/,
-    /search the web/,
-    /search online/,
-    /google it/
+  return (
+    /курс/.test(t) ||
+    /доллар/.test(t) ||
+    /долар/.test(t) ||
+    /евро/.test(t) ||
+    /євро/.test(t) ||
+    /гривн/.test(t) ||
+    /usd/.test(t) ||
+    /uah/.test(t) ||
+    /eur/.test(t) ||
+    /gbp/.test(t)
+  );
+}
+
+
+function needsGoogleSearch(text) {
+  const t = text.toLowerCase();
+
+  return (
+    /новост/.test(t) ||
+    /новини/.test(t) ||
+    /последние событ/.test(t) ||
+    /останні події/.test(t) ||
+    /что произошло сегодня/.test(t) ||
+    /що сталося сьогодні/.test(t) ||
+    /latest news/.test(t) ||
+    /breaking news/.test(t) ||
+    /fortnite news/.test(t) ||
+    /новости fortnite/.test(t) ||
+    /новини fortnite/.test(t) ||
+    /найди в интернете/.test(t) ||
+    /поищи в интернете/.test(t) ||
+    /пошукай в інтернеті/.test(t) ||
+    /search the web/.test(t)
+  );
+}
+
+
+// =====================================================
+// ИЗВЛЕЧЕНИЕ ГОРОДА
+// =====================================================
+
+function simpleLocationFromText(text) {
+  let location = text;
+
+  location = location.replace(
+    /какая|какой|какая сейчас|сейчас|погода|погоде|температура|температуру|прогноз|weather|forecast|который час|сколько сейчас времени|скільки зараз часу|котра година|який зараз час|what time is it|current time/gi,
+    " "
+  );
+
+  location = location.replace(
+    /\b(в|во|у|in|at)\b/gi,
+    " "
+  );
+
+  location = location.replace(/[?!.,]/g, " ");
+
+  return location
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+
+// =====================================================
+// GEMINI — НОРМАЛИЗУЕТ НАЗВАНИЕ ГОРОДА
+// =====================================================
+
+async function normalizeLocation(userText) {
+  const fallback =
+    simpleLocationFromText(userText);
+
+  if (!GEMINI_API_KEY) {
+    return fallback;
+  }
+
+  const prompt = `
+Extract only the geographical location from this message.
+
+Return only a normal city/location name suitable for a geocoding API.
+Do not explain anything.
+
+Examples:
+"Какая погода в Полтаве?" -> Poltava
+"погода киев" -> Kyiv
+"Который час в Нью Йорке?" -> New York
+"котра година у Львові" -> Lviv
+
+Message:
+${userText}
+`;
+
+  const models = [
+    "gemini-3.8-flash",
+    "gemini-3.5-flash"
   ];
 
-  return searchPatterns.some(pattern => pattern.test(t));
+  for (const model of models) {
+    try {
+      const response = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "x-goog-api-key": GEMINI_API_KEY
+          },
+          body: JSON.stringify({
+            contents: [
+              {
+                role: "user",
+                parts: [
+                  {
+                    text: prompt
+                  }
+                ]
+              }
+            ],
+            generationConfig: {
+              temperature: 0,
+              maxOutputTokens: 50
+            }
+          })
+        }
+      );
+
+      if (!response.ok) {
+        continue;
+      }
+
+      const data = await response.json();
+
+      const result =
+        data.candidates?.[0]?.content?.parts
+          ?.map(p => p.text || "")
+          .join("")
+          .trim();
+
+      if (result) {
+        return result
+          .replace(/^["']|["']$/g, "")
+          .trim();
+      }
+
+    } catch (error) {
+      console.error(
+        "Location normalize error:",
+        error
+      );
+    }
+  }
+
+  return fallback;
+}
+
+
+// =====================================================
+// ПОИСК ГОРОДА — OPEN METEO
+// =====================================================
+
+async function geocodeLocation(userText) {
+  const locationName =
+    await normalizeLocation(userText);
+
+  if (!locationName) {
+    return null;
+  }
+
+  const url =
+    "https://geocoding-api.open-meteo.com/v1/search" +
+    `?name=${encodeURIComponent(locationName)}` +
+    "&count=1" +
+    "&language=en" +
+    "&format=json";
+
+  try {
+    const response = await fetch(url);
+
+    if (!response.ok) {
+      return null;
+    }
+
+    const data = await response.json();
+
+    const result =
+      data.results?.[0];
+
+    if (!result) {
+      return null;
+    }
+
+    return {
+      name: result.name,
+      country: result.country,
+      admin1: result.admin1,
+      latitude: result.latitude,
+      longitude: result.longitude,
+      timezone: result.timezone
+    };
+
+  } catch (error) {
+    console.error(
+      "Geocoding error:",
+      error
+    );
+
+    return null;
+  }
+}
+
+
+// =====================================================
+// ПОГОДА
+// =====================================================
+
+function weatherCodeToText(code) {
+  const codes = {
+    0: "ясно",
+    1: "в основном ясно",
+    2: "переменная облачность",
+    3: "пасмурно",
+
+    45: "туман",
+    48: "изморозь и туман",
+
+    51: "лёгкая морось",
+    53: "морось",
+    55: "сильная морось",
+
+    61: "небольшой дождь",
+    63: "дождь",
+    65: "сильный дождь",
+
+    71: "небольшой снег",
+    73: "снег",
+    75: "сильный снег",
+
+    80: "небольшие ливни",
+    81: "ливни",
+    82: "сильные ливни",
+
+    95: "гроза",
+    96: "гроза с градом",
+    99: "сильная гроза с градом"
+  };
+
+  return codes[code] || "неизвестные погодные условия";
+}
+
+
+async function getWeather(userText) {
+  const place =
+    await geocodeLocation(userText);
+
+  if (!place) {
+    return (
+      "⚠️ Я не смог определить город.\n\n" +
+      "Например напиши:\n" +
+      "Какая погода в Полтаве?"
+    );
+  }
+
+  const url =
+    "https://api.open-meteo.com/v1/forecast" +
+    `?latitude=${place.latitude}` +
+    `&longitude=${place.longitude}` +
+    "&current=" +
+    [
+      "temperature_2m",
+      "relative_humidity_2m",
+      "apparent_temperature",
+      "precipitation",
+      "weather_code",
+      "wind_speed_10m"
+    ].join(",") +
+    "&timezone=auto";
+
+  try {
+    const response = await fetch(url);
+
+    if (!response.ok) {
+      throw new Error(
+        `Weather API ${response.status}`
+      );
+    }
+
+    const data = await response.json();
+
+    const current =
+      data.current;
+
+    if (!current) {
+      throw new Error(
+        "Weather current data missing"
+      );
+    }
+
+    const placeName =
+      place.admin1
+        ? `${place.name}, ${place.admin1}`
+        : `${place.name}, ${place.country}`;
+
+    return (
+      `🌤 Погода сейчас — ${placeName}\n\n` +
+      `🌡 Температура: ${current.temperature_2m} °C\n` +
+      `🤔 Ощущается как: ${current.apparent_temperature} °C\n` +
+      `☁️ ${weatherCodeToText(current.weather_code)}\n` +
+      `💧 Влажность: ${current.relative_humidity_2m}%\n` +
+      `🌬 Ветер: ${current.wind_speed_10m} км/ч\n` +
+      `🌧 Осадки: ${current.precipitation} мм`
+    );
+
+  } catch (error) {
+    console.error(
+      "Weather error:",
+      error
+    );
+
+    return (
+      "⚠️ Сейчас не удалось получить погоду.\n\n" +
+      "Попробуй ещё раз."
+    );
+  }
+}
+
+
+// =====================================================
+// ВРЕМЯ
+// =====================================================
+
+async function getCurrentTime(userText) {
+  const place =
+    await geocodeLocation(userText);
+
+  if (!place) {
+    return (
+      "⚠️ Я не смог определить город.\n\n" +
+      "Например:\n" +
+      "Который час в Нью-Йорке?"
+    );
+  }
+
+  try {
+    const now =
+      new Date();
+
+    const time =
+      new Intl.DateTimeFormat(
+        "ru-RU",
+        {
+          timeZone: place.timezone,
+          hour: "2-digit",
+          minute: "2-digit",
+          second: "2-digit",
+          hour12: false
+        }
+      ).format(now);
+
+    const date =
+      new Intl.DateTimeFormat(
+        "ru-RU",
+        {
+          timeZone: place.timezone,
+          day: "2-digit",
+          month: "2-digit",
+          year: "numeric"
+        }
+      ).format(now);
+
+    return (
+      `🕒 Сейчас в ${place.name}:\n\n` +
+      `${time}\n` +
+      `📅 ${date}\n\n` +
+      `Часовой пояс: ${place.timezone}`
+    );
+
+  } catch (error) {
+    console.error(
+      "Time error:",
+      error
+    );
+
+    return (
+      "⚠️ Не удалось определить текущее время."
+    );
+  }
+}
+
+
+// =====================================================
+// ВАЛЮТЫ
+// =====================================================
+
+function detectCurrency(text) {
+  const t =
+    text.toLowerCase();
+
+  const currencies = [
+    {
+      code: "USD",
+      patterns: [
+        "usd",
+        "доллар",
+        "долар",
+        "долара",
+        "доллара",
+        "доллары",
+        "долари"
+      ]
+    },
+
+    {
+      code: "EUR",
+      patterns: [
+        "eur",
+        "евро",
+        "євро"
+      ]
+    },
+
+    {
+      code: "GBP",
+      patterns: [
+        "gbp",
+        "фунт",
+        "фунта",
+        "фунтів"
+      ]
+    },
+
+    {
+      code: "PLN",
+      patterns: [
+        "pln",
+        "злот",
+        "злоты",
+        "злотых"
+      ]
+    },
+
+    {
+      code: "UAH",
+      patterns: [
+        "uah",
+        "гривн",
+        "грн"
+      ]
+    }
+  ];
+
+  const found = [];
+
+  for (const currency of currencies) {
+    if (
+      currency.patterns.some(
+        pattern => t.includes(pattern)
+      )
+    ) {
+      found.push(currency.code);
+    }
+  }
+
+  return found;
+}
+
+
+function extractAmount(text) {
+  const match =
+    text.match(
+      /(\d+(?:[.,]\d+)?)/
+    );
+
+  if (!match) {
+    return 1;
+  }
+
+  return Number(
+    match[1].replace(",", ".")
+  );
+}
+
+
+async function getCurrencyRate(userText) {
+  const currencies =
+    detectCurrency(userText);
+
+  const amount =
+    extractAmount(userText);
+
+  let base;
+  let quote;
+
+
+  // Если написано просто:
+  // "курс доллара"
+  // считаем USD → UAH
+  if (currencies.length === 0) {
+    base = "USD";
+    quote = "UAH";
+
+  } else if (currencies.length === 1) {
+
+    if (currencies[0] === "UAH") {
+      base = "UAH";
+      quote = "USD";
+    } else {
+      base = currencies[0];
+      quote = "UAH";
+    }
+
+  } else {
+    base = currencies[0];
+    quote = currencies[1];
+  }
+
+
+  if (base === quote) {
+    return (
+      `${amount} ${base} = ${amount} ${quote}`
+    );
+  }
+
+
+  const url =
+    `https://api.frankfurter.dev/v2/rate/` +
+    `${base.toLowerCase()}/` +
+    `${quote.toLowerCase()}`;
+
+
+  try {
+    const response = await fetch(url);
+
+    if (!response.ok) {
+      throw new Error(
+        `Currency API ${response.status}`
+      );
+    }
+
+    const data =
+      await response.json();
+
+    const rate =
+      data.rate;
+
+    if (!rate) {
+      throw new Error(
+        "Rate missing"
+      );
+    }
+
+
+    const total =
+      amount * rate;
+
+
+    return (
+      `💱 Курс валют\n\n` +
+      `${amount} ${base} = ${total.toFixed(2)} ${quote}\n\n` +
+      `1 ${base} = ${Number(rate).toFixed(4)} ${quote}\n` +
+      `📅 Данные: ${data.date}`
+    );
+
+  } catch (error) {
+    console.error(
+      "Currency error:",
+      error
+    );
+
+
+    return (
+      "⚠️ Сейчас не удалось получить курс валют."
+    );
+  }
 }
 
 
@@ -223,7 +725,7 @@ function needsWebSearch(text) {
 // =====================================================
 
 function getSystemInstruction(useSearch) {
-  let prompt =
+  let text =
     "You are a helpful AI assistant inside Telegram. " +
 
     "Always answer in the same language as the user's latest message. " +
@@ -232,34 +734,28 @@ function getSystemInstruction(useSearch) {
     "If the user writes in Ukrainian, answer in Ukrainian. " +
     "If the user writes in English, answer in English. " +
 
-    "If the user changes language, change your response language too. " +
+    "Use conversation history to understand follow-up requests. " +
 
-    "Use the conversation history to understand follow-up requests. " +
-
-    "For example, if you previously wrote a text and the user says " +
-    "'make it shorter', 'make it prettier', 'rewrite it', 'simplify it', " +
-    "'make it funnier' or something similar, understand that they are " +
-    "referring to the previous relevant answer. " +
+    "If the user says make it shorter, rewrite it, make it prettier, " +
+    "simpler, more detailed or funnier, apply that request to the " +
+    "previous relevant response. " +
 
     "Write naturally and clearly. " +
-    "Do not make answers unnecessarily long. " +
-
-    "Do not pretend you know live information if you do not have access to it. ";
+    "Do not make answers unnecessarily long. ";
 
   if (useSearch) {
-    prompt +=
-      "Google Search is available for this request. " +
-      "Use it when needed to get current and recent information. " +
-      "Prefer fresh information when the user asks about weather, news, " +
-      "current time, prices, sports results or recent events. ";
+    text +=
+      "Google Search is available. " +
+      "Use it to answer questions about recent news and current events. " +
+      "Prefer current reliable information. ";
   }
 
-  return prompt;
+  return text;
 }
 
 
 // =====================================================
-// ОДИН ЗАПРОС К GEMINI
+// GEMINI REQUEST
 // =====================================================
 
 async function requestGemini({
@@ -267,11 +763,14 @@ async function requestGemini({
   contents,
   useSearch
 }) {
-  const requestBody = {
+  const body = {
     systemInstruction: {
       parts: [
         {
-          text: getSystemInstruction(useSearch)
+          text:
+            getSystemInstruction(
+              useSearch
+            )
         }
       ]
     },
@@ -285,9 +784,8 @@ async function requestGemini({
   };
 
 
-  // Google Search добавляем ТОЛЬКО когда он нужен
   if (useSearch) {
-    requestBody.tools = [
+    body.tools = [
       {
         googleSearch: {}
       }
@@ -303,146 +801,86 @@ async function requestGemini({
 
         headers: {
           "Content-Type": "application/json",
-          "x-goog-api-key": GEMINI_API_KEY
+          "x-goog-api-key":
+            GEMINI_API_KEY
         },
 
-        body: JSON.stringify(requestBody)
+        body:
+          JSON.stringify(body)
       }
     );
 
 
-    let data;
+    const data =
+      await response.json()
+        .catch(() => ({}));
 
-    try {
-      data = await response.json();
-    } catch {
-      data = {};
-    }
-
-
-    // ===============================================
-    // УСПЕХ
-    // ===============================================
 
     if (response.ok) {
-      const parts =
-        data.candidates?.[0]?.content?.parts;
+      const answer =
+        data.candidates?.[0]?.content?.parts
+          ?.map(
+            part => part.text || ""
+          )
+          .join("")
+          .trim();
 
-      if (!parts || parts.length === 0) {
-        console.error(
-          `${model} returned no content:`,
-          JSON.stringify(data)
-        );
 
+      if (answer) {
         return {
-          success: false,
-          status: 500,
-          type: "EMPTY"
+          success: true,
+          answer
         };
       }
-
-
-      const answer = parts
-        .map(part => part.text || "")
-        .join("")
-        .trim();
-
-
-      if (!answer) {
-        return {
-          success: false,
-          status: 500,
-          type: "EMPTY"
-        };
-      }
-
-
-      return {
-        success: true,
-        answer
-      };
     }
 
 
     console.error(
-      `Gemini API error | model=${model} | search=${useSearch}`,
+      `Gemini error | model=${model} | search=${useSearch}`,
       response.status,
       JSON.stringify(data)
     );
 
 
-    // ===============================================
-    // 429
-    // ===============================================
-
-    if (response.status === 429) {
-      return {
-        success: false,
-        status: 429,
-        type: "RATE_LIMIT"
-      };
-    }
-
-
-    // ===============================================
-    // 503
-    // ===============================================
-
-    if (response.status === 503) {
-      return {
-        success: false,
-        status: 503,
-        type: "OVERLOADED"
-      };
-    }
-
-
-    // ===============================================
-    // 404 — например модель недоступна
-    // ===============================================
-
-    if (response.status === 404) {
-      return {
-        success: false,
-        status: 404,
-        type: "MODEL_NOT_FOUND"
-      };
-    }
-
-
     return {
       success: false,
-      status: response.status,
-      type: "OTHER"
+      status: response.status
     };
 
 
   } catch (error) {
     console.error(
-      `Gemini network error | model=${model}:`,
+      "Gemini network error:",
       error
     );
 
+
     return {
       success: false,
-      status: 0,
-      type: "NETWORK"
+      status: 0
     };
   }
 }
 
 
 // =====================================================
-// GEMINI С RETRY + FALLBACK
+// GEMINI + FALLBACK
 // =====================================================
 
-async function askGemini(chatId, userText) {
+async function askGemini(
+  chatId,
+  userText,
+  useSearch
+) {
   if (!GEMINI_API_KEY) {
-    return "⚠️ GEMINI_API_KEY не настроен в Vercel.";
+    return (
+      "⚠️ GEMINI_API_KEY не настроен."
+    );
   }
 
 
-  const history = getHistory(chatId);
+  const history =
+    getHistory(chatId);
 
 
   const contents = [
@@ -458,46 +896,27 @@ async function askGemini(chatId, userText) {
   ];
 
 
-  // Определяем, нужен ли интернет
-  let useSearch = needsWebSearch(userText);
-
-
-  console.log(
-    `Request | chat=${chatId} | search=${useSearch} | text=${userText.slice(0, 100)}`
-  );
-
-
-  // Основная + запасная модель
   const models = [
     "gemini-3.8-flash",
     "gemini-3.5-flash"
   ];
 
 
-  // ===================================================
-  // ПРОХОД ПО МОДЕЛЯМ
-  // ===================================================
-
   for (const model of models) {
 
-    // До трёх попыток одной модели
-    for (let attempt = 1; attempt <= 3; attempt++) {
+    for (
+      let attempt = 1;
+      attempt <= 3;
+      attempt++
+    ) {
 
-      console.log(
-        `Gemini attempt ${attempt} | model=${model} | search=${useSearch}`
-      );
+      let result =
+        await requestGemini({
+          model,
+          contents,
+          useSearch
+        });
 
-
-      const result = await requestGemini({
-        model,
-        contents,
-        useSearch
-      });
-
-
-      // ===============================================
-      // УСПЕХ
-      // ===============================================
 
       if (result.success) {
 
@@ -518,24 +937,18 @@ async function askGemini(chatId, userText) {
       }
 
 
-      // ===============================================
-      // SEARCH ПОЛУЧИЛ 429
-      // ===============================================
-
+      // Search получил лимит
       if (
         result.status === 429 &&
         useSearch
       ) {
+
         console.log(
-          "Google Search quota/rate limit reached. Retrying WITHOUT Search."
+          "Search limit reached, retry without Search"
         );
 
 
-        // Выключаем Search
-        useSearch = false;
-
-
-        const fallbackWithoutSearch =
+        result =
           await requestGemini({
             model,
             contents,
@@ -543,46 +956,11 @@ async function askGemini(chatId, userText) {
           });
 
 
-        if (fallbackWithoutSearch.success) {
-
-          const answer =
-            "⚠️ Сейчас веб-поиск недоступен, поэтому ответ может быть неактуальным.\n\n" +
-            fallbackWithoutSearch.answer;
-
-
-          addToHistory(
-            chatId,
-            "user",
-            userText
+        if (result.success) {
+          return (
+            "⚠️ Сейчас веб-поиск недоступен, поэтому свежесть данных не гарантируется.\n\n" +
+            result.answer
           );
-
-          addToHistory(
-            chatId,
-            "model",
-            answer
-          );
-
-
-          return answer;
-        }
-
-
-        // Если модель без Search перегружена —
-        // перейдём к retry / другой модели
-        if (
-          fallbackWithoutSearch.status === 503
-        ) {
-          await sleep(attempt * 1200);
-          continue;
-        }
-
-
-        // Если и обычный Gemini получил 429 —
-        // пробуем запасную модель
-        if (
-          fallbackWithoutSearch.status === 429
-        ) {
-          break;
         }
 
 
@@ -590,99 +968,53 @@ async function askGemini(chatId, userText) {
       }
 
 
-      // ===============================================
-      // 503 — ЖДЁМ И ПРОБУЕМ СНОВА
-      // ===============================================
-
+      // Gemini перегружен
       if (result.status === 503) {
 
-        console.log(
-          `${model} overloaded. Attempt ${attempt}/3`
-        );
-
-
         if (attempt < 3) {
-          await sleep(attempt * 1200);
+          await sleep(
+            attempt * 1200
+          );
+
           continue;
         }
 
-
-        // Три попытки не помогли —
-        // переключаемся на следующую модель
-        console.log(
-          `${model} still overloaded. Trying fallback model...`
-        );
 
         break;
       }
 
 
-      // ===============================================
-      // NETWORK ERROR
-      // ===============================================
-
-      if (result.type === "NETWORK") {
-
-        if (attempt < 3) {
-          await sleep(attempt * 1000);
-          continue;
-        }
-
-        break;
-      }
-
-
-      // ===============================================
-      // 404 — МОДЕЛЬ НЕДОСТУПНА
-      // ===============================================
-
+      // Модель недоступна
       if (result.status === 404) {
-
-        console.log(
-          `${model} is not available. Trying next model.`
-        );
-
         break;
       }
 
 
-      // ===============================================
-      // 429 БЕЗ SEARCH
-      // ===============================================
-
+      // Лимит модели
       if (result.status === 429) {
-
-        console.log(
-          `${model} rate limit. Trying fallback model.`
-        );
-
         break;
       }
 
 
-      // Прочая ошибка
       break;
     }
   }
 
 
-  // ===================================================
-  // ВСЕ МОДЕЛИ НЕ СРАБОТАЛИ
-  // ===================================================
-
   return (
-    "⚠️ Gemini сейчас временно недоступен или достигнут лимит API.\n\n" +
-    "Попробуй ещё раз немного позже."
+    "⚠️ Gemini сейчас временно недоступен.\n\n" +
+    "Попробуй немного позже."
   );
 }
 
 
 // =====================================================
-// TELEGRAM MESSAGE
+// ОБРАБОТКА СООБЩЕНИЯ
 // =====================================================
 
 async function handleMessage(message) {
-  const chatId = message.chat.id;
+  const chatId =
+    message.chat.id;
 
   const text =
     (message.text || "").trim();
@@ -693,14 +1025,10 @@ async function handleMessage(message) {
   }
 
 
-  // ===================================================
   // START
-  // ===================================================
-
   if (text === "/start") {
 
     clearHistory(chatId);
-
 
     return sendMessage(
       chatId,
@@ -708,44 +1036,36 @@ async function handleMessage(message) {
 
 Я AI-помощник на Gemini.
 
-Можешь просто писать мне вопросы.
-
-Для актуальной информации я могу использовать Google Search, когда это действительно необходимо.`
+Я могу отвечать на обычные вопросы, смотреть погоду, время, курсы валют и использовать веб-поиск для свежих новостей.`
     );
   }
 
 
-  // ===================================================
   // HELP
-  // ===================================================
-
   if (text === "/help") {
 
     return sendMessage(
       chatId,
-      `🤖 Просто напиши свой вопрос.
+      `🤖 Просто напиши вопрос.
 
 Например:
 
-Какая сейчас погода в Киеве?
-
-Какие сегодня новости Fortnite?
+Какая погода в Полтаве?
 
 Который час в Нью-Йорке?
 
-Напиши описание для видео
+Курс доллара
 
-А потом можешь написать:
+100 долларов в гривнах
 
-Сделай покороче`
+Какие сегодня новости Fortnite?
+
+Напиши описание для ролика`
     );
   }
 
 
-  // ===================================================
   // RESET
-  // ===================================================
-
   if (
     text === "/clear" ||
     text === "/reset"
@@ -753,32 +1073,83 @@ async function handleMessage(message) {
 
     clearHistory(chatId);
 
+    return sendMessage(
+      chatId,
+      "🧹 История очищена."
+    );
+  }
+
+
+  await tg(
+    "sendChatAction",
+    {
+      chat_id: chatId,
+      action: "typing"
+    }
+  );
+
+
+  // ===================================================
+  // ПОГОДА
+  // ===================================================
+
+  if (isWeatherRequest(text)) {
+
+    const answer =
+      await getWeather(text);
 
     return sendMessage(
       chatId,
-      "🧹 История диалога очищена."
+      answer
     );
   }
 
 
   // ===================================================
-  // TYPING
+  // ВРЕМЯ
   // ===================================================
 
-  await tg("sendChatAction", {
-    chat_id: chatId,
-    action: "typing"
-  });
+  if (isTimeRequest(text)) {
+
+    const answer =
+      await getCurrentTime(text);
+
+    return sendMessage(
+      chatId,
+      answer
+    );
+  }
+
+
+  // ===================================================
+  // ВАЛЮТА
+  // ===================================================
+
+  if (isCurrencyRequest(text)) {
+
+    const answer =
+      await getCurrencyRate(text);
+
+    return sendMessage(
+      chatId,
+      answer
+    );
+  }
 
 
   // ===================================================
   // GEMINI
   // ===================================================
 
+  const useSearch =
+    needsGoogleSearch(text);
+
+
   const answer =
     await askGemini(
       chatId,
-      text
+      text,
+      useSearch
     );
 
 
@@ -805,7 +1176,8 @@ export async function GET(request) {
     return Response.json(
       {
         ok: false,
-        error: "TELEGRAM_BOT_TOKEN is not set"
+        error:
+          "TELEGRAM_BOT_TOKEN is not set"
       },
       {
         status: 500
@@ -829,7 +1201,8 @@ export async function GET(request) {
 
   return Response.json({
     ok: true,
-    message: "Gemini Telegram webhook is ready"
+    message:
+      "Gemini Telegram webhook is ready"
   });
 }
 
@@ -850,7 +1223,8 @@ export async function POST(request) {
     return Response.json(
       {
         ok: false,
-        error: "TELEGRAM_BOT_TOKEN is not set"
+        error:
+          "TELEGRAM_BOT_TOKEN is not set"
       },
       {
         status: 500
@@ -900,7 +1274,8 @@ export async function POST(request) {
     return Response.json(
       {
         ok: false,
-        error: "Webhook handler failed"
+        error:
+          "Webhook handler failed"
       },
       {
         status: 500
