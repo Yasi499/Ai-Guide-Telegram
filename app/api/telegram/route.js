@@ -9,7 +9,17 @@ const TELEGRAM_API = BOT_TOKEN
 
 
 // =====================================================
-// ПАМЯТЬ
+// MODELS
+// =====================================================
+
+const MODELS = [
+  "gemini-3.8-flash",
+  "gemini-3.5-flash"
+];
+
+
+// =====================================================
+// MEMORY
 // =====================================================
 
 const conversations =
@@ -17,23 +27,16 @@ const conversations =
 
 globalThis.__geminiConversations = conversations;
 
-
-const toolStates =
-  globalThis.__geminiToolStates || new Map();
-
-globalThis.__geminiToolStates = toolStates;
-
-
-const MAX_HISTORY_MESSAGES = 12;
+const MAX_HISTORY_MESSAGES = 14;
 
 
 // =====================================================
-// TELEGRAM API
+// TELEGRAM
 // =====================================================
 
 async function tg(method, payload) {
   if (!TELEGRAM_API) {
-    throw new Error("TELEGRAM_BOT_TOKEN is not configured");
+    throw new Error("TELEGRAM_BOT_TOKEN is missing");
   }
 
   const response = await fetch(
@@ -47,7 +50,8 @@ async function tg(method, payload) {
     }
   );
 
-  const data = await response.json().catch(() => null);
+  const data =
+    await response.json().catch(() => null);
 
   if (!response.ok || !data?.ok) {
     console.error(
@@ -64,7 +68,7 @@ async function tg(method, payload) {
 
 
 // =====================================================
-// TELEGRAM MESSAGE
+// SEND MESSAGE
 // =====================================================
 
 async function sendMessage(chatId, text) {
@@ -73,14 +77,22 @@ async function sendMessage(chatId, text) {
   }
 
   for (let i = 0; i < text.length; i += 4000) {
-    const part = text.slice(i, i + 4000);
-
     await tg("sendMessage", {
       chat_id: chatId,
-      text: part,
+      text: text.slice(i, i + 4000),
       disable_web_page_preview: true
     });
   }
+}
+
+
+async function sendTyping(chatId) {
+  try {
+    await tg("sendChatAction", {
+      chat_id: chatId,
+      action: "typing"
+    });
+  } catch {}
 }
 
 
@@ -90,7 +102,7 @@ function sleep(ms) {
 
 
 // =====================================================
-// HISTORY
+// MEMORY
 // =====================================================
 
 function getHistory(chatId) {
@@ -102,16 +114,12 @@ function getHistory(chatId) {
 }
 
 
-function addToHistory(chatId, role, text) {
+function addToHistory(chatId, role, parts) {
   const history = getHistory(chatId);
 
   history.push({
     role,
-    parts: [
-      {
-        text
-      }
-    ]
+    parts
   });
 
   while (history.length > MAX_HISTORY_MESSAGES) {
@@ -120,750 +128,25 @@ function addToHistory(chatId, role, text) {
 }
 
 
-function rememberExchange(chatId, userText, answer) {
-  addToHistory(
-    chatId,
-    "user",
-    userText
-  );
-
-  addToHistory(
-    chatId,
-    "model",
-    answer
-  );
-}
-
-
 function clearHistory(chatId) {
   conversations.delete(chatId);
-  toolStates.delete(chatId);
 }
 
 
 // =====================================================
-// INTENT DETECTION
+// DATE
 // =====================================================
 
-function isWeatherRequest(text) {
-  const t = text.toLowerCase();
-
-  return (
-    /погод/.test(t) ||
-    /температур/.test(t) ||
-    /дожд/.test(t) ||
-    /дощ/.test(t) ||
-    /снег/.test(t) ||
-    /сніг/.test(t) ||
-    /weather/.test(t) ||
-    /forecast/.test(t)
-  );
-}
-
-
-function isTomorrowWeatherFollowup(chatId, text) {
-  const state =
-    toolStates.get(chatId);
-
-  if (!state || state.type !== "weather") {
-    return false;
-  }
-
-  return (
-    /завтра/.test(text.toLowerCase()) ||
-    /tomorrow/.test(text.toLowerCase())
-  );
-}
-
-
-function isTimeRequest(text) {
-  const t = text.toLowerCase();
-
-  return (
-    /который час/.test(t) ||
-    /который сейчас час/.test(t) ||
-    /сколько сейчас времени/.test(t) ||
-    /скільки зараз часу/.test(t) ||
-    /котра година/.test(t) ||
-    /який зараз час/.test(t) ||
-    /what time/.test(t) ||
-    /current time/.test(t)
-  );
-}
-
-
-function isCurrencyRequest(text) {
-  const t = text.toLowerCase();
-
-  return (
-    /курс/.test(t) ||
-    /доллар/.test(t) ||
-    /долар/.test(t) ||
-    /евро/.test(t) ||
-    /євро/.test(t) ||
-    /гривн/.test(t) ||
-    /usd/.test(t) ||
-    /uah/.test(t) ||
-    /eur/.test(t) ||
-    /gbp/.test(t) ||
-    /pln/.test(t)
-  );
-}
-
-
-function needsGoogleSearch(text) {
-  const t = text.toLowerCase();
-
-  return (
-    /новост/.test(t) ||
-    /новини/.test(t) ||
-    /сегодня произошло/.test(t) ||
-    /сьогодні сталося/.test(t) ||
-    /последние события/.test(t) ||
-    /останні події/.test(t) ||
-    /latest news/.test(t) ||
-    /breaking news/.test(t) ||
-    /fortnite news/.test(t) ||
-    /новости fortnite/.test(t) ||
-    /новини fortnite/.test(t) ||
-    /найди в интернете/.test(t) ||
-    /поищи в интернете/.test(t) ||
-    /проверь в интернете/.test(t) ||
-    /пошукай в інтернеті/.test(t) ||
-    /search the web/.test(t) ||
-    /google it/.test(t)
-  );
-}
-
-
-// =====================================================
-// LOCATION EXTRACTION
-// =====================================================
-
-function extractLocationText(text) {
-  let s = text.trim();
-
-  s = s.replace(
-    /^(какая|какой|какое|яка|який|яке)\s+/i,
-    ""
-  );
-
-  s = s.replace(
-    /погода|погоде|погоду|weather|forecast|температура|температуре|температуру|который час|который сейчас час|сколько сейчас времени|скільки зараз часу|котра година|який зараз час|what time is it|current time/gi,
-    " "
-  );
-
-  s = s.replace(/[?!.,]/g, " ");
-
-  const match =
-    s.match(
-      /(?:\bв\b|\bво\b|\bу\b|\bin\b)\s+(.+)/i
-    );
-
-  if (match?.[1]) {
-    s = match[1];
-  }
-
-  return s
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-
-// =====================================================
-// LOCATION CANDIDATES
-// =====================================================
-
-function locationCandidates(name) {
-  const value = name.trim();
-
-  const results = new Set();
-
-  if (!value) {
-    return [];
-  }
-
-  results.add(value);
-
-
-  // Частые формы
-  const known = {
-    "полтаве": "Полтава",
-    "полтаві": "Полтава",
-
-    "киеве": "Киев",
-    "києві": "Київ",
-    "киев": "Киев",
-    "київ": "Київ",
-
-    "львове": "Львов",
-    "львові": "Львів",
-
-    "одессе": "Одесса",
-    "одесі": "Одеса",
-
-    "харькове": "Харьков",
-    "харкові": "Харків",
-
-    "днепре": "Днепр",
-    "дніпрі": "Дніпро",
-
-    "варшаве": "Варшава",
-    "варшаві": "Warsaw",
-
-    "нью-йорке": "New York",
-    "нью йорке": "New York",
-
-    "токио": "Tokyo",
-    "токіо": "Tokyo",
-
-    "лондоне": "London",
-    "лондоні": "London",
-
-    "париже": "Paris",
-    "парижі": "Paris",
-
-    "берлине": "Berlin",
-    "берліні": "Berlin"
-  };
-
-
-  const lower = value.toLowerCase();
-
-  if (known[lower]) {
-    results.add(known[lower]);
-  }
-
-
-  // Киевe -> Киев
-  if (/[еі]$/i.test(value)) {
-    results.add(
-      value.slice(0, -1)
-    );
-  }
-
-
-  // Полтаве -> Полтава
-  if (/ве$/i.test(value)) {
-    results.add(
-      value.slice(0, -2) + "ва"
-    );
-  }
-
-
-  // Варшаве -> Варшава
-  if (/аве$/i.test(value)) {
-    results.add(
-      value.slice(0, -1) + "а"
-    );
-  }
-
-
-  // Одессе -> Одесса
-  if (/ссе$/i.test(value)) {
-    results.add(
-      value.slice(0, -1) + "а"
-    );
-  }
-
-
-  // Нью Йорк -> New York-ish fallback
-  results.add(
-    value.replace(/-/g, " ")
-  );
-
-
-  return [...results];
-}
-
-
-// =====================================================
-// OPEN-METEO GEOCODING
-// =====================================================
-
-async function findPlaceFromName(rawName) {
-  const candidates =
-    locationCandidates(rawName);
-
-
-  for (const candidate of candidates) {
-    try {
-      const url =
-        "https://geocoding-api.open-meteo.com/v1/search" +
-        `?name=${encodeURIComponent(candidate)}` +
-        "&count=5" +
-        "&language=ru" +
-        "&format=json";
-
-
-      const response =
-        await fetch(url);
-
-
-      if (!response.ok) {
-        continue;
-      }
-
-
-      const data =
-        await response.json();
-
-
-      const place =
-        data.results?.[0];
-
-
-      if (place) {
-        return {
-          name: place.name,
-          country: place.country,
-          admin1: place.admin1,
-          latitude: place.latitude,
-          longitude: place.longitude,
-          timezone: place.timezone
-        };
-      }
-
-    } catch (error) {
-      console.error(
-        "Geocoding candidate error:",
-        candidate,
-        error
-      );
-    }
-  }
-
-
-  return null;
-}
-
-
-async function geocodeFromMessage(text) {
-  const raw =
-    extractLocationText(text);
-
-  if (!raw) {
-    return null;
-  }
-
-  return findPlaceFromName(raw);
-}
-
-
-// =====================================================
-// WEATHER
-// =====================================================
-
-function weatherCodeToText(code) {
-  const codes = {
-    0: "ясно",
-    1: "в основном ясно",
-    2: "переменная облачность",
-    3: "пасмурно",
-
-    45: "туман",
-    48: "изморозь и туман",
-
-    51: "лёгкая морось",
-    53: "морось",
-    55: "сильная морось",
-
-    61: "небольшой дождь",
-    63: "дождь",
-    65: "сильный дождь",
-
-    71: "небольшой снег",
-    73: "снег",
-    75: "сильный снег",
-
-    80: "небольшие ливни",
-    81: "ливни",
-    82: "сильные ливни",
-
-    95: "гроза",
-    96: "гроза с градом",
-    99: "сильная гроза с градом"
-  };
-
-  return (
-    codes[code] ||
-    "неизвестные погодные условия"
-  );
-}
-
-
-function placeTitle(place) {
-  if (place.admin1) {
-    return `${place.name}, ${place.admin1}`;
-  }
-
-  return `${place.name}, ${place.country}`;
-}
-
-
-// =====================================================
-// CURRENT WEATHER
-// =====================================================
-
-async function getCurrentWeather(place) {
-  try {
-    const url =
-      "https://api.open-meteo.com/v1/forecast" +
-      `?latitude=${place.latitude}` +
-      `&longitude=${place.longitude}` +
-      "&current=" +
-      [
-        "temperature_2m",
-        "relative_humidity_2m",
-        "apparent_temperature",
-        "precipitation",
-        "weather_code",
-        "wind_speed_10m"
-      ].join(",") +
-      "&timezone=auto";
-
-
-    const response =
-      await fetch(url);
-
-
-    if (!response.ok) {
-      throw new Error(
-        `Weather API ${response.status}`
-      );
-    }
-
-
-    const data =
-      await response.json();
-
-
-    const current =
-      data.current;
-
-
-    if (!current) {
-      throw new Error(
-        "Missing current weather"
-      );
-    }
-
-
-    return (
-      `🌤 Погода сейчас — ${placeTitle(place)}\n\n` +
-      `🌡 Температура: ${current.temperature_2m} °C\n` +
-      `🤔 Ощущается как: ${current.apparent_temperature} °C\n` +
-      `☁️ ${weatherCodeToText(current.weather_code)}\n` +
-      `💧 Влажность: ${current.relative_humidity_2m}%\n` +
-      `🌬 Ветер: ${current.wind_speed_10m} км/ч\n` +
-      `🌧 Осадки: ${current.precipitation} мм`
-    );
-
-  } catch (error) {
-    console.error(
-      "Current weather error:",
-      error
-    );
-
-    return (
-      "⚠️ Сейчас не удалось получить погоду."
-    );
-  }
-}
-
-
-// =====================================================
-// TOMORROW WEATHER
-// =====================================================
-
-async function getTomorrowWeather(place) {
-  try {
-    const url =
-      "https://api.open-meteo.com/v1/forecast" +
-      `?latitude=${place.latitude}` +
-      `&longitude=${place.longitude}` +
-      "&daily=" +
-      [
-        "weather_code",
-        "temperature_2m_max",
-        "temperature_2m_min",
-        "precipitation_probability_max",
-        "wind_speed_10m_max"
-      ].join(",") +
-      "&forecast_days=2" +
-      "&timezone=auto";
-
-
-    const response =
-      await fetch(url);
-
-
-    if (!response.ok) {
-      throw new Error(
-        `Forecast API ${response.status}`
-      );
-    }
-
-
-    const data =
-      await response.json();
-
-
-    const d =
-      data.daily;
-
-
-    if (!d?.time?.[1]) {
-      throw new Error(
-        "Tomorrow data missing"
-      );
-    }
-
-
-    return (
-      `🌤 Завтра — ${placeTitle(place)}\n\n` +
-      `🌡 Максимум: ${d.temperature_2m_max[1]} °C\n` +
-      `🌡 Минимум: ${d.temperature_2m_min[1]} °C\n` +
-      `☁️ ${weatherCodeToText(d.weather_code[1])}\n` +
-      `🌧 Вероятность осадков: ${d.precipitation_probability_max[1]}%\n` +
-      `🌬 Ветер до: ${d.wind_speed_10m_max[1]} км/ч`
-    );
-
-  } catch (error) {
-    console.error(
-      "Tomorrow weather error:",
-      error
-    );
-
-    return (
-      "⚠️ Не удалось получить прогноз на завтра."
-    );
-  }
-}
-
-
-// =====================================================
-// TIME
-// =====================================================
-
-async function getCurrentTime(place) {
-  try {
-    const now =
-      new Date();
-
-
-    const time =
-      new Intl.DateTimeFormat(
-        "ru-RU",
-        {
-          timeZone: place.timezone,
-          hour: "2-digit",
-          minute: "2-digit",
-          second: "2-digit",
-          hour12: false
-        }
-      ).format(now);
-
-
-    const date =
-      new Intl.DateTimeFormat(
-        "ru-RU",
-        {
-          timeZone: place.timezone,
-          day: "2-digit",
-          month: "2-digit",
-          year: "numeric"
-        }
-      ).format(now);
-
-
-    return (
-      `🕒 Сейчас в ${place.name}:\n\n` +
-      `${time}\n` +
-      `📅 ${date}\n\n` +
-      `Часовой пояс: ${place.timezone}`
-    );
-
-  } catch (error) {
-    console.error(
-      "Time error:",
-      error
-    );
-
-    return (
-      "⚠️ Не удалось определить время."
-    );
-  }
-}
-
-
-// =====================================================
-// CURRENCY
-// =====================================================
-
-function detectCurrencies(text) {
-  const t = text.toLowerCase();
-
-  const list = [
+function getCurrentDate() {
+  return new Intl.DateTimeFormat(
+    "en-CA",
     {
-      code: "USD",
-      words: [
-        "usd",
-        "доллар",
-        "долар"
-      ]
-    },
-    {
-      code: "EUR",
-      words: [
-        "eur",
-        "евро",
-        "євро"
-      ]
-    },
-    {
-      code: "UAH",
-      words: [
-        "uah",
-        "гривн",
-        "грн"
-      ]
-    },
-    {
-      code: "GBP",
-      words: [
-        "gbp",
-        "фунт"
-      ]
-    },
-    {
-      code: "PLN",
-      words: [
-        "pln",
-        "злот"
-      ]
+      timeZone: "UTC",
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit"
     }
-  ];
-
-
-  const found = [];
-
-
-  for (const currency of list) {
-    if (
-      currency.words.some(
-        word => t.includes(word)
-      )
-    ) {
-      found.push(
-        currency.code
-      );
-    }
-  }
-
-
-  return found;
-}
-
-
-function extractAmount(text) {
-  const match =
-    text.match(
-      /(\d+(?:[.,]\d+)?)/
-    );
-
-  if (!match) {
-    return 1;
-  }
-
-  return Number(
-    match[1].replace(",", ".")
-  );
-}
-
-
-async function getCurrencyRate(text) {
-  const found =
-    detectCurrencies(text);
-
-  const amount =
-    extractAmount(text);
-
-
-  let base;
-  let quote;
-
-
-  if (found.length === 0) {
-    base = "USD";
-    quote = "UAH";
-
-  } else if (found.length === 1) {
-
-    if (found[0] === "UAH") {
-      base = "UAH";
-      quote = "USD";
-    } else {
-      base = found[0];
-      quote = "UAH";
-    }
-
-  } else {
-    base = found[0];
-    quote = found[1];
-  }
-
-
-  try {
-    const url =
-      `https://api.frankfurter.dev/v2/rate/` +
-      `${base.toLowerCase()}/` +
-      `${quote.toLowerCase()}`;
-
-
-    const response =
-      await fetch(url);
-
-
-    if (!response.ok) {
-      throw new Error(
-        `Currency API ${response.status}`
-      );
-    }
-
-
-    const data =
-      await response.json();
-
-
-    if (!data.rate) {
-      throw new Error(
-        "Currency rate missing"
-      );
-    }
-
-
-    const converted =
-      amount * data.rate;
-
-
-    return (
-      `💱 Курс валют\n\n` +
-      `${amount} ${base} = ${converted.toFixed(2)} ${quote}\n\n` +
-      `1 ${base} = ${Number(data.rate).toFixed(4)} ${quote}\n` +
-      `📅 Данные: ${data.date}`
-    );
-
-  } catch (error) {
-    console.error(
-      "Currency error:",
-      error
-    );
-
-    return (
-      "⚠️ Сейчас не удалось получить курс валют."
-    );
-  }
+  ).format(new Date());
 }
 
 
@@ -871,41 +154,79 @@ async function getCurrencyRate(text) {
 // SYSTEM PROMPT
 // =====================================================
 
-function systemPrompt(useSearch = false) {
-  let prompt =
-    "You are a helpful AI assistant inside Telegram. " +
+function getSystemPrompt(webAvailable) {
+  const currentDate = getCurrentDate();
 
-    "Always answer in the same language as the user's latest message. " +
+  return `
+You are a helpful AI assistant inside Telegram.
 
-    "If the user writes Russian, answer Russian. " +
-    "If the user writes Ukrainian, answer Ukrainian. " +
-    "If the user writes English, answer English. " +
+Current date: ${currentDate}.
 
-    "Use conversation history to understand context. " +
+Answer naturally, like a modern general-purpose AI assistant.
 
-    "If the user says make it shorter, rewrite it, make it prettier, " +
-    "simpler, more detailed or funnier, apply the instruction to the " +
-    "previous relevant answer. " +
+Always answer in the same language as the user's latest message unless the user asks for another language.
 
-    "Write naturally and clearly. " +
-    "Do not be unnecessarily verbose. ";
+Use conversation history to understand context.
 
+For example, if the user says:
+- "make it shorter"
+- "rewrite it"
+- "make it prettier"
+- "continue"
+- "explain simpler"
+- "what about tomorrow?"
 
-  if (useSearch) {
-    prompt +=
-      "Google Search is available for this request. " +
-      "The user is asking for current or recent information. " +
-      "Use current search results. " +
-      "Never present old information as today's news. ";
-  }
+understand the previous conversation instead of treating it as a completely new request.
 
+Do not unnecessarily repeat yourself.
 
-  return prompt;
+Be concise when the question is simple and detailed when useful.
+
+You can understand casual language, spelling mistakes and incomplete phrases.
+
+${webAvailable
+  ? `
+Google Search is available.
+
+Use it whenever fresh or current information is needed, including current events, news, weather, prices, sports, software, games, releases, public information or anything that may have changed recently.
+
+Do not rely on old training knowledge when current information is required.
+`
+  : `
+Live web access is currently unavailable.
+
+If the user's question requires current, live or recently changed information, clearly say that you cannot verify the latest information right now.
+
+Do NOT invent current facts and do NOT present old information as if it were current.
+`
+}
+
+Never claim that the current year is an older year when the current date above says otherwise.
+`.trim();
 }
 
 
 // =====================================================
-// GEMINI TEXT REQUEST
+// EXTRACT GEMINI TEXT
+// =====================================================
+
+function extractAnswer(data) {
+  const parts =
+    data?.candidates?.[0]?.content?.parts;
+
+  if (!Array.isArray(parts)) {
+    return "";
+  }
+
+  return parts
+    .map(part => part.text || "")
+    .join("")
+    .trim();
+}
+
+
+// =====================================================
+// GEMINI REQUEST
 // =====================================================
 
 async function requestGemini({
@@ -917,10 +238,7 @@ async function requestGemini({
     systemInstruction: {
       parts: [
         {
-          text:
-            systemPrompt(
-              useSearch
-            )
+          text: getSystemPrompt(useSearch)
         }
       ]
     },
@@ -934,6 +252,8 @@ async function requestGemini({
   };
 
 
+  // Просто даём Gemini возможность пользоваться Google.
+  // Gemini сам решает, нужен ли поиск.
   if (useSearch) {
     body.tools = [
       {
@@ -944,40 +264,27 @@ async function requestGemini({
 
 
   try {
-    const response =
-      await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
-        {
-          method: "POST",
+    const response = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
+      {
+        method: "POST",
 
-          headers: {
-            "Content-Type":
-              "application/json",
+        headers: {
+          "Content-Type": "application/json",
+          "x-goog-api-key": GEMINI_API_KEY
+        },
 
-            "x-goog-api-key":
-              GEMINI_API_KEY
-          },
-
-          body:
-            JSON.stringify(body)
-        }
-      );
+        body: JSON.stringify(body)
+      }
+    );
 
 
     const data =
-      await response.json()
-        .catch(() => ({}));
+      await response.json().catch(() => ({}));
 
 
     if (response.ok) {
-      const answer =
-        data.candidates?.[0]?.content?.parts
-          ?.map(
-            part => part.text || ""
-          )
-          .join("")
-          .trim();
-
+      const answer = extractAnswer(data);
 
       if (answer) {
         return {
@@ -989,7 +296,7 @@ async function requestGemini({
 
 
     console.error(
-      `Gemini error model=${model} search=${useSearch}`,
+      `Gemini error | ${model} | search=${useSearch}`,
       response.status,
       JSON.stringify(data)
     );
@@ -997,8 +304,7 @@ async function requestGemini({
 
     return {
       success: false,
-      status: response.status,
-      data
+      status: response.status
     };
 
   } catch (error) {
@@ -1006,7 +312,6 @@ async function requestGemini({
       "Gemini network error:",
       error
     );
-
 
     return {
       success: false,
@@ -1017,23 +322,16 @@ async function requestGemini({
 
 
 // =====================================================
-// GEMINI CHAT
+// ASK GEMINI
 // =====================================================
 
-async function askGemini(
-  chatId,
-  userText,
-  useSearch
-) {
+async function askGemini(chatId, userParts) {
   if (!GEMINI_API_KEY) {
-    return (
-      "⚠️ GEMINI_API_KEY не настроен."
-    );
+    return "⚠️ GEMINI_API_KEY не настроен.";
   }
 
 
-  const history =
-    getHistory(chatId);
+  const history = getHistory(chatId);
 
 
   const contents = [
@@ -1041,72 +339,72 @@ async function askGemini(
 
     {
       role: "user",
-      parts: [
-        {
-          text: userText
-        }
-      ]
+      parts: userParts
     }
   ];
 
 
-  const models = [
-    "gemini-3.8-flash",
-    "gemini-3.5-flash"
-  ];
+  // ===================================================
+  // СНАЧАЛА GEMINI + GOOGLE SEARCH
+  // ===================================================
 
+  for (const model of MODELS) {
 
-  for (const model of models) {
-
-    for (
-      let attempt = 1;
-      attempt <= 3;
-      attempt++
-    ) {
+    for (let attempt = 1; attempt <= 3; attempt++) {
 
       const result =
         await requestGemini({
           model,
           contents,
-          useSearch
+          useSearch: true
         });
 
 
       if (result.success) {
-        rememberExchange(
+
+        addToHistory(
           chatId,
-          userText,
-          result.answer
+          "user",
+          userParts
         );
+
+        addToHistory(
+          chatId,
+          "model",
+          [
+            {
+              text: result.answer
+            }
+          ]
+        );
+
 
         return result.answer;
       }
 
 
-      // =================================================
-      // SEARCH LIMIT
-      // =================================================
+      // ===============================================
+      // GOOGLE SEARCH / API LIMIT
+      // ===============================================
 
-      if (
-        useSearch &&
-        result.status === 429
-      ) {
-        return (
-          "⚠️ Сейчас веб-поиск временно недоступен или достигнут лимит.\n\n" +
-          "Я не буду выдавать старую информацию за сегодняшние новости. " +
-          "Попробуй запрос чуть позже."
+      if (result.status === 429) {
+        console.log(
+          "Search/API limit. Retrying without web..."
         );
+
+        break;
       }
 
 
-      // =================================================
-      // 503
-      // =================================================
+      // ===============================================
+      // MODEL OVERLOADED
+      // ===============================================
 
       if (result.status === 503) {
+
         if (attempt < 3) {
           await sleep(
-            attempt * 1200
+            attempt * 1000
           );
 
           continue;
@@ -1116,13 +414,7 @@ async function askGemini(
       }
 
 
-      // 429 обычного Gemini
-      if (result.status === 429) {
-        break;
-      }
-
-
-      // модель недоступна
+      // Model unavailable
       if (result.status === 404) {
         break;
       }
@@ -1133,29 +425,82 @@ async function askGemini(
   }
 
 
+  // ===================================================
+  // FALLBACK БЕЗ WEB
+  // ===================================================
+
+  for (const model of MODELS) {
+
+    for (let attempt = 1; attempt <= 2; attempt++) {
+
+      const result =
+        await requestGemini({
+          model,
+          contents,
+          useSearch: false
+        });
+
+
+      if (result.success) {
+
+        addToHistory(
+          chatId,
+          "user",
+          userParts
+        );
+
+        addToHistory(
+          chatId,
+          "model",
+          [
+            {
+              text: result.answer
+            }
+          ]
+        );
+
+
+        return result.answer;
+      }
+
+
+      if (
+        result.status === 503 &&
+        attempt < 2
+      ) {
+        await sleep(1000);
+        continue;
+      }
+
+
+      break;
+    }
+  }
+
+
   return (
     "⚠️ Gemini сейчас временно недоступен.\n\n" +
-    "Попробуй немного позже."
+    "Попробуй ещё раз немного позже."
   );
 }
 
 
 // =====================================================
-// TELEGRAM VOICE DOWNLOAD
+// DOWNLOAD TELEGRAM FILE
 // =====================================================
 
-async function downloadTelegramVoice(fileId) {
-  const fileInfo =
-    await tg(
-      "getFile",
-      {
-        file_id: fileId
-      }
-    );
+async function downloadTelegramFile(
+  fileId,
+  defaultMimeType
+) {
+  const file =
+    await tg("getFile", {
+      file_id: fileId
+    });
 
 
   const filePath =
-    fileInfo.result?.file_path;
+    file.result?.file_path;
 
 
   if (!filePath) {
@@ -1165,17 +510,15 @@ async function downloadTelegramVoice(fileId) {
   }
 
 
-  const fileUrl =
-    `https://api.telegram.org/file/bot${BOT_TOKEN}/${filePath}`;
-
-
   const response =
-    await fetch(fileUrl);
+    await fetch(
+      `https://api.telegram.org/file/bot${BOT_TOKEN}/${filePath}`
+    );
 
 
   if (!response.ok) {
     throw new Error(
-      `Voice download failed ${response.status}`
+      `Telegram file download error ${response.status}`
     );
   }
 
@@ -1187,228 +530,166 @@ async function downloadTelegramVoice(fileId) {
 
 
   return {
-    buffer,
+    data: buffer.toString("base64"),
     mimeType:
-      "audio/ogg"
+      response.headers.get("content-type") ||
+      defaultMimeType
   };
 }
 
 
 // =====================================================
-// GEMINI AUDIO
+// VOICE
 // =====================================================
 
-async function askGeminiWithVoice(
-  chatId,
-  voice
-) {
-  if (!GEMINI_API_KEY) {
-    return (
-      "⚠️ GEMINI_API_KEY не настроен."
-    );
-  }
-
-
-  let audio;
-
-
+async function handleVoice(chatId, voice) {
   try {
-    audio =
-      await downloadTelegramVoice(
-        voice.file_id
+    const file =
+      await downloadTelegramFile(
+        voice.file_id,
+        "audio/ogg"
       );
+
+
+    return askGemini(
+      chatId,
+      [
+        {
+          text:
+            "Listen to this voice message and respond to what I said. " +
+            "Do not just transcribe it unless I ask for transcription."
+        },
+
+        {
+          inlineData: {
+            mimeType: file.mimeType,
+            data: file.data
+          }
+        }
+      ]
+    );
 
   } catch (error) {
     console.error(
-      "Voice download error:",
+      "Voice error:",
       error
     );
 
     return (
-      "⚠️ Не удалось скачать голосовое сообщение."
+      "⚠️ Не удалось обработать голосовое сообщение."
     );
   }
-
-
-  const base64 =
-    audio.buffer.toString(
-      "base64"
-    );
-
-
-  const models = [
-    "gemini-3.8-flash",
-    "gemini-3.5-flash"
-  ];
-
-
-  for (const model of models) {
-
-    for (
-      let attempt = 1;
-      attempt <= 3;
-      attempt++
-    ) {
-
-      const body = {
-        systemInstruction: {
-          parts: [
-            {
-              text:
-                "You are an AI assistant inside Telegram. " +
-
-                "Listen carefully to the user's voice message. " +
-
-                "Understand what the user says and answer their request directly. " +
-
-                "Answer in the same language spoken by the user. " +
-
-                "Use conversation context when useful. " +
-
-                "Do not only provide a transcription unless the user asks for transcription."
-            }
-          ]
-        },
-
-        contents: [
-          ...getHistory(chatId),
-
-          {
-            role: "user",
-            parts: [
-              {
-                text:
-                  "This is my voice message. Listen to it and respond to what I said."
-              },
-
-              {
-                inlineData: {
-                  mimeType:
-                    audio.mimeType,
-
-                  data:
-                    base64
-                }
-              }
-            ]
-          }
-        ],
-
-        generationConfig: {
-          temperature: 0.7,
-          maxOutputTokens: 2048
-        }
-      };
-
-
-      try {
-        const response =
-          await fetch(
-            `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
-            {
-              method: "POST",
-
-              headers: {
-                "Content-Type":
-                  "application/json",
-
-                "x-goog-api-key":
-                  GEMINI_API_KEY
-              },
-
-              body:
-                JSON.stringify(body)
-            }
-          );
-
-
-        const data =
-          await response.json()
-            .catch(() => ({}));
-
-
-        if (response.ok) {
-          const answer =
-            data.candidates?.[0]?.content?.parts
-              ?.map(
-                part => part.text || ""
-              )
-              .join("")
-              .trim();
-
-
-          if (answer) {
-
-            // Голосовое сохраняем в историю
-            // как условное сообщение пользователя.
-            rememberExchange(
-              chatId,
-              "[Голосовое сообщение пользователя]",
-              answer
-            );
-
-
-            return answer;
-          }
-        }
-
-
-        console.error(
-          `Gemini voice error model=${model}`,
-          response.status,
-          JSON.stringify(data)
-        );
-
-
-        if (
-          response.status === 503 &&
-          attempt < 3
-        ) {
-          await sleep(
-            attempt * 1200
-          );
-
-          continue;
-        }
-
-
-        break;
-
-      } catch (error) {
-        console.error(
-          "Gemini voice network error:",
-          error
-        );
-
-
-        if (attempt < 3) {
-          await sleep(
-            attempt * 1000
-          );
-
-          continue;
-        }
-
-
-        break;
-      }
-    }
-  }
-
-
-  return (
-    "⚠️ Сейчас не удалось обработать голосовое сообщение."
-  );
 }
 
 
 // =====================================================
-// MESSAGE HANDLER
+// PHOTO
+// =====================================================
+
+async function handlePhoto(
+  chatId,
+  photoArray,
+  caption
+) {
+  try {
+    // Самая большая фотография
+    const photo =
+      photoArray[
+        photoArray.length - 1
+      ];
+
+
+    const file =
+      await downloadTelegramFile(
+        photo.file_id,
+        "image/jpeg"
+      );
+
+
+    const prompt =
+      caption?.trim() ||
+      "Look at this image and help me with it.";
+
+
+    return askGemini(
+      chatId,
+      [
+        {
+          text: prompt
+        },
+
+        {
+          inlineData: {
+            mimeType: file.mimeType,
+            data: file.data
+          }
+        }
+      ]
+    );
+
+  } catch (error) {
+    console.error(
+      "Photo error:",
+      error
+    );
+
+    return (
+      "⚠️ Не удалось обработать изображение."
+    );
+  }
+}
+
+
+// =====================================================
+// HANDLE MESSAGE
 // =====================================================
 
 async function handleMessage(message) {
-  const chatId =
-    message.chat.id;
+  const chatId = message.chat.id;
+
+
+  // ===================================================
+  // START
+  // ===================================================
+
+  if (message.text === "/start") {
+
+    clearHistory(chatId);
+
+
+    return sendMessage(
+      chatId,
+      `Привет! 👋
+
+Я AI-помощник на Gemini.
+
+Просто пиши мне как обычному ИИ.
+
+Можешь отправлять текст, голосовые сообщения и изображения.`
+    );
+  }
+
+
+  // ===================================================
+  // CLEAR
+  // ===================================================
+
+  if (
+    message.text === "/clear" ||
+    message.text === "/reset"
+  ) {
+
+    clearHistory(chatId);
+
+
+    return sendMessage(
+      chatId,
+      "🧹 Контекст диалога очищен."
+    );
+  }
+
+
+  await sendTyping(chatId);
 
 
   // ===================================================
@@ -1417,19 +698,34 @@ async function handleMessage(message) {
 
   if (message.voice) {
 
-    await tg(
-      "sendChatAction",
-      {
-        chat_id: chatId,
-        action: "typing"
-      }
-    );
-
-
     const answer =
-      await askGeminiWithVoice(
+      await handleVoice(
         chatId,
         message.voice
+      );
+
+
+    return sendMessage(
+      chatId,
+      answer
+    );
+  }
+
+
+  // ===================================================
+  // PHOTO
+  // ===================================================
+
+  if (
+    Array.isArray(message.photo) &&
+    message.photo.length > 0
+  ) {
+
+    const answer =
+      await handlePhoto(
+        chatId,
+        message.photo,
+        message.caption || ""
       );
 
 
@@ -1453,251 +749,14 @@ async function handleMessage(message) {
   }
 
 
-  // START
-  if (text === "/start") {
-
-    clearHistory(chatId);
-
-
-    return sendMessage(
-      chatId,
-      `Привет! 👋
-
-Я AI-помощник на Gemini.
-
-Можешь писать текстом или отправлять голосовые сообщения.
-
-Я умею отвечать на обычные вопросы, смотреть погоду, время, курс валют и искать свежие новости.`
-    );
-  }
-
-
-  // HELP
-  if (text === "/help") {
-
-    return sendMessage(
-      chatId,
-      `🤖 Примеры:
-
-Какая погода в Полтаве?
-
-А завтра?
-
-Который час в Токио?
-
-100 долларов в гривнах
-
-Какие сегодня новости Fortnite?
-
-Или просто отправь голосовое 🎤`
-    );
-  }
-
-
-  // RESET
-  if (
-    text === "/clear" ||
-    text === "/reset"
-  ) {
-
-    clearHistory(chatId);
-
-
-    return sendMessage(
-      chatId,
-      "🧹 История очищена."
-    );
-  }
-
-
-  await tg(
-    "sendChatAction",
-    {
-      chat_id: chatId,
-      action: "typing"
-    }
-  );
-
-
-  // ===================================================
-  // WEATHER FOLLOWUP
-  // ===================================================
-
-  if (
-    isTomorrowWeatherFollowup(
-      chatId,
-      text
-    )
-  ) {
-
-    const state =
-      toolStates.get(chatId);
-
-
-    const answer =
-      await getTomorrowWeather(
-        state.place
-      );
-
-
-    rememberExchange(
-      chatId,
-      text,
-      answer
-    );
-
-
-    return sendMessage(
-      chatId,
-      answer
-    );
-  }
-
-
-  // ===================================================
-  // WEATHER
-  // ===================================================
-
-  if (isWeatherRequest(text)) {
-
-    const place =
-      await geocodeFromMessage(
-        text
-      );
-
-
-    if (!place) {
-      return sendMessage(
-        chatId,
-        `⚠️ Я не смог определить город.
-
-Попробуй написать, например:
-
-Погода Полтава
-
-или:
-
-Какая погода в Киеве?`
-      );
-    }
-
-
-    const answer =
-      await getCurrentWeather(
-        place
-      );
-
-
-    toolStates.set(
-      chatId,
-      {
-        type:
-          "weather",
-
-        place
-      }
-    );
-
-
-    rememberExchange(
-      chatId,
-      text,
-      answer
-    );
-
-
-    return sendMessage(
-      chatId,
-      answer
-    );
-  }
-
-
-  // ===================================================
-  // TIME
-  // ===================================================
-
-  if (isTimeRequest(text)) {
-
-    const place =
-      await geocodeFromMessage(
-        text
-      );
-
-
-    if (!place) {
-      return sendMessage(
-        chatId,
-        `⚠️ Я не смог определить город.
-
-Например:
-
-Который час в Токио?`
-      );
-    }
-
-
-    const answer =
-      await getCurrentTime(
-        place
-      );
-
-
-    rememberExchange(
-      chatId,
-      text,
-      answer
-    );
-
-
-    return sendMessage(
-      chatId,
-      answer
-    );
-  }
-
-
-  // ===================================================
-  // CURRENCY
-  // ===================================================
-
-  if (isCurrencyRequest(text)) {
-
-    const answer =
-      await getCurrencyRate(
-        text
-      );
-
-
-    rememberExchange(
-      chatId,
-      text,
-      answer
-    );
-
-
-    return sendMessage(
-      chatId,
-      answer
-    );
-  }
-
-
-  // ===================================================
-  // NEWS / SEARCH
-  // ===================================================
-
-  const useSearch =
-    needsGoogleSearch(
-      text
-    );
-
-
   const answer =
     await askGemini(
       chatId,
-      text,
-      useSearch
+      [
+        {
+          text
+        }
+      ]
     );
 
 
@@ -1717,9 +776,7 @@ export async function GET(request) {
     new URL(request.url);
 
   const token =
-    url.searchParams.get(
-      "token"
-    );
+    url.searchParams.get("token");
 
 
   if (!BOT_TOKEN) {
@@ -1727,7 +784,7 @@ export async function GET(request) {
       {
         ok: false,
         error:
-          "TELEGRAM_BOT_TOKEN is not set"
+          "TELEGRAM_BOT_TOKEN is missing"
       },
       {
         status: 500
@@ -1740,8 +797,7 @@ export async function GET(request) {
     return Response.json(
       {
         ok: false,
-        error:
-          "Invalid token"
+        error: "Invalid token"
       },
       {
         status: 401
@@ -1753,7 +809,7 @@ export async function GET(request) {
   return Response.json({
     ok: true,
     message:
-      "Gemini Telegram webhook is ready"
+      "Gemini Telegram bot is running"
   });
 }
 
@@ -1767,9 +823,7 @@ export async function POST(request) {
     new URL(request.url);
 
   const token =
-    url.searchParams.get(
-      "token"
-    );
+    url.searchParams.get("token");
 
 
   if (!BOT_TOKEN) {
@@ -1777,7 +831,7 @@ export async function POST(request) {
       {
         ok: false,
         error:
-          "TELEGRAM_BOT_TOKEN is not set"
+          "TELEGRAM_BOT_TOKEN is missing"
       },
       {
         status: 500
@@ -1790,8 +844,7 @@ export async function POST(request) {
     return Response.json(
       {
         ok: false,
-        error:
-          "Invalid token"
+        error: "Invalid token"
       },
       {
         status: 401
@@ -1815,7 +868,6 @@ export async function POST(request) {
     return Response.json({
       ok: true
     });
-
 
   } catch (error) {
     console.error(
