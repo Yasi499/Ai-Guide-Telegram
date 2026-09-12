@@ -7,10 +7,16 @@ const TELEGRAM_API = BOT_TOKEN
 
 
 // =====================================================
-// ПРОСТАЯ ПАМЯТЬ
+// ПАМЯТЬ
 // =====================================================
 
-const conversations = new Map();
+// globalThis помогает сохранить память,
+// пока Vercel instance остаётся живым.
+const conversations =
+  globalThis.__geminiConversations || new Map();
+
+globalThis.__geminiConversations = conversations;
+
 const MAX_HISTORY_MESSAGES = 12;
 
 
@@ -48,7 +54,7 @@ async function tg(method, payload) {
 
 
 // =====================================================
-// ОТПРАВКА СООБЩЕНИЙ
+// ОТПРАВКА СООБЩЕНИЯ
 // =====================================================
 
 async function sendMessage(chatId, text) {
@@ -114,7 +120,320 @@ function clearHistory(chatId) {
 
 
 // =====================================================
-// GEMINI
+// НУЖЕН ЛИ GOOGLE SEARCH?
+// =====================================================
+
+function needsWebSearch(text) {
+  const t = text.toLowerCase();
+
+  const searchPatterns = [
+    // ПОГОДА
+    /погода/,
+    /температур/,
+    /дожд/,
+    /снег/,
+    /ветер/,
+    /прогноз погод/,
+    /weather/,
+    /temperature/,
+    /forecast/,
+
+    // НОВОСТИ / СВЕЖИЕ СОБЫТИЯ
+    /новост/,
+    /последние событ/,
+    /свежие событ/,
+    /что произошло сегодня/,
+    /что случилось сегодня/,
+    /останні новини/,
+    /новини/,
+    /latest news/,
+    /breaking news/,
+    /what happened today/,
+
+    // ТЕКУЩЕЕ ВРЕМЯ
+    /сколько сейчас времени/,
+    /который сейчас час/,
+    /который час/,
+    /скільки зараз часу/,
+    /котра година/,
+    /current time/,
+    /what time is it/,
+    /time in /,
+
+    // КУРСЫ / ЦЕНЫ
+    /курс доллар/,
+    /курс евро/,
+    /курс валют/,
+    /курс гривн/,
+    /цена биткоин/,
+    /курс биткоин/,
+    /bitcoin price/,
+    /btc price/,
+    /ethereum price/,
+    /eth price/,
+    /current price/,
+    /акции сегодня/,
+    /stock price/,
+
+    // СПОРТ
+    /кто выиграл/,
+    /кто победил/,
+    /результат матч/,
+    /счёт матч/,
+    /счет матч/,
+    /последний матч/,
+    /таблица чемпионата/,
+    /турнирная таблица/,
+    /who won/,
+    /match result/,
+    /latest match/,
+    /score /,
+
+    // ИГРЫ / ОБНОВЛЕНИЯ
+    /последнее обновление/,
+    /новое обновление/,
+    /вышло обновление/,
+    /патч/,
+    /обновление fortnite/,
+    /новости fortnite/,
+    /фортнайт новости/,
+    /fortnite news/,
+    /fortnite update/,
+    /fortnite patch/,
+
+    // ЯВНАЯ ПРОСЬБА ПОИСКАТЬ
+    /найди в интернете/,
+    /поищи в интернете/,
+    /проверь в интернете/,
+    /найди в гугле/,
+    /погугли/,
+    /пошукай в інтернеті/,
+    /перевір в інтернеті/,
+    /search the web/,
+    /search online/,
+    /google it/
+  ];
+
+  return searchPatterns.some(pattern => pattern.test(t));
+}
+
+
+// =====================================================
+// SYSTEM PROMPT
+// =====================================================
+
+function getSystemInstruction(useSearch) {
+  let prompt =
+    "You are a helpful AI assistant inside Telegram. " +
+
+    "Always answer in the same language as the user's latest message. " +
+
+    "If the user writes in Russian, answer in Russian. " +
+    "If the user writes in Ukrainian, answer in Ukrainian. " +
+    "If the user writes in English, answer in English. " +
+
+    "If the user changes language, change your response language too. " +
+
+    "Use the conversation history to understand follow-up requests. " +
+
+    "For example, if you previously wrote a text and the user says " +
+    "'make it shorter', 'make it prettier', 'rewrite it', 'simplify it', " +
+    "'make it funnier' or something similar, understand that they are " +
+    "referring to the previous relevant answer. " +
+
+    "Write naturally and clearly. " +
+    "Do not make answers unnecessarily long. " +
+
+    "Do not pretend you know live information if you do not have access to it. ";
+
+  if (useSearch) {
+    prompt +=
+      "Google Search is available for this request. " +
+      "Use it when needed to get current and recent information. " +
+      "Prefer fresh information when the user asks about weather, news, " +
+      "current time, prices, sports results or recent events. ";
+  }
+
+  return prompt;
+}
+
+
+// =====================================================
+// ОДИН ЗАПРОС К GEMINI
+// =====================================================
+
+async function requestGemini({
+  model,
+  contents,
+  useSearch
+}) {
+  const requestBody = {
+    systemInstruction: {
+      parts: [
+        {
+          text: getSystemInstruction(useSearch)
+        }
+      ]
+    },
+
+    contents,
+
+    generationConfig: {
+      temperature: 0.7,
+      maxOutputTokens: 2048
+    }
+  };
+
+
+  // Google Search добавляем ТОЛЬКО когда он нужен
+  if (useSearch) {
+    requestBody.tools = [
+      {
+        googleSearch: {}
+      }
+    ];
+  }
+
+
+  try {
+    const response = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
+      {
+        method: "POST",
+
+        headers: {
+          "Content-Type": "application/json",
+          "x-goog-api-key": GEMINI_API_KEY
+        },
+
+        body: JSON.stringify(requestBody)
+      }
+    );
+
+
+    let data;
+
+    try {
+      data = await response.json();
+    } catch {
+      data = {};
+    }
+
+
+    // ===============================================
+    // УСПЕХ
+    // ===============================================
+
+    if (response.ok) {
+      const parts =
+        data.candidates?.[0]?.content?.parts;
+
+      if (!parts || parts.length === 0) {
+        console.error(
+          `${model} returned no content:`,
+          JSON.stringify(data)
+        );
+
+        return {
+          success: false,
+          status: 500,
+          type: "EMPTY"
+        };
+      }
+
+
+      const answer = parts
+        .map(part => part.text || "")
+        .join("")
+        .trim();
+
+
+      if (!answer) {
+        return {
+          success: false,
+          status: 500,
+          type: "EMPTY"
+        };
+      }
+
+
+      return {
+        success: true,
+        answer
+      };
+    }
+
+
+    console.error(
+      `Gemini API error | model=${model} | search=${useSearch}`,
+      response.status,
+      JSON.stringify(data)
+    );
+
+
+    // ===============================================
+    // 429
+    // ===============================================
+
+    if (response.status === 429) {
+      return {
+        success: false,
+        status: 429,
+        type: "RATE_LIMIT"
+      };
+    }
+
+
+    // ===============================================
+    // 503
+    // ===============================================
+
+    if (response.status === 503) {
+      return {
+        success: false,
+        status: 503,
+        type: "OVERLOADED"
+      };
+    }
+
+
+    // ===============================================
+    // 404 — например модель недоступна
+    // ===============================================
+
+    if (response.status === 404) {
+      return {
+        success: false,
+        status: 404,
+        type: "MODEL_NOT_FOUND"
+      };
+    }
+
+
+    return {
+      success: false,
+      status: response.status,
+      type: "OTHER"
+    };
+
+
+  } catch (error) {
+    console.error(
+      `Gemini network error | model=${model}:`,
+      error
+    );
+
+    return {
+      success: false,
+      status: 0,
+      type: "NETWORK"
+    };
+  }
+}
+
+
+// =====================================================
+// GEMINI С RETRY + FALLBACK
 // =====================================================
 
 async function askGemini(chatId, userText) {
@@ -122,7 +441,9 @@ async function askGemini(chatId, userText) {
     return "⚠️ GEMINI_API_KEY не настроен в Vercel.";
   }
 
+
   const history = getHistory(chatId);
+
 
   const contents = [
     ...history,
@@ -136,116 +457,50 @@ async function askGemini(chatId, userText) {
     }
   ];
 
-  const requestBody = {
-    systemInstruction: {
-      parts: [
-        {
-          text:
-            "You are a helpful AI assistant inside Telegram. " +
 
-            "Always answer in the same language as the user's latest message. " +
-            "If the user writes in Russian, answer in Russian. " +
-            "If the user writes in Ukrainian, answer in Ukrainian. " +
-            "If the user writes in English, answer in English. " +
-            "If the user changes language, switch to that language. " +
+  // Определяем, нужен ли интернет
+  let useSearch = needsWebSearch(userText);
 
-            "Use conversation history to understand follow-up requests. " +
 
-            "If the user asks to make the previous response shorter, prettier, " +
-            "simpler, more detailed, funnier, more formal or rewritten, " +
-            "apply that request to the previous relevant answer. " +
+  console.log(
+    `Request | chat=${chatId} | search=${useSearch} | text=${userText.slice(0, 100)}`
+  );
 
-            "Use Google Search when current or recent information may be useful, " +
-            "including weather, current time, news, prices, sports results, " +
-            "recent events, software versions, public figures, companies, " +
-            "games, products and other changing information. " +
 
-            "Do not invent current facts. " +
-            "If search results are available, base the answer on them. " +
-
-            "Write naturally, clearly and not unnecessarily long."
-        }
-      ]
-    },
-
-    contents,
-
-    // =================================================
-    // GOOGLE SEARCH
-    // =================================================
-
-    tools: [
-      {
-        googleSearch: {}
-      }
-    ],
-
-    generationConfig: {
-      temperature: 0.7,
-      maxOutputTokens: 2048
-    }
-  };
+  // Основная + запасная модель
+  const models = [
+    "gemini-3.8-flash",
+    "gemini-3.5-flash"
+  ];
 
 
   // ===================================================
-  // ДО 3 ПОПЫТОК
+  // ПРОХОД ПО МОДЕЛЯМ
   // ===================================================
 
-  for (let attempt = 1; attempt <= 3; attempt++) {
+  for (const model of models) {
 
-    try {
+    // До трёх попыток одной модели
+    for (let attempt = 1; attempt <= 3; attempt++) {
 
-      const response = await fetch(
-        "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent",
-        {
-          method: "POST",
-
-          headers: {
-            "Content-Type": "application/json",
-            "x-goog-api-key": GEMINI_API_KEY
-          },
-
-          body: JSON.stringify(requestBody)
-        }
+      console.log(
+        `Gemini attempt ${attempt} | model=${model} | search=${useSearch}`
       );
 
 
-      const data = await response.json();
+      const result = await requestGemini({
+        model,
+        contents,
+        useSearch
+      });
 
 
-      // =================================================
+      // ===============================================
       // УСПЕХ
-      // =================================================
+      // ===============================================
 
-      if (response.ok) {
+      if (result.success) {
 
-        const parts =
-          data.candidates?.[0]?.content?.parts;
-
-
-        if (!parts || parts.length === 0) {
-
-          console.error(
-            "Gemini returned no content:",
-            JSON.stringify(data)
-          );
-
-          return "⚠️ Gemini не вернул ответ.";
-        }
-
-
-        const answer = parts
-          .map(part => part.text || "")
-          .join("")
-          .trim();
-
-
-        if (!answer) {
-          return "⚠️ Gemini вернул пустой ответ.";
-        }
-
-
-        // Сохраняем историю
         addToHistory(
           chatId,
           "user",
@@ -255,116 +510,179 @@ async function askGemini(chatId, userText) {
         addToHistory(
           chatId,
           "model",
-          answer
+          result.answer
         );
 
 
-        return answer;
+        return result.answer;
       }
 
 
-      // =================================================
-      // 503 — ПЕРЕГРУЗКА
-      // =================================================
+      // ===============================================
+      // SEARCH ПОЛУЧИЛ 429
+      // ===============================================
 
-      if (response.status === 503) {
-
-        console.error(
-          `Gemini 503 attempt ${attempt}:`,
-          JSON.stringify(data)
+      if (
+        result.status === 429 &&
+        useSearch
+      ) {
+        console.log(
+          "Google Search quota/rate limit reached. Retrying WITHOUT Search."
         );
 
 
-        if (attempt < 3) {
+        // Выключаем Search
+        useSearch = false;
 
-          await sleep(
-            attempt * 1200
+
+        const fallbackWithoutSearch =
+          await requestGemini({
+            model,
+            contents,
+            useSearch: false
+          });
+
+
+        if (fallbackWithoutSearch.success) {
+
+          const answer =
+            "⚠️ Сейчас веб-поиск недоступен, поэтому ответ может быть неактуальным.\n\n" +
+            fallbackWithoutSearch.answer;
+
+
+          addToHistory(
+            chatId,
+            "user",
+            userText
           );
 
+          addToHistory(
+            chatId,
+            "model",
+            answer
+          );
+
+
+          return answer;
+        }
+
+
+        // Если модель без Search перегружена —
+        // перейдём к retry / другой модели
+        if (
+          fallbackWithoutSearch.status === 503
+        ) {
+          await sleep(attempt * 1200);
           continue;
         }
 
 
-        return (
-          "⚠️ Gemini сейчас перегружен.\n\n" +
-          "Попробуй ещё раз через несколько секунд."
-        );
+        // Если и обычный Gemini получил 429 —
+        // пробуем запасную модель
+        if (
+          fallbackWithoutSearch.status === 429
+        ) {
+          break;
+        }
+
+
+        break;
       }
 
 
-      // =================================================
-      // 429 — ЛИМИТ / SEARCH QUOTA
-      // =================================================
+      // ===============================================
+      // 503 — ЖДЁМ И ПРОБУЕМ СНОВА
+      // ===============================================
 
-      if (response.status === 429) {
+      if (result.status === 503) {
 
-        console.error(
-          "Gemini 429:",
-          JSON.stringify(data)
+        console.log(
+          `${model} overloaded. Attempt ${attempt}/3`
         );
 
 
-        return (
-          "⚠️ Сейчас достигнут лимит Gemini API или Google Search.\n\n" +
-          "Попробуй позже."
+        if (attempt < 3) {
+          await sleep(attempt * 1200);
+          continue;
+        }
+
+
+        // Три попытки не помогли —
+        // переключаемся на следующую модель
+        console.log(
+          `${model} still overloaded. Trying fallback model...`
         );
+
+        break;
       }
 
 
-      // =================================================
-      // ПРОЧИЕ ОШИБКИ
-      // =================================================
+      // ===============================================
+      // NETWORK ERROR
+      // ===============================================
 
-      console.error(
-        "Gemini API error:",
-        response.status,
-        JSON.stringify(data)
-      );
+      if (result.type === "NETWORK") {
 
+        if (attempt < 3) {
+          await sleep(attempt * 1000);
+          continue;
+        }
 
-      return (
-        "⚠️ Gemini сейчас не смог ответить.\n\n" +
-        `Код ошибки: ${response.status}`
-      );
-
-
-    } catch (error) {
-
-      console.error(
-        `Gemini request error attempt ${attempt}:`,
-        error
-      );
-
-
-      if (attempt < 3) {
-
-        await sleep(
-          attempt * 1200
-        );
-
-        continue;
+        break;
       }
 
 
-      return (
-        "⚠️ Произошла ошибка при обращении к Gemini."
-      );
+      // ===============================================
+      // 404 — МОДЕЛЬ НЕДОСТУПНА
+      // ===============================================
+
+      if (result.status === 404) {
+
+        console.log(
+          `${model} is not available. Trying next model.`
+        );
+
+        break;
+      }
+
+
+      // ===============================================
+      // 429 БЕЗ SEARCH
+      // ===============================================
+
+      if (result.status === 429) {
+
+        console.log(
+          `${model} rate limit. Trying fallback model.`
+        );
+
+        break;
+      }
+
+
+      // Прочая ошибка
+      break;
     }
   }
 
 
-  return "⚠️ Gemini сейчас недоступен.";
+  // ===================================================
+  // ВСЕ МОДЕЛИ НЕ СРАБОТАЛИ
+  // ===================================================
+
+  return (
+    "⚠️ Gemini сейчас временно недоступен или достигнут лимит API.\n\n" +
+    "Попробуй ещё раз немного позже."
+  );
 }
 
 
 // =====================================================
-// ОБРАБОТКА СООБЩЕНИЙ
+// TELEGRAM MESSAGE
 // =====================================================
 
 async function handleMessage(message) {
-
-  const chatId =
-    message.chat.id;
+  const chatId = message.chat.id;
 
   const text =
     (message.text || "").trim();
@@ -383,15 +701,16 @@ async function handleMessage(message) {
 
     clearHistory(chatId);
 
+
     return sendMessage(
       chatId,
       `Привет! 👋
 
 Я AI-помощник на Gemini.
 
-Просто напиши мне любое сообщение.
+Можешь просто писать мне вопросы.
 
-Я могу помнить контекст недавней переписки и использовать Google Search для актуальной информации.`
+Для актуальной информации я могу использовать Google Search, когда это действительно необходимо.`
     );
   }
 
@@ -404,19 +723,19 @@ async function handleMessage(message) {
 
     return sendMessage(
       chatId,
-      `🤖 Просто напиши вопрос.
+      `🤖 Просто напиши свой вопрос.
 
 Например:
 
-Какая сейчас погода в Токио?
+Какая сейчас погода в Киеве?
 
 Какие сегодня новости Fortnite?
 
-Кто выиграл последний матч Барселоны?
+Который час в Нью-Йорке?
 
 Напиши описание для видео
 
-А потом:
+А потом можешь написать:
 
 Сделай покороче`
     );
@@ -424,7 +743,7 @@ async function handleMessage(message) {
 
 
   // ===================================================
-  // CLEAR
+  // RESET
   // ===================================================
 
   if (
@@ -434,6 +753,7 @@ async function handleMessage(message) {
 
     clearHistory(chatId);
 
+
     return sendMessage(
       chatId,
       "🧹 История диалога очищена."
@@ -442,7 +762,7 @@ async function handleMessage(message) {
 
 
   // ===================================================
-  // ПЕЧАТАЕТ...
+  // TYPING
   // ===================================================
 
   await tg("sendChatAction", {
@@ -462,10 +782,6 @@ async function handleMessage(message) {
     );
 
 
-  // ===================================================
-  // ОТВЕТ
-  // ===================================================
-
   return sendMessage(
     chatId,
     answer
@@ -478,7 +794,6 @@ async function handleMessage(message) {
 // =====================================================
 
 export async function GET(request) {
-
   const url =
     new URL(request.url);
 
@@ -487,12 +802,10 @@ export async function GET(request) {
 
 
   if (!BOT_TOKEN) {
-
     return Response.json(
       {
         ok: false,
-        error:
-          "TELEGRAM_BOT_TOKEN is not set"
+        error: "TELEGRAM_BOT_TOKEN is not set"
       },
       {
         status: 500
@@ -502,12 +815,10 @@ export async function GET(request) {
 
 
   if (token !== BOT_TOKEN) {
-
     return Response.json(
       {
         ok: false,
-        error:
-          "Invalid token"
+        error: "Invalid token"
       },
       {
         status: 401
@@ -518,8 +829,7 @@ export async function GET(request) {
 
   return Response.json({
     ok: true,
-    message:
-      "Gemini Telegram webhook is ready"
+    message: "Gemini Telegram webhook is ready"
   });
 }
 
@@ -529,7 +839,6 @@ export async function GET(request) {
 // =====================================================
 
 export async function POST(request) {
-
   const url =
     new URL(request.url);
 
@@ -538,12 +847,10 @@ export async function POST(request) {
 
 
   if (!BOT_TOKEN) {
-
     return Response.json(
       {
         ok: false,
-        error:
-          "TELEGRAM_BOT_TOKEN is not set"
+        error: "TELEGRAM_BOT_TOKEN is not set"
       },
       {
         status: 500
@@ -553,12 +860,10 @@ export async function POST(request) {
 
 
   if (token !== BOT_TOKEN) {
-
     return Response.json(
       {
         ok: false,
-        error:
-          "Invalid token"
+        error: "Invalid token"
       },
       {
         status: 401
@@ -568,13 +873,11 @@ export async function POST(request) {
 
 
   try {
-
     const update =
       await request.json();
 
 
     if (update.message) {
-
       await handleMessage(
         update.message
       );
@@ -597,8 +900,7 @@ export async function POST(request) {
     return Response.json(
       {
         ok: false,
-        error:
-          "Webhook handler failed"
+        error: "Webhook handler failed"
       },
       {
         status: 500
