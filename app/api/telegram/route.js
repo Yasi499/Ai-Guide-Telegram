@@ -6,9 +6,18 @@ const TELEGRAM_API = BOT_TOKEN
   : null;
 
 
-// ==========================================
+// =====================================================
+// ПРОСТАЯ ПАМЯТЬ ВНУТРИ ТЕКУЩЕГО VERCEL INSTANCE
+// =====================================================
+
+const conversations = new Map();
+
+const MAX_HISTORY_MESSAGES = 12;
+
+
+// =====================================================
 // TELEGRAM API
-// ==========================================
+// =====================================================
 
 async function tg(method, payload) {
   if (!TELEGRAM_API) {
@@ -39,17 +48,15 @@ async function tg(method, payload) {
 }
 
 
-// ==========================================
+// =====================================================
 // ОТПРАВКА СООБЩЕНИЯ
-// ==========================================
+// =====================================================
 
 async function sendMessage(chatId, text) {
   if (!text) {
     text = "Не вдалося отримати відповідь від Gemini.";
   }
 
-  // Telegram не позволяет отправлять слишком
-  // большие сообщения одним сообщением.
   for (let i = 0; i < text.length; i += 4000) {
     const part = text.slice(i, i + 4000);
 
@@ -61,72 +68,200 @@ async function sendMessage(chatId, text) {
 }
 
 
-// ==========================================
-// GEMINI
-// ==========================================
+// =====================================================
+// ПАУЗА
+// =====================================================
 
-async function askGemini(userText) {
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+
+// =====================================================
+// ПАМЯТЬ
+// =====================================================
+
+function getHistory(chatId) {
+  if (!conversations.has(chatId)) {
+    conversations.set(chatId, []);
+  }
+
+  return conversations.get(chatId);
+}
+
+
+function addToHistory(chatId, role, text) {
+  const history = getHistory(chatId);
+
+  history.push({
+    role,
+    parts: [
+      {
+        text
+      }
+    ]
+  });
+
+  while (history.length > MAX_HISTORY_MESSAGES) {
+    history.shift();
+  }
+}
+
+
+function clearHistory(chatId) {
+  conversations.delete(chatId);
+}
+
+
+// =====================================================
+// GEMINI
+// =====================================================
+
+async function askGemini(chatId, userText) {
   if (!GEMINI_API_KEY) {
     return "⚠️ GEMINI_API_KEY не налаштований у Vercel.";
   }
 
-  try {
-    const response = await fetch(
-      "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent",
-      {
-        method: "POST",
+  const history = getHistory(chatId);
 
-        headers: {
-          "Content-Type": "application/json",
-          "x-goog-api-key": GEMINI_API_KEY
-        },
+  const contents = [
+    ...history,
+    {
+      role: "user",
+      parts: [
+        {
+          text: userText
+        }
+      ]
+    }
+  ];
 
-        body: JSON.stringify({
-          systemInstruction: {
-            parts: [
-              {
-                text:
-                  "You are a helpful AI assistant inside Telegram. " +
+  const requestBody = {
+    systemInstruction: {
+      parts: [
+        {
+          text:
+            "You are a helpful AI assistant inside Telegram. " +
+            "Always answer in the same language as the user's latest message. " +
+            "If the user writes in Russian, answer in Russian. " +
+            "If the user writes in Ukrainian, answer in Ukrainian. " +
+            "If the user writes in English, answer in English. " +
+            "If the user changes language, switch language too. " +
+            "Use the conversation history to understand follow-up requests. " +
+            "If the user says 'make it shorter', 'rewrite it', 'make it prettier', " +
+            "'simpler', 'more detailed', 'funnier' or similar, apply that request " +
+            "to the previous relevant answer. " +
+            "Write naturally, clearly and not unnecessarily long."
+        }
+      ]
+    },
 
-                  "Always answer in the same language as the user's latest message. " +
+    contents,
 
-                  "If the user writes in Russian, answer in Russian. " +
-                  "If the user writes in Ukrainian, answer in Ukrainian. " +
-                  "If the user writes in English, answer in English. " +
-                  "If the user changes language, change your response language too. " +
+    generationConfig: {
+      temperature: 0.7,
+      maxOutputTokens: 2048
+    }
+  };
 
-                  "Write naturally and clearly. " +
 
-                  "Do not make answers unnecessarily long. " +
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const response = await fetch(
+        "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent",
+        {
+          method: "POST",
 
-                  "If the user asks to make something shorter, prettier, simpler, " +
-                  "more detailed, funnier, more formal or rewrite it, follow their request."
-              }
-            ]
+          headers: {
+            "Content-Type": "application/json",
+            "x-goog-api-key": GEMINI_API_KEY
           },
 
-          contents: [
-            {
-              role: "user",
-              parts: [
-                {
-                  text: userText
-                }
-              ]
-            }
-          ],
+          body: JSON.stringify(requestBody)
+        }
+      );
 
-          generationConfig: {
-            temperature: 0.7,
-            maxOutputTokens: 2048
-          }
-        })
+      const data = await response.json();
+
+
+      // =================================================
+      // УСПЕШНЫЙ ОТВЕТ
+      // =================================================
+
+      if (response.ok) {
+        const parts =
+          data.candidates?.[0]?.content?.parts;
+
+        if (!parts || parts.length === 0) {
+          console.error(
+            "Gemini returned no content:",
+            JSON.stringify(data)
+          );
+
+          return "⚠️ Gemini не повернув відповідь.";
+        }
+
+        const answer = parts
+          .map(part => part.text || "")
+          .join("")
+          .trim();
+
+        if (!answer) {
+          return "⚠️ Gemini повернув порожню відповідь.";
+        }
+
+
+        // Сохраняем в память
+        addToHistory(chatId, "user", userText);
+        addToHistory(chatId, "model", answer);
+
+        return answer;
       }
-    );
 
-    const data = await response.json();
 
-    if (!response.ok) {
+      // =================================================
+      // ЕСЛИ 503 — ПЕРЕГРУЗКА GEMINI
+      // =================================================
+
+      if (response.status === 503) {
+        console.error(
+          `Gemini 503, attempt ${attempt}:`,
+          JSON.stringify(data)
+        );
+
+        if (attempt < 3) {
+          await sleep(attempt * 1200);
+          continue;
+        }
+
+        return (
+          "⚠️ Gemini зараз перевантажений.\n\n" +
+          "Спробуй ще раз через кілька секунд."
+        );
+      }
+
+
+      // =================================================
+      // 429 — ЛИМИТ
+      // =================================================
+
+      if (response.status === 429) {
+        console.error(
+          "Gemini rate limit:",
+          JSON.stringify(data)
+        );
+
+        return (
+          "⚠️ Досягнуто ліміт Gemini API.\n\n" +
+          "Спробуй трохи пізніше."
+        );
+      }
+
+
+      // =================================================
+      // ПРОЧИЕ ОШИБКИ
+      // =================================================
+
       console.error(
         "Gemini API error:",
         response.status,
@@ -134,50 +269,35 @@ async function askGemini(userText) {
       );
 
       return (
-        "⚠️ Gemini зараз не зміг відповісти.\n\n" +
-        "Перевір GEMINI_API_KEY або Vercel Logs."
+        `⚠️ Gemini зараз не зміг відповісти.\n\n` +
+        `Код помилки: ${response.status}`
       );
-    }
 
-    const parts =
-      data.candidates?.[0]?.content?.parts;
-
-    if (!parts || parts.length === 0) {
+    } catch (error) {
       console.error(
-        "Gemini returned no content:",
-        JSON.stringify(data)
+        `Gemini request error, attempt ${attempt}:`,
+        error
       );
 
-      return "⚠️ Gemini не повернув відповідь.";
+      if (attempt < 3) {
+        await sleep(attempt * 1200);
+        continue;
+      }
+
+      return (
+        "⚠️ Сталася помилка при зверненні до Gemini."
+      );
     }
-
-    const answer = parts
-      .map(part => part.text || "")
-      .join("")
-      .trim();
-
-    if (!answer) {
-      return "⚠️ Gemini повернув порожню відповідь.";
-    }
-
-    return answer;
-
-  } catch (error) {
-    console.error(
-      "Gemini request error:",
-      error
-    );
-
-    return (
-      "⚠️ Сталася помилка при зверненні до Gemini."
-    );
   }
+
+
+  return "⚠️ Gemini зараз недоступний.";
 }
 
 
-// ==========================================
-// ОБРАБОТКА TELEGRAM СООБЩЕНИЯ
-// ==========================================
+// =====================================================
+// ОБРАБОТКА TELEGRAM СООБЩЕНИЙ
+// =====================================================
 
 async function handleMessage(message) {
   const chatId = message.chat.id;
@@ -190,43 +310,92 @@ async function handleMessage(message) {
   }
 
 
-  // /start
+  // ===================================================
+  // START
+  // ===================================================
+
   if (text === "/start") {
+    clearHistory(chatId);
+
     return sendMessage(
       chatId,
       `Привіт! 👋
 
 Я AI-помічник на Gemini.
 
-Просто напиши мені будь-яке повідомлення.`
+Просто напиши мені будь-яке повідомлення.
+
+Я також пам'ятаю контекст недавньої розмови.`
     );
   }
 
 
-  // /help
+  // ===================================================
+  // HELP
+  // ===================================================
+
   if (text === "/help") {
     return sendMessage(
       chatId,
       `🤖 Просто напиши своє питання.
 
-Я можу відповідати українською, російською, англійською та іншими мовами.`
+Наприклад:
+
+Напиши опис для відео
+
+Потім можеш написати:
+
+Зроби коротше
+
+або:
+
+Зроби красивіше`
     );
   }
 
 
-  // Показываем "печатает..."
+  // ===================================================
+  // ОЧИСТКА ПАМЯТИ
+  // ===================================================
+
+  if (
+    text === "/clear" ||
+    text === "/reset"
+  ) {
+    clearHistory(chatId);
+
+    return sendMessage(
+      chatId,
+      "🧹 Історію діалогу очищено."
+    );
+  }
+
+
+  // ===================================================
+  // ПЕЧАТАЕТ...
+  // ===================================================
+
   await tg("sendChatAction", {
     chat_id: chatId,
     action: "typing"
   });
 
 
-  // Отправляем сообщение Gemini
+  // ===================================================
+  // GEMINI
+  // ===================================================
+
   const answer =
-    await askGemini(text);
+    await askGemini(
+      chatId,
+      text
+    );
 
 
-  // Отправляем ответ пользователю
+  // ===================================================
+  // ОТВЕТ
+  // ===================================================
+
   return sendMessage(
     chatId,
     answer
@@ -234,9 +403,9 @@ async function handleMessage(message) {
 }
 
 
-// ==========================================
-// GET — ПРОВЕРКА WEBHOOK
-// ==========================================
+// =====================================================
+// GET — ПРОВЕРКА ENDPOINT
+// =====================================================
 
 export async function GET(request) {
   const url =
@@ -246,7 +415,6 @@ export async function GET(request) {
     url.searchParams.get("token");
 
 
-  // Проверяем переменную Vercel
   if (!BOT_TOKEN) {
     return Response.json(
       {
@@ -261,12 +429,12 @@ export async function GET(request) {
   }
 
 
-  // Проверяем token в URL
   if (token !== BOT_TOKEN) {
     return Response.json(
       {
         ok: false,
-        error: "Invalid token"
+        error:
+          "Invalid token"
       },
       {
         status: 401
@@ -283,9 +451,9 @@ export async function GET(request) {
 }
 
 
-// ==========================================
+// =====================================================
 // POST — TELEGRAM WEBHOOK
-// ==========================================
+// =====================================================
 
 export async function POST(request) {
   const url =
@@ -295,7 +463,6 @@ export async function POST(request) {
     url.searchParams.get("token");
 
 
-  // Проверяем Telegram token
   if (!BOT_TOKEN) {
     return Response.json(
       {
@@ -310,12 +477,12 @@ export async function POST(request) {
   }
 
 
-  // Защита webhook
   if (token !== BOT_TOKEN) {
     return Response.json(
       {
         ok: false,
-        error: "Invalid token"
+        error:
+          "Invalid token"
       },
       {
         status: 401
@@ -329,7 +496,6 @@ export async function POST(request) {
       await request.json();
 
 
-    // Получили обычное сообщение
     if (update.message) {
       await handleMessage(
         update.message
