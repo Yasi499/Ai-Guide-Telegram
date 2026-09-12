@@ -7,11 +7,10 @@ const TELEGRAM_API = BOT_TOKEN
 
 
 // =====================================================
-// ПРОСТАЯ ПАМЯТЬ ВНУТРИ ТЕКУЩЕГО VERCEL INSTANCE
+// ПРОСТАЯ ПАМЯТЬ
 // =====================================================
 
 const conversations = new Map();
-
 const MAX_HISTORY_MESSAGES = 12;
 
 
@@ -49,12 +48,12 @@ async function tg(method, payload) {
 
 
 // =====================================================
-// ОТПРАВКА СООБЩЕНИЯ
+// ОТПРАВКА СООБЩЕНИЙ
 // =====================================================
 
 async function sendMessage(chatId, text) {
   if (!text) {
-    text = "Не вдалося отримати відповідь від Gemini.";
+    text = "Не удалось получить ответ.";
   }
 
   for (let i = 0; i < text.length; i += 4000) {
@@ -62,7 +61,8 @@ async function sendMessage(chatId, text) {
 
     await tg("sendMessage", {
       chat_id: chatId,
-      text: part
+      text: part,
+      disable_web_page_preview: true
     });
   }
 }
@@ -119,7 +119,7 @@ function clearHistory(chatId) {
 
 async function askGemini(chatId, userText) {
   if (!GEMINI_API_KEY) {
-    return "⚠️ GEMINI_API_KEY не налаштований у Vercel.";
+    return "⚠️ GEMINI_API_KEY не настроен в Vercel.";
   }
 
   const history = getHistory(chatId);
@@ -142,21 +142,43 @@ async function askGemini(chatId, userText) {
         {
           text:
             "You are a helpful AI assistant inside Telegram. " +
+
             "Always answer in the same language as the user's latest message. " +
             "If the user writes in Russian, answer in Russian. " +
             "If the user writes in Ukrainian, answer in Ukrainian. " +
             "If the user writes in English, answer in English. " +
-            "If the user changes language, switch language too. " +
-            "Use the conversation history to understand follow-up requests. " +
-            "If the user says 'make it shorter', 'rewrite it', 'make it prettier', " +
-            "'simpler', 'more detailed', 'funnier' or similar, apply that request " +
-            "to the previous relevant answer. " +
+            "If the user changes language, switch to that language. " +
+
+            "Use conversation history to understand follow-up requests. " +
+
+            "If the user asks to make the previous response shorter, prettier, " +
+            "simpler, more detailed, funnier, more formal or rewritten, " +
+            "apply that request to the previous relevant answer. " +
+
+            "Use Google Search when current or recent information may be useful, " +
+            "including weather, current time, news, prices, sports results, " +
+            "recent events, software versions, public figures, companies, " +
+            "games, products and other changing information. " +
+
+            "Do not invent current facts. " +
+            "If search results are available, base the answer on them. " +
+
             "Write naturally, clearly and not unnecessarily long."
         }
       ]
     },
 
     contents,
+
+    // =================================================
+    // GOOGLE SEARCH
+    // =================================================
+
+    tools: [
+      {
+        googleSearch: {}
+      }
+    ],
 
     generationConfig: {
       temperature: 0.7,
@@ -165,8 +187,14 @@ async function askGemini(chatId, userText) {
   };
 
 
+  // ===================================================
+  // ДО 3 ПОПЫТОК
+  // ===================================================
+
   for (let attempt = 1; attempt <= 3; attempt++) {
+
     try {
+
       const response = await fetch(
         "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent",
         {
@@ -181,79 +209,104 @@ async function askGemini(chatId, userText) {
         }
       );
 
+
       const data = await response.json();
 
 
       // =================================================
-      // УСПЕШНЫЙ ОТВЕТ
+      // УСПЕХ
       // =================================================
 
       if (response.ok) {
+
         const parts =
           data.candidates?.[0]?.content?.parts;
 
+
         if (!parts || parts.length === 0) {
+
           console.error(
             "Gemini returned no content:",
             JSON.stringify(data)
           );
 
-          return "⚠️ Gemini не повернув відповідь.";
+          return "⚠️ Gemini не вернул ответ.";
         }
+
 
         const answer = parts
           .map(part => part.text || "")
           .join("")
           .trim();
 
+
         if (!answer) {
-          return "⚠️ Gemini повернув порожню відповідь.";
+          return "⚠️ Gemini вернул пустой ответ.";
         }
 
 
-        // Сохраняем в память
-        addToHistory(chatId, "user", userText);
-        addToHistory(chatId, "model", answer);
+        // Сохраняем историю
+        addToHistory(
+          chatId,
+          "user",
+          userText
+        );
+
+        addToHistory(
+          chatId,
+          "model",
+          answer
+        );
+
 
         return answer;
       }
 
 
       // =================================================
-      // ЕСЛИ 503 — ПЕРЕГРУЗКА GEMINI
+      // 503 — ПЕРЕГРУЗКА
       // =================================================
 
       if (response.status === 503) {
+
         console.error(
-          `Gemini 503, attempt ${attempt}:`,
+          `Gemini 503 attempt ${attempt}:`,
           JSON.stringify(data)
         );
 
+
         if (attempt < 3) {
-          await sleep(attempt * 1200);
+
+          await sleep(
+            attempt * 1200
+          );
+
           continue;
         }
 
+
         return (
-          "⚠️ Gemini зараз перевантажений.\n\n" +
-          "Спробуй ще раз через кілька секунд."
+          "⚠️ Gemini сейчас перегружен.\n\n" +
+          "Попробуй ещё раз через несколько секунд."
         );
       }
 
 
       // =================================================
-      // 429 — ЛИМИТ
+      // 429 — ЛИМИТ / SEARCH QUOTA
       // =================================================
 
       if (response.status === 429) {
+
         console.error(
-          "Gemini rate limit:",
+          "Gemini 429:",
           JSON.stringify(data)
         );
 
+
         return (
-          "⚠️ Досягнуто ліміт Gemini API.\n\n" +
-          "Спробуй трохи пізніше."
+          "⚠️ Сейчас достигнут лимит Gemini API или Google Search.\n\n" +
+          "Попробуй позже."
         );
       }
 
@@ -268,42 +321,54 @@ async function askGemini(chatId, userText) {
         JSON.stringify(data)
       );
 
+
       return (
-        `⚠️ Gemini зараз не зміг відповісти.\n\n` +
-        `Код помилки: ${response.status}`
+        "⚠️ Gemini сейчас не смог ответить.\n\n" +
+        `Код ошибки: ${response.status}`
       );
 
+
     } catch (error) {
+
       console.error(
-        `Gemini request error, attempt ${attempt}:`,
+        `Gemini request error attempt ${attempt}:`,
         error
       );
 
+
       if (attempt < 3) {
-        await sleep(attempt * 1200);
+
+        await sleep(
+          attempt * 1200
+        );
+
         continue;
       }
 
+
       return (
-        "⚠️ Сталася помилка при зверненні до Gemini."
+        "⚠️ Произошла ошибка при обращении к Gemini."
       );
     }
   }
 
 
-  return "⚠️ Gemini зараз недоступний.";
+  return "⚠️ Gemini сейчас недоступен.";
 }
 
 
 // =====================================================
-// ОБРАБОТКА TELEGRAM СООБЩЕНИЙ
+// ОБРАБОТКА СООБЩЕНИЙ
 // =====================================================
 
 async function handleMessage(message) {
-  const chatId = message.chat.id;
+
+  const chatId =
+    message.chat.id;
 
   const text =
     (message.text || "").trim();
+
 
   if (!text) {
     return;
@@ -315,17 +380,18 @@ async function handleMessage(message) {
   // ===================================================
 
   if (text === "/start") {
+
     clearHistory(chatId);
 
     return sendMessage(
       chatId,
-      `Привіт! 👋
+      `Привет! 👋
 
-Я AI-помічник на Gemini.
+Я AI-помощник на Gemini.
 
-Просто напиши мені будь-яке повідомлення.
+Просто напиши мне любое сообщение.
 
-Я також пам'ятаю контекст недавньої розмови.`
+Я могу помнить контекст недавней переписки и использовать Google Search для актуальной информации.`
     );
   }
 
@@ -335,38 +401,42 @@ async function handleMessage(message) {
   // ===================================================
 
   if (text === "/help") {
+
     return sendMessage(
       chatId,
-      `🤖 Просто напиши своє питання.
+      `🤖 Просто напиши вопрос.
 
-Наприклад:
+Например:
 
-Напиши опис для відео
+Какая сейчас погода в Токио?
 
-Потім можеш написати:
+Какие сегодня новости Fortnite?
 
-Зроби коротше
+Кто выиграл последний матч Барселоны?
 
-або:
+Напиши описание для видео
 
-Зроби красивіше`
+А потом:
+
+Сделай покороче`
     );
   }
 
 
   // ===================================================
-  // ОЧИСТКА ПАМЯТИ
+  // CLEAR
   // ===================================================
 
   if (
     text === "/clear" ||
     text === "/reset"
   ) {
+
     clearHistory(chatId);
 
     return sendMessage(
       chatId,
-      "🧹 Історію діалогу очищено."
+      "🧹 История диалога очищена."
     );
   }
 
@@ -404,10 +474,11 @@ async function handleMessage(message) {
 
 
 // =====================================================
-// GET — ПРОВЕРКА ENDPOINT
+// GET
 // =====================================================
 
 export async function GET(request) {
+
   const url =
     new URL(request.url);
 
@@ -416,6 +487,7 @@ export async function GET(request) {
 
 
   if (!BOT_TOKEN) {
+
     return Response.json(
       {
         ok: false,
@@ -430,6 +502,7 @@ export async function GET(request) {
 
 
   if (token !== BOT_TOKEN) {
+
     return Response.json(
       {
         ok: false,
@@ -452,10 +525,11 @@ export async function GET(request) {
 
 
 // =====================================================
-// POST — TELEGRAM WEBHOOK
+// POST
 // =====================================================
 
 export async function POST(request) {
+
   const url =
     new URL(request.url);
 
@@ -464,6 +538,7 @@ export async function POST(request) {
 
 
   if (!BOT_TOKEN) {
+
     return Response.json(
       {
         ok: false,
@@ -478,6 +553,7 @@ export async function POST(request) {
 
 
   if (token !== BOT_TOKEN) {
+
     return Response.json(
       {
         ok: false,
@@ -492,11 +568,13 @@ export async function POST(request) {
 
 
   try {
+
     const update =
       await request.json();
 
 
     if (update.message) {
+
       await handleMessage(
         update.message
       );
@@ -507,7 +585,9 @@ export async function POST(request) {
       ok: true
     });
 
+
   } catch (error) {
+
     console.error(
       "Webhook error:",
       error
