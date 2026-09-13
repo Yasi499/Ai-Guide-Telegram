@@ -12,13 +12,14 @@ const ALLOWED_USER_ID = process.env.TELEGRAM_ALLOWED_USER_ID
   ? Number(process.env.TELEGRAM_ALLOWED_USER_ID)
   : null;
 
-const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}`;
+const TELEGRAM_API =
+  `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}`;
 
 const OPENROUTER_API =
   "https://openrouter.ai/api/v1/chat/completions";
 
 // ======================================================
-// TELEGRAM SEND
+// TELEGRAM
 // ======================================================
 
 async function sendMessage(chatId, text) {
@@ -26,7 +27,6 @@ async function sendMessage(chatId, text) {
     text = "Не удалось получить ответ.";
   }
 
-  // Telegram ограничивает длину одного сообщения
   for (let i = 0; i < text.length; i += 4000) {
     const part = text.slice(i, i + 4000);
 
@@ -45,90 +45,126 @@ async function sendMessage(chatId, text) {
     );
 
     if (!response.ok) {
-      const error = await response.text();
-      console.error("❌ Telegram error:", error);
+      console.error(
+        "Telegram error:",
+        await response.text()
+      );
     }
   }
 }
 
 // ======================================================
-// ОПРЕДЕЛЯЕМ, НУЖЕН ЛИ ИНТЕРНЕТ
+// ТИП ЗАПРОСА
 // ======================================================
+
+function isFastWebRequest(text) {
+  const t = text.toLowerCase();
+
+  const words = [
+    // погода
+    "погода",
+    "погоде",
+    "температура",
+    "дождь",
+    "снег",
+    "weather",
+
+    // валюты
+    "курс дол",
+    "курс евро",
+    "курс грив",
+    "доллар",
+    "долара",
+    "долларов",
+    "евро",
+    "usd",
+    "eur",
+    "uah",
+
+    // цены
+    "цена сейчас",
+    "сколько стоит сейчас",
+    "какая цена",
+    "ціна",
+    "скільки коштує",
+
+    // простые свежие данные
+    "который час",
+    "сколько сейчас времени",
+    "який зараз час",
+  ];
+
+  return words.some((word) => t.includes(word));
+}
 
 function needsInternet(text) {
   const t = text.toLowerCase();
 
   const words = [
-    // Русский
     "сейчас",
     "сегодня",
     "вчера",
     "завтра",
+
     "новости",
     "что нового",
     "последние",
     "последний",
     "последняя",
     "актуаль",
+
     "погода",
     "температура",
+
     "курс",
     "доллар",
+    "долара",
     "евро",
+
     "цена",
     "сколько стоит",
-    "когда выйдет",
-    "когда будет",
+
     "обновление",
     "обнова",
-    "вышло",
-    "вышел",
-    "результат",
-    "кто победил",
 
-    // Украинский
+    "вышел",
+    "вышло",
+    "выйдет",
+    "когда выйдет",
+    "когда будет",
+
     "зараз",
     "сьогодні",
-    "вчора",
     "новини",
     "що нового",
-    "останні",
-    "актуаль",
     "погода",
-    "температура",
     "курс",
     "ціна",
-    "скільки коштує",
     "оновлення",
-    "коли вийде",
-    "хто переміг",
 
-    // English
     "today",
     "current",
     "currently",
     "latest",
     "news",
     "weather",
-    "temperature",
     "price",
     "update",
     "release",
     "right now",
-    "who won",
   ];
 
   return words.some((word) => t.includes(word));
 }
 
 // ======================================================
-// TAVILY SEARCH
+// TAVILY
 // ======================================================
 
 async function searchWeb(query) {
   try {
     if (!TAVILY_API_KEY) {
-      console.error("❌ TAVILY_API_KEY отсутствует");
+      console.error("TAVILY_API_KEY отсутствует");
       return null;
     }
 
@@ -156,68 +192,109 @@ async function searchWeb(query) {
 
     const raw = await response.text();
 
-    console.log("🌐 Tavily status:", response.status);
     console.log(
-      "🌐 Tavily response:",
-      raw.slice(0, 2000)
+      "🌐 Tavily status:",
+      response.status
     );
 
     if (!response.ok) {
-      console.error("❌ Tavily error:", raw);
+      console.error(
+        "❌ Tavily error:",
+        raw
+      );
+
       return null;
     }
 
-    let data;
+    const data = JSON.parse(raw);
 
-    try {
-      data = JSON.parse(raw);
-    } catch (error) {
-      console.error("❌ Tavily JSON error:", error);
-      return null;
+    return data;
+  } catch (error) {
+    console.error(
+      "❌ Tavily exception:",
+      error
+    );
+
+    return null;
+  }
+}
+
+// ======================================================
+// БЫСТРЫЙ ОТВЕТ TAVILY
+// ======================================================
+
+function makeFastWebAnswer(data) {
+  if (!data) {
+    return null;
+  }
+
+  let answer = "";
+
+  if (data.answer) {
+    answer += data.answer.trim();
+  }
+
+  // Добавляем 1-2 источника
+  if (
+    Array.isArray(data.results) &&
+    data.results.length > 0
+  ) {
+    answer += "\n\nИсточники:";
+
+    const sources = data.results.slice(0, 2);
+
+    for (const item of sources) {
+      if (item.url) {
+        answer += `\n${item.url}`;
+      }
     }
+  }
 
-    let result = "";
+  return answer || null;
+}
 
-    if (data.answer) {
-      result += `
-ОТВЕТ ПОИСКА:
+// ======================================================
+// КОНТЕКСТ ДЛЯ AI
+// ======================================================
+
+function makeWebContext(data) {
+  if (!data) {
+    return null;
+  }
+
+  let result = "";
+
+  if (data.answer) {
+    result += `
+КРАТКИЙ ОТВЕТ ПОИСКА:
 ${data.answer}
 
 `;
-    }
+  }
 
-    if (
-      Array.isArray(data.results) &&
-      data.results.length > 0
-    ) {
-      result += data.results
-        .map((item, index) => {
-          return `
+  if (
+    Array.isArray(data.results) &&
+    data.results.length > 0
+  ) {
+    result += data.results
+      .map((item, index) => {
+        return `
 ИСТОЧНИК ${index + 1}
 
 Название:
 ${item.title || "Без названия"}
 
 Информация:
-${item.content || "Нет описания"}
+${item.content || "Нет информации"}
 
 URL:
-${item.url || "Нет ссылки"}
+${item.url || ""}
 `;
-        })
-        .join("\n");
-    }
-
-    if (!result.trim()) {
-      console.log("⚠️ Tavily: результатов нет");
-      return null;
-    }
-
-    return result;
-  } catch (error) {
-    console.error("❌ Tavily exception:", error);
-    return null;
+      })
+      .join("\n");
   }
+
+  return result || null;
 }
 
 // ======================================================
@@ -229,58 +306,45 @@ async function askAI(userText, webContext = null) {
     return "⚠️ OPENROUTER_API_KEY не настроен.";
   }
 
-  const currentDate = new Date().toLocaleString(
-    "ru-RU",
-    {
-      timeZone: "Europe/Kyiv",
-    }
-  );
+  const currentDate =
+    new Date().toLocaleString(
+      "ru-RU",
+      {
+        timeZone: "Europe/Kyiv",
+      }
+    );
 
   let systemPrompt = `
-Ты универсальный AI-ассистент в Telegram.
+Ты универсальный AI-ассистент.
 
 Текущая дата и время:
 ${currentDate}
 
-ПРАВИЛА:
+Правила:
 
 - Отвечай на языке пользователя.
-- Русский вопрос -> русский ответ.
-- Украинский вопрос -> украинский ответ.
-- Английский вопрос -> английский ответ.
-
-- Отвечай естественно и понятно.
-- Не пиши слишком много без необходимости.
-
-- Не выдумывай актуальные данные.
-
-- Если ниже предоставлена информация из веб-поиска,
-используй её для актуальных данных.
-
-- Если веб-поиск был выполнен,
-не говори пользователю, что у тебя нет доступа к интернету.
-
-- Для погоды, новостей, цен, курсов,
-обновлений и текущих событий используй результаты поиска.
-
-- Если найденной информации недостаточно,
-честно скажи об этом.
+- Пиши понятно и естественно.
+- Не пиши слишком длинно без необходимости.
+- Не выдумывай свежие факты.
+- Если предоставлены результаты поиска,
+  используй их как источник актуальной информации.
+- Если есть веб-данные, не говори,
+  что у тебя нет доступа к интернету.
 `;
 
   if (webContext) {
     systemPrompt += `
 
 ==================================================
-РЕЗУЛЬТАТЫ ЖИВОГО ПОИСКА В ИНТЕРНЕТЕ
+АКТУАЛЬНЫЕ ДАННЫЕ ИЗ ИНТЕРНЕТА
 ==================================================
 
 ${webContext}
 
 ==================================================
 
-Сформируй ответ пользователю на основе этих результатов.
-
-Не придумывай факты, которых нет в результатах.
+Ответь пользователю с учётом этих данных.
+Не придумывай факты.
 `;
   }
 
@@ -312,7 +376,7 @@ ${webContext}
         ],
 
         temperature: 0.7,
-        max_tokens: 2000,
+        max_tokens: 1500,
       }),
     }
   );
@@ -324,14 +388,9 @@ ${webContext}
     response.status
   );
 
-  console.log(
-    "🤖 OpenRouter response:",
-    raw.slice(0, 2000)
-  );
-
   if (!response.ok) {
     console.error(
-      "❌ OpenRouter API error:",
+      "❌ OpenRouter error:",
       raw
     );
 
@@ -342,24 +401,14 @@ ${webContext}
 
   try {
     data = JSON.parse(raw);
-  } catch (error) {
-    console.error(
-      "❌ OpenRouter JSON error:",
-      error
-    );
-
-    return "⚠️ OpenRouter вернул неправильный ответ.";
+  } catch {
+    return "⚠️ Ошибка ответа OpenRouter.";
   }
 
   const answer =
     data?.choices?.[0]?.message?.content;
 
   if (!answer) {
-    console.error(
-      "❌ OpenRouter empty response:",
-      raw
-    );
-
     return "⚠️ AI не вернул ответ.";
   }
 
@@ -367,30 +416,32 @@ ${webContext}
 }
 
 // ======================================================
-// TELEGRAM WEBHOOK
+// WEBHOOK
 // ======================================================
 
 export async function POST(request) {
   try {
     console.log(
-      "🚀 VERSION: OPENROUTER-TEST-2026"
+      "🚀 VERSION: OPENROUTER-TAVILY-FAST-V2"
     );
 
-    const update = await request.json();
+    const update =
+      await request.json();
 
-    const message = update.message;
+    const message =
+      update.message;
 
-    // Например Telegram service update
     if (!message) {
       return Response.json({
         ok: true,
       });
     }
 
-    const chatId = message.chat?.id;
-    const userId = message.from?.id;
+    const chatId =
+      message.chat?.id;
 
-    console.log("👤 User:", userId);
+    const userId =
+      message.from?.id;
 
     // ==================================================
     // ПРИВАТНЫЙ ДОСТУП
@@ -400,11 +451,6 @@ export async function POST(request) {
       ALLOWED_USER_ID &&
       userId !== ALLOWED_USER_ID
     ) {
-      console.log(
-        "⛔ Пользователь заблокирован:",
-        userId
-      );
-
       await sendMessage(
         chatId,
         "⛔ Это приватный бот."
@@ -419,12 +465,13 @@ export async function POST(request) {
     // ТЕКСТ
     // ==================================================
 
-    const text = message.text;
+    const text =
+      message.text;
 
     if (!text) {
       await sendMessage(
         chatId,
-        "Пока эта версия работает только с текстом."
+        "Пока эта версия работает с текстовыми сообщениями."
       );
 
       return Response.json({
@@ -432,46 +479,77 @@ export async function POST(request) {
       });
     }
 
-    console.log("💬 Message:", text);
+    console.log(
+      "💬 Сообщение:",
+      text
+    );
 
     // ==================================================
-    // WEB SEARCH
+    // 1. БЫСТРЫЙ WEB
+    // ==================================================
+
+    if (isFastWebRequest(text)) {
+      console.log(
+        "⚡ Быстрый интернет-запрос"
+      );
+
+      const webData =
+        await searchWeb(text);
+
+      const fastAnswer =
+        makeFastWebAnswer(webData);
+
+      if (fastAnswer) {
+        await sendMessage(
+          chatId,
+          fastAnswer
+        );
+
+        console.log(
+          "⚡ Ответ отправлен напрямую из Tavily"
+        );
+
+        return Response.json({
+          ok: true,
+        });
+      }
+
+      console.log(
+        "⚠️ Быстрый поиск не дал ответа, используем AI"
+      );
+    }
+
+    // ==================================================
+    // 2. АКТУАЛЬНЫЙ СЛОЖНЫЙ ЗАПРОС
     // ==================================================
 
     let webContext = null;
 
     if (needsInternet(text)) {
-      console.log("🌐 Нужен интернет");
+      console.log(
+        "🌐 Нужен интернет + AI"
+      );
 
-      webContext = await searchWeb(text);
+      const webData =
+        await searchWeb(text);
 
-      if (webContext) {
-        console.log(
-          "✅ Tavily поиск успешен"
-        );
-      } else {
-        console.log(
-          "⚠️ Tavily поиск не удался"
-        );
-      }
+      webContext =
+        makeWebContext(webData);
     } else {
       console.log(
-        "🧠 Интернет для запроса не нужен"
+        "🧠 Обычный AI запрос"
       );
     }
 
     // ==================================================
-    // AI
+    // 3. OPENROUTER
     // ==================================================
 
-    const answer = await askAI(
-      text,
-      webContext
-    );
-
-    // ==================================================
-    // ОТПРАВЛЯЕМ
-    // ==================================================
+    const answer =
+      await askAI(
+        text,
+        webContext
+      );
 
     await sendMessage(
       chatId,
@@ -498,14 +576,16 @@ export async function POST(request) {
 }
 
 // ======================================================
-// ПРОВЕРКА В БРАУЗЕРЕ
+// GET TEST
 // ======================================================
 
 export async function GET() {
   return Response.json({
-    version: "OPENROUTER-TEST-2026",
+    version:
+      "OPENROUTER-TAVILY-FAST-V2",
 
-    status: "Bot is running",
+    status:
+      "Bot is running",
 
     telegram:
       !!TELEGRAM_BOT_TOKEN,
