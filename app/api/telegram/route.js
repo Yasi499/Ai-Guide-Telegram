@@ -1,890 +1,311 @@
 export const runtime = "nodejs";
 
-const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+const TAVILY_API_KEY = process.env.TAVILY_API_KEY;
 
-const TELEGRAM_API = BOT_TOKEN
-  ? `https://api.telegram.org/bot${BOT_TOKEN}`
+// Если добавлял приватный ID в Vercel
+const ALLOWED_USER_ID = process.env.TELEGRAM_ALLOWED_USER_ID
+  ? Number(process.env.TELEGRAM_ALLOWED_USER_ID)
   : null;
 
+const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}`;
 
-// =====================================================
-// MODELS
-// =====================================================
-
-const MODELS = [
-  "gemini-3.8-flash",
-  "gemini-3.5-flash"
-];
-
-
-// =====================================================
-// MEMORY
-// =====================================================
-
-const conversations =
-  globalThis.__geminiConversations || new Map();
-
-globalThis.__geminiConversations = conversations;
-
-const MAX_HISTORY_MESSAGES = 14;
-
-
-// =====================================================
+// ==============================
 // TELEGRAM
-// =====================================================
+// ==============================
 
-async function tg(method, payload) {
-  if (!TELEGRAM_API) {
-    throw new Error("TELEGRAM_BOT_TOKEN is missing");
+async function sendMessage(chatId, text) {
+  if (!text) text = "Не удалось получить ответ.";
+
+  for (let i = 0; i < text.length; i += 4000) {
+    const part = text.slice(i, i + 4000);
+
+    await fetch(`${TELEGRAM_API}/sendMessage`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        chat_id: chatId,
+        text: part,
+      }),
+    });
+  }
+}
+
+// ==============================
+// НУЖЕН ЛИ ИНТЕРНЕТ
+// ==============================
+
+function needsInternet(text) {
+  const t = text.toLowerCase();
+
+  const currentWords = [
+    "сейчас",
+    "сегодня",
+    "вчера",
+    "завтра",
+    "последние",
+    "последний",
+    "последняя",
+    "новости",
+    "нового",
+    "что нового",
+    "актуаль",
+    "погода",
+    "температура",
+    "курс",
+    "доллар",
+    "евро",
+    "цена",
+    "стоит сейчас",
+    "вышло",
+    "вышел",
+    "обновление",
+    "обнова",
+    "когда выйдет",
+    "когда будет",
+    "новий",
+    "сьогодні",
+    "зараз",
+    "погода",
+    "новини",
+    "курс",
+    "актуальн",
+    "latest",
+    "today",
+    "current",
+    "news",
+    "weather",
+    "price",
+    "update",
+    "release",
+  ];
+
+  return currentWords.some((word) => t.includes(word));
+}
+
+// ==============================
+// TAVILY SEARCH
+// ==============================
+
+async function searchWeb(query) {
+  try {
+    const response = await fetch("https://api.tavily.com/search", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        api_key: TAVILY_API_KEY,
+        query,
+        search_depth: "basic",
+        max_results: 5,
+        include_answer: true,
+      }),
+    });
+
+    if (!response.ok) {
+      console.error("Tavily error:", await response.text());
+      return null;
+    }
+
+    const data = await response.json();
+
+    let result = "";
+
+    if (data.answer) {
+      result += `Краткий ответ поиска:\n${data.answer}\n\n`;
+    }
+
+    if (Array.isArray(data.results)) {
+      result += data.results
+        .map((item, index) => {
+          return `${index + 1}. ${item.title || ""}
+${item.content || ""}
+Источник: ${item.url || ""}`;
+        })
+        .join("\n\n");
+    }
+
+    return result || null;
+  } catch (error) {
+    console.error("Search error:", error);
+    return null;
+  }
+}
+
+// ==============================
+// GEMINI
+// ==============================
+
+async function askGemini(userText, webContext = null) {
+  const currentDate = new Date().toLocaleString("ru-RU", {
+    timeZone: "Europe/Kyiv",
+  });
+
+  let prompt = `
+Ты универсальный AI-ассистент в Telegram.
+
+Текущая дата и время: ${currentDate}.
+
+Правила:
+- Отвечай на языке пользователя.
+- Если пользователь пишет по-русски — отвечай по-русски.
+- Если по-украински — по-украински.
+- Пиши понятно и естественно.
+- Не придумывай свежие факты.
+`;
+
+  if (webContext) {
+    prompt += `
+
+Пользователь задал вопрос, для которого был выполнен поиск в интернете.
+
+Вот свежая информация из интернета:
+
+====================
+${webContext}
+====================
+
+Используй найденную информацию для ответа.
+Не утверждай то, чего нет в результатах поиска.
+Если источники противоречат друг другу — скажи об этом.
+`;
   }
 
+  prompt += `
+
+Сообщение пользователя:
+${userText}
+`;
+
   const response = await fetch(
-    `${TELEGRAM_API}/${method}`,
+    `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent?key=${GEMINI_API_KEY}`,
     {
       method: "POST",
       headers: {
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
       },
-      body: JSON.stringify(payload)
-    }
-  );
+      body: JSON.stringify({
+        contents: [
+          {
+            role: "user",
+            parts: [
+              {
+                text: prompt,
+              },
+            ],
+          },
+        ],
 
-  const data =
-    await response.json().catch(() => null);
-
-  if (!response.ok || !data?.ok) {
-    console.error(
-      "Telegram API error:",
-      response.status,
-      JSON.stringify(data)
-    );
-
-    throw new Error("Telegram API error");
-  }
-
-  return data;
-}
-
-
-// =====================================================
-// SEND MESSAGE
-// =====================================================
-
-async function sendMessage(chatId, text) {
-  if (!text) {
-    text = "Не удалось получить ответ.";
-  }
-
-  for (let i = 0; i < text.length; i += 4000) {
-    await tg("sendMessage", {
-      chat_id: chatId,
-      text: text.slice(i, i + 4000),
-      disable_web_page_preview: true
-    });
-  }
-}
-
-
-async function sendTyping(chatId) {
-  try {
-    await tg("sendChatAction", {
-      chat_id: chatId,
-      action: "typing"
-    });
-  } catch {}
-}
-
-
-function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
-
-
-// =====================================================
-// MEMORY
-// =====================================================
-
-function getHistory(chatId) {
-  if (!conversations.has(chatId)) {
-    conversations.set(chatId, []);
-  }
-
-  return conversations.get(chatId);
-}
-
-
-function addToHistory(chatId, role, parts) {
-  const history = getHistory(chatId);
-
-  history.push({
-    role,
-    parts
-  });
-
-  while (history.length > MAX_HISTORY_MESSAGES) {
-    history.shift();
-  }
-}
-
-
-function clearHistory(chatId) {
-  conversations.delete(chatId);
-}
-
-
-// =====================================================
-// DATE
-// =====================================================
-
-function getCurrentDate() {
-  return new Intl.DateTimeFormat(
-    "en-CA",
-    {
-      timeZone: "UTC",
-      year: "numeric",
-      month: "2-digit",
-      day: "2-digit"
-    }
-  ).format(new Date());
-}
-
-
-// =====================================================
-// SYSTEM PROMPT
-// =====================================================
-
-function getSystemPrompt(webAvailable) {
-  const currentDate = getCurrentDate();
-
-  return `
-You are a helpful AI assistant inside Telegram.
-
-Current date: ${currentDate}.
-
-Answer naturally, like a modern general-purpose AI assistant.
-
-Always answer in the same language as the user's latest message unless the user asks for another language.
-
-Use conversation history to understand context.
-
-For example, if the user says:
-- "make it shorter"
-- "rewrite it"
-- "make it prettier"
-- "continue"
-- "explain simpler"
-- "what about tomorrow?"
-
-understand the previous conversation instead of treating it as a completely new request.
-
-Do not unnecessarily repeat yourself.
-
-Be concise when the question is simple and detailed when useful.
-
-You can understand casual language, spelling mistakes and incomplete phrases.
-
-${webAvailable
-  ? `
-Google Search is available.
-
-Use it whenever fresh or current information is needed, including current events, news, weather, prices, sports, software, games, releases, public information or anything that may have changed recently.
-
-Do not rely on old training knowledge when current information is required.
-`
-  : `
-Live web access is currently unavailable.
-
-If the user's question requires current, live or recently changed information, clearly say that you cannot verify the latest information right now.
-
-Do NOT invent current facts and do NOT present old information as if it were current.
-`
-}
-
-Never claim that the current year is an older year when the current date above says otherwise.
-`.trim();
-}
-
-
-// =====================================================
-// EXTRACT GEMINI TEXT
-// =====================================================
-
-function extractAnswer(data) {
-  const parts =
-    data?.candidates?.[0]?.content?.parts;
-
-  if (!Array.isArray(parts)) {
-    return "";
-  }
-
-  return parts
-    .map(part => part.text || "")
-    .join("")
-    .trim();
-}
-
-
-// =====================================================
-// GEMINI REQUEST
-// =====================================================
-
-async function requestGemini({
-  model,
-  contents,
-  useSearch
-}) {
-  const body = {
-    systemInstruction: {
-      parts: [
-        {
-          text: getSystemPrompt(useSearch)
-        }
-      ]
-    },
-
-    contents,
-
-    generationConfig: {
-      temperature: 0.7,
-      maxOutputTokens: 2048
-    }
-  };
-
-
-  // Просто даём Gemini возможность пользоваться Google.
-  // Gemini сам решает, нужен ли поиск.
-  if (useSearch) {
-    body.tools = [
-      {
-        google_search: {}
-      }
-    ];
-  }
-
-
-  try {
-    const response = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
-      {
-        method: "POST",
-
-        headers: {
-          "Content-Type": "application/json",
-          "x-goog-api-key": GEMINI_API_KEY
+        generationConfig: {
+          temperature: 0.7,
+          maxOutputTokens: 2000,
         },
-
-        body: JSON.stringify(body)
-      }
-    );
-
-
-    const data =
-      await response.json().catch(() => ({}));
-
-
-    if (response.ok) {
-      const answer = extractAnswer(data);
-
-      if (answer) {
-        return {
-          success: true,
-          answer
-        };
-      }
+      }),
     }
-
-
-    console.error(
-      `Gemini error | ${model} | search=${useSearch}`,
-      response.status,
-      JSON.stringify(data)
-    );
-
-
-    return {
-      success: false,
-      status: response.status
-    };
-
-  } catch (error) {
-    console.error(
-      "Gemini network error:",
-      error
-    );
-
-    return {
-      success: false,
-      status: 0
-    };
-  }
-}
-
-
-// =====================================================
-// ASK GEMINI
-// =====================================================
-
-async function askGemini(chatId, userParts) {
-  if (!GEMINI_API_KEY) {
-    return "⚠️ GEMINI_API_KEY не настроен.";
-  }
-
-
-  const history = getHistory(chatId);
-
-
-  const contents = [
-    ...history,
-
-    {
-      role: "user",
-      parts: userParts
-    }
-  ];
-
-
-  // ===================================================
-  // СНАЧАЛА GEMINI + GOOGLE SEARCH
-  // ===================================================
-
-  for (const model of MODELS) {
-
-    for (let attempt = 1; attempt <= 3; attempt++) {
-
-      const result =
-        await requestGemini({
-          model,
-          contents,
-          useSearch: true
-        });
-
-
-      if (result.success) {
-
-        addToHistory(
-          chatId,
-          "user",
-          userParts
-        );
-
-        addToHistory(
-          chatId,
-          "model",
-          [
-            {
-              text: result.answer
-            }
-          ]
-        );
-
-
-        return result.answer;
-      }
-
-
-      // ===============================================
-      // GOOGLE SEARCH / API LIMIT
-      // ===============================================
-
-      if (result.status === 429) {
-        console.log(
-          "Search/API limit. Retrying without web..."
-        );
-
-        break;
-      }
-
-
-      // ===============================================
-      // MODEL OVERLOADED
-      // ===============================================
-
-      if (result.status === 503) {
-
-        if (attempt < 3) {
-          await sleep(
-            attempt * 1000
-          );
-
-          continue;
-        }
-
-        break;
-      }
-
-
-      // Model unavailable
-      if (result.status === 404) {
-        break;
-      }
-
-
-      break;
-    }
-  }
-
-
-  // ===================================================
-  // FALLBACK БЕЗ WEB
-  // ===================================================
-
-  for (const model of MODELS) {
-
-    for (let attempt = 1; attempt <= 2; attempt++) {
-
-      const result =
-        await requestGemini({
-          model,
-          contents,
-          useSearch: false
-        });
-
-
-      if (result.success) {
-
-        addToHistory(
-          chatId,
-          "user",
-          userParts
-        );
-
-        addToHistory(
-          chatId,
-          "model",
-          [
-            {
-              text: result.answer
-            }
-          ]
-        );
-
-
-        return result.answer;
-      }
-
-
-      if (
-        result.status === 503 &&
-        attempt < 2
-      ) {
-        await sleep(1000);
-        continue;
-      }
-
-
-      break;
-    }
-  }
-
-
-  return (
-    "⚠️ Gemini сейчас временно недоступен.\n\n" +
-    "Попробуй ещё раз немного позже."
   );
-}
-
-
-// =====================================================
-// DOWNLOAD TELEGRAM FILE
-// =====================================================
-
-async function downloadTelegramFile(
-  fileId,
-  defaultMimeType
-) {
-  const file =
-    await tg("getFile", {
-      file_id: fileId
-    });
-
-
-  const filePath =
-    file.result?.file_path;
-
-
-  if (!filePath) {
-    throw new Error(
-      "Telegram file path missing"
-    );
-  }
-
-
-  const response =
-    await fetch(
-      `https://api.telegram.org/file/bot${BOT_TOKEN}/${filePath}`
-    );
-
 
   if (!response.ok) {
-    throw new Error(
-      `Telegram file download error ${response.status}`
-    );
+    const error = await response.text();
+    console.error("Gemini error:", error);
+
+    throw new Error("Gemini API error");
   }
 
-
-  const buffer =
-    Buffer.from(
-      await response.arrayBuffer()
-    );
-
-
-  return {
-    data: buffer.toString("base64"),
-    mimeType:
-      response.headers.get("content-type") ||
-      defaultMimeType
-  };
-}
-
-
-// =====================================================
-// VOICE
-// =====================================================
-
-async function handleVoice(chatId, voice) {
-  try {
-    const file =
-      await downloadTelegramFile(
-        voice.file_id,
-        "audio/ogg"
-      );
-
-
-    return askGemini(
-      chatId,
-      [
-        {
-          text:
-            "Listen to this voice message and respond to what I said. " +
-            "Do not just transcribe it unless I ask for transcription."
-        },
-
-        {
-          inlineData: {
-            mimeType: file.mimeType,
-            data: file.data
-          }
-        }
-      ]
-    );
-
-  } catch (error) {
-    console.error(
-      "Voice error:",
-      error
-    );
-
-    return (
-      "⚠️ Не удалось обработать голосовое сообщение."
-    );
-  }
-}
-
-
-// =====================================================
-// PHOTO
-// =====================================================
-
-async function handlePhoto(
-  chatId,
-  photoArray,
-  caption
-) {
-  try {
-    // Самая большая фотография
-    const photo =
-      photoArray[
-        photoArray.length - 1
-      ];
-
-
-    const file =
-      await downloadTelegramFile(
-        photo.file_id,
-        "image/jpeg"
-      );
-
-
-    const prompt =
-      caption?.trim() ||
-      "Look at this image and help me with it.";
-
-
-    return askGemini(
-      chatId,
-      [
-        {
-          text: prompt
-        },
-
-        {
-          inlineData: {
-            mimeType: file.mimeType,
-            data: file.data
-          }
-        }
-      ]
-    );
-
-  } catch (error) {
-    console.error(
-      "Photo error:",
-      error
-    );
-
-    return (
-      "⚠️ Не удалось обработать изображение."
-    );
-  }
-}
-
-
-// =====================================================
-// HANDLE MESSAGE
-// =====================================================
-
-async function handleMessage(message) {
-  const chatId = message.chat.id;
-
-
-  // ===================================================
-  // START
-  // ===================================================
-
-  if (message.text === "/start") {
-
-    clearHistory(chatId);
-
-
-    return sendMessage(
-      chatId,
-      `Привет! 👋
-
-Я AI-помощник на Gemini.
-
-Просто пиши мне как обычному ИИ.
-
-Можешь отправлять текст, голосовые сообщения и изображения.`
-    );
-  }
-
-
-  // ===================================================
-  // CLEAR
-  // ===================================================
-
-  if (
-    message.text === "/clear" ||
-    message.text === "/reset"
-  ) {
-
-    clearHistory(chatId);
-
-
-    return sendMessage(
-      chatId,
-      "🧹 Контекст диалога очищен."
-    );
-  }
-
-
-  await sendTyping(chatId);
-
-
-  // ===================================================
-  // VOICE
-  // ===================================================
-
-  if (message.voice) {
-
-    const answer =
-      await handleVoice(
-        chatId,
-        message.voice
-      );
-
-
-    return sendMessage(
-      chatId,
-      answer
-    );
-  }
-
-
-  // ===================================================
-  // PHOTO
-  // ===================================================
-
-  if (
-    Array.isArray(message.photo) &&
-    message.photo.length > 0
-  ) {
-
-    const answer =
-      await handlePhoto(
-        chatId,
-        message.photo,
-        message.caption || ""
-      );
-
-
-    return sendMessage(
-      chatId,
-      answer
-    );
-  }
-
-
-  // ===================================================
-  // TEXT
-  // ===================================================
-
-  const text =
-    (message.text || "").trim();
-
-
-  if (!text) {
-    return;
-  }
-
-
-  const answer =
-    await askGemini(
-      chatId,
-      [
-        {
-          text
-        }
-      ]
-    );
-
-
-  return sendMessage(
-    chatId,
-    answer
+  const data = await response.json();
+
+  return (
+    data?.candidates?.[0]?.content?.parts
+      ?.map((part) => part.text || "")
+      .join("") || "Не удалось получить ответ от AI."
   );
 }
 
-
-// =====================================================
-// GET
-// =====================================================
-
-export async function GET(request) {
-  const url =
-    new URL(request.url);
-
-  const token =
-    url.searchParams.get("token");
-
-
-  if (!BOT_TOKEN) {
-    return Response.json(
-      {
-        ok: false,
-        error:
-          "TELEGRAM_BOT_TOKEN is missing"
-      },
-      {
-        status: 500
-      }
-    );
-  }
-
-
-  if (token !== BOT_TOKEN) {
-    return Response.json(
-      {
-        ok: false,
-        error: "Invalid token"
-      },
-      {
-        status: 401
-      }
-    );
-  }
-
-
-  return Response.json({
-    ok: true,
-    message:
-      "Gemini Telegram bot is running"
-  });
-}
-
-
-// =====================================================
-// POST
-// =====================================================
+// ==============================
+// WEBHOOK
+// ==============================
 
 export async function POST(request) {
-  const url =
-    new URL(request.url);
-
-  const token =
-    url.searchParams.get("token");
-
-
-  if (!BOT_TOKEN) {
-    return Response.json(
-      {
-        ok: false,
-        error:
-          "TELEGRAM_BOT_TOKEN is missing"
-      },
-      {
-        status: 500
-      }
-    );
-  }
-
-
-  if (token !== BOT_TOKEN) {
-    return Response.json(
-      {
-        ok: false,
-        error: "Invalid token"
-      },
-      {
-        status: 401
-      }
-    );
-  }
-
-
   try {
-    const update =
-      await request.json();
+    const update = await request.json();
 
+    const message = update.message;
 
-    if (update.message) {
-      await handleMessage(
-        update.message
-      );
+    if (!message) {
+      return Response.json({ ok: true });
     }
 
+    const chatId = message.chat.id;
+    const userId = message.from?.id;
+
+    // ==============================
+    // ПРИВАТНЫЙ БОТ
+    // ==============================
+
+    if (ALLOWED_USER_ID && userId !== ALLOWED_USER_ID) {
+      await sendMessage(chatId, "⛔ Это приватный бот.");
+      return Response.json({ ok: true });
+    }
+
+    // ==============================
+    // ПОКА ТОЛЬКО ТЕКСТ
+    // ==============================
+
+    const text = message.text;
+
+    if (!text) {
+      await sendMessage(
+        chatId,
+        "Пока эта версия работает с текстовыми сообщениями."
+      );
+
+      return Response.json({ ok: true });
+    }
+
+    // ==============================
+    // РЕШАЕМ, НУЖЕН ЛИ ИНТЕРНЕТ
+    // ==============================
+
+    let webContext = null;
+
+    if (needsInternet(text)) {
+      console.log("🌐 Используем Tavily:", text);
+
+      webContext = await searchWeb(text);
+
+      if (!webContext) {
+        console.log("⚠️ Tavily недоступен");
+      }
+    } else {
+      console.log("🧠 Обычный Gemini:", text);
+    }
+
+    // ==============================
+    // ОТВЕТ
+    // ==============================
+
+    const answer = await askGemini(text, webContext);
+
+    await sendMessage(chatId, answer);
+
+    return Response.json({ ok: true });
+  } catch (error) {
+    console.error("BOT ERROR:", error);
 
     return Response.json({
-      ok: true
+      ok: true,
     });
-
-  } catch (error) {
-    console.error(
-      "Webhook error:",
-      error
-    );
-
-
-    return Response.json(
-      {
-        ok: false,
-        error:
-          "Webhook handler failed"
-      },
-      {
-        status: 500
-      }
-    );
   }
+}
+
+// Для проверки адреса в браузере
+export async function GET() {
+  return Response.json({
+    status: "Bot is running",
+    gemini: true,
+    tavily: !!TAVILY_API_KEY,
+  });
 }
