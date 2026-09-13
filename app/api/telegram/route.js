@@ -1,14 +1,18 @@
 export const runtime = "nodejs";
 
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
 const TAVILY_API_KEY = process.env.TAVILY_API_KEY;
 
 const ALLOWED_USER_ID = process.env.TELEGRAM_ALLOWED_USER_ID
   ? Number(process.env.TELEGRAM_ALLOWED_USER_ID)
   : null;
 
-const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}`;
+const TELEGRAM_API =
+  `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}`;
+
+const OPENROUTER_API =
+  "https://openrouter.ai/api/v1/chat/completions";
 
 // ======================================================
 // TELEGRAM
@@ -43,7 +47,7 @@ function needsInternet(text) {
   const t = text.toLowerCase();
 
   const words = [
-    // русский
+    // Русский
     "сейчас",
     "сегодня",
     "вчера",
@@ -61,14 +65,16 @@ function needsInternet(text) {
     "евро",
     "цена",
     "сколько стоит",
-    "вышло",
-    "вышел",
-    "обновление",
-    "обнова",
     "когда выйдет",
     "когда будет",
+    "обновление",
+    "обнова",
+    "вышло",
+    "вышел",
+    "результат матча",
+    "кто победил",
 
-    // украинский
+    // Украинский
     "зараз",
     "сьогодні",
     "вчора",
@@ -76,6 +82,7 @@ function needsInternet(text) {
     "новини",
     "що нового",
     "останні",
+    "актуаль",
     "погода",
     "температура",
     "курс",
@@ -83,8 +90,9 @@ function needsInternet(text) {
     "скільки коштує",
     "оновлення",
     "коли вийде",
+    "хто переміг",
 
-    // английский
+    // English
     "today",
     "current",
     "currently",
@@ -96,13 +104,14 @@ function needsInternet(text) {
     "update",
     "release",
     "right now",
+    "who won",
   ];
 
   return words.some((word) => t.includes(word));
 }
 
 // ======================================================
-// TAVILY SEARCH
+// TAVILY — ЖИВОЙ ИНТЕРНЕТ
 // ======================================================
 
 async function searchWeb(query) {
@@ -114,27 +123,33 @@ async function searchWeb(query) {
 
     console.log("🌐 Tavily query:", query);
 
-    const response = await fetch("https://api.tavily.com/search", {
-      method: "POST",
+    const response = await fetch(
+      "https://api.tavily.com/search",
+      {
+        method: "POST",
 
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${TAVILY_API_KEY}`,
-      },
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${TAVILY_API_KEY}`,
+        },
 
-      body: JSON.stringify({
-        query: query,
-        search_depth: "basic",
-        max_results: 5,
-        include_answer: true,
-        include_raw_content: false,
-      }),
-    });
+        body: JSON.stringify({
+          query: query,
+          search_depth: "basic",
+          max_results: 5,
+          include_answer: true,
+          include_raw_content: false,
+        }),
+      }
+    );
 
     const raw = await response.text();
 
     console.log("🌐 Tavily status:", response.status);
-    console.log("🌐 Tavily response:", raw.slice(0, 3000));
+    console.log(
+      "🌐 Tavily response:",
+      raw.slice(0, 3000)
+    );
 
     if (!response.ok) {
       console.error("❌ Tavily API error:", raw);
@@ -146,21 +161,31 @@ async function searchWeb(query) {
     try {
       data = JSON.parse(raw);
     } catch (error) {
-      console.error("❌ Tavily JSON parse error:", error);
+      console.error(
+        "❌ Tavily JSON parse error:",
+        error
+      );
       return null;
     }
 
     let result = "";
 
     if (data.answer) {
-      result += `Краткий ответ поиска:\n${data.answer}\n\n`;
+      result += `
+Краткий ответ поиска:
+${data.answer}
+
+`;
     }
 
-    if (Array.isArray(data.results) && data.results.length > 0) {
+    if (
+      Array.isArray(data.results) &&
+      data.results.length > 0
+    ) {
       result += data.results
         .map((item, index) => {
           return `
-Источник ${index + 1}
+ИСТОЧНИК ${index + 1}
 
 Название:
 ${item.title || "Без названия"}
@@ -176,127 +201,165 @@ ${item.url || "Нет ссылки"}
     }
 
     if (!result.trim()) {
-      console.log("⚠️ Tavily не вернул результатов");
+      console.log(
+        "⚠️ Tavily не вернул результатов"
+      );
+
       return null;
     }
 
     return result;
   } catch (error) {
-    console.error("❌ Tavily search error:", error);
+    console.error(
+      "❌ Tavily search error:",
+      error
+    );
+
     return null;
   }
 }
 
 // ======================================================
-// GEMINI
+// OPENROUTER FREE
 // ======================================================
 
-async function askGemini(userText, webContext = null) {
-  if (!GEMINI_API_KEY) {
-    throw new Error("GEMINI_API_KEY отсутствует");
+async function askAI(userText, webContext = null) {
+  if (!OPENROUTER_API_KEY) {
+    throw new Error(
+      "OPENROUTER_API_KEY отсутствует"
+    );
   }
 
-  const currentDate = new Date().toLocaleString("ru-RU", {
-    timeZone: "Europe/Kyiv",
-  });
+  const currentDate = new Date().toLocaleString(
+    "ru-RU",
+    {
+      timeZone: "Europe/Kyiv",
+    }
+  );
 
-  let prompt = `
+  let systemPrompt = `
 Ты универсальный AI-ассистент в Telegram.
 
 Текущая дата и время:
 ${currentDate}
 
-ПРАВИЛА:
+Правила:
 
 1. Отвечай на языке пользователя.
 
-2. Если пользователь пишет по-русски —
-отвечай по-русски.
+2. Если пользователь пишет на русском —
+отвечай на русском.
 
-3. Если пользователь пишет по-украински —
-отвечай по-украински.
+3. Если пользователь пишет на украинском —
+отвечай на украинском.
 
-4. Если пользователь пишет по-английски —
-отвечай по-английски.
+4. Если пользователь пишет на английском —
+отвечай на английском.
 
-5. Пиши понятно, естественно и без лишней воды.
+5. Пиши естественно и понятно.
 
 6. Не придумывай свежую информацию.
 
-7. Если тебе предоставлены результаты поиска из интернета,
-используй именно их для актуальной информации.
+7. Если тебе переданы результаты поиска из интернета,
+используй их для актуальных фактов.
 
-8. Не говори, что у тебя нет доступа к интернету,
-если результаты поиска были предоставлены.
+8. Если свежих данных нет,
+не выдавай старые данные за актуальные.
 
-9. Если результатов поиска недостаточно —
-честно скажи, что точную информацию найти не удалось.
+9. Не говори, что у тебя нет интернета,
+если тебе были переданы результаты поиска.
+
+10. Если поиск не дал точного ответа,
+честно скажи об этом.
+
+11. Не перегружай ответ лишним текстом.
 `;
 
   if (webContext) {
-    prompt += `
+    systemPrompt += `
 
-================================================
-СВЕЖАЯ ИНФОРМАЦИЯ ИЗ ИНТЕРНЕТА
-================================================
+==================================================
+СВЕЖИЕ ДАННЫЕ ИЗ ИНТЕРНЕТА
+==================================================
 
 ${webContext}
 
-================================================
+==================================================
 
-Используй эту информацию при ответе пользователю.
+Используй эти данные при ответе.
 
-Если возможно, укажи источники или названия сайтов.
+Для текущих событий, цен, погоды,
+новостей и другой меняющейся информации
+ориентируйся прежде всего на эти результаты.
 
-Не придумывай данные, которых нет в результатах.
+Не придумывай факты, которых нет
+в результатах поиска.
 `;
   }
 
-  prompt += `
-
-================================================
-СООБЩЕНИЕ ПОЛЬЗОВАТЕЛЯ
-================================================
-
-${userText}
-`;
+  console.log("🤖 OpenRouter request");
 
   const response = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent?key=${GEMINI_API_KEY}`,
+    OPENROUTER_API,
     {
       method: "POST",
 
       headers: {
         "Content-Type": "application/json",
+
+        Authorization:
+          `Bearer ${OPENROUTER_API_KEY}`,
+
+        "HTTP-Referer":
+          "https://gemini-telegram-bot-wheat.vercel.app",
+
+        "X-Title":
+          "Private Telegram AI Bot",
       },
 
       body: JSON.stringify({
-        contents: [
+        model: "openrouter/free",
+
+        messages: [
+          {
+            role: "system",
+            content: systemPrompt,
+          },
+
           {
             role: "user",
-            parts: [
-              {
-                text: prompt,
-              },
-            ],
+            content: userText,
           },
         ],
 
-        generationConfig: {
-          temperature: 0.7,
-          maxOutputTokens: 2500,
-        },
+        temperature: 0.7,
+
+        max_tokens: 2000,
       }),
     }
   );
 
   const raw = await response.text();
 
-  console.log("🤖 Gemini status:", response.status);
+  console.log(
+    "🤖 OpenRouter status:",
+    response.status
+  );
+
+  console.log(
+    "🤖 OpenRouter response:",
+    raw.slice(0, 3000)
+  );
 
   if (!response.ok) {
-    console.error("❌ Gemini error:", raw);
-    throw new Error("Gemini API error");
+    console.error(
+      "❌ OpenRouter error:",
+      raw
+    );
+
+    throw new Error(
+      `OpenRouter API error ${response.status}`
+    );
   }
 
   let data;
@@ -304,17 +367,25 @@ ${userText}
   try {
     data = JSON.parse(raw);
   } catch (error) {
-    console.error("❌ Gemini JSON error:", error);
-    throw new Error("Gemini JSON error");
+    console.error(
+      "❌ OpenRouter JSON error:",
+      error
+    );
+
+    throw new Error(
+      "OpenRouter JSON parse error"
+    );
   }
 
   const answer =
-    data?.candidates?.[0]?.content?.parts
-      ?.map((part) => part.text || "")
-      .join("") || null;
+    data?.choices?.[0]?.message?.content;
 
   if (!answer) {
-    console.error("❌ Gemini пустой ответ:", raw);
+    console.error(
+      "❌ OpenRouter пустой ответ:",
+      raw
+    );
+
     return "Не удалось получить ответ от AI.";
   }
 
@@ -329,7 +400,9 @@ export async function POST(request) {
   try {
     const update = await request.json();
 
-    console.log("📩 Telegram update received");
+    console.log(
+      "📩 Telegram update received"
+    );
 
     const message = update.message;
 
@@ -343,13 +416,22 @@ export async function POST(request) {
     const userId = message.from?.id;
 
     // ==================================================
-    // ПРИВАТНЫЙ БОТ
+    // ПРИВАТКА
     // ==================================================
 
-    if (ALLOWED_USER_ID && userId !== ALLOWED_USER_ID) {
-      console.log("⛔ Заблокирован пользователь:", userId);
+    if (
+      ALLOWED_USER_ID &&
+      userId !== ALLOWED_USER_ID
+    ) {
+      console.log(
+        "⛔ Заблокирован пользователь:",
+        userId
+      );
 
-      await sendMessage(chatId, "⛔ Это приватный бот.");
+      await sendMessage(
+        chatId,
+        "⛔ Это приватный бот."
+      );
 
       return Response.json({
         ok: true,
@@ -373,48 +455,75 @@ export async function POST(request) {
       });
     }
 
-    console.log("👤 User:", userId);
-    console.log("💬 Message:", text);
+    console.log(
+      "👤 User:",
+      userId
+    );
+
+    console.log(
+      "💬 Message:",
+      text
+    );
 
     // ==================================================
-    // ПРОВЕРЯЕМ, НУЖЕН ЛИ WEB SEARCH
+    // НУЖЕН ЛИ ИНТЕРНЕТ
     // ==================================================
 
     let webContext = null;
 
     if (needsInternet(text)) {
-      console.log("🌐 Нужен интернет");
+      console.log(
+        "🌐 Нужен интернет"
+      );
 
-      webContext = await searchWeb(text);
+      webContext =
+        await searchWeb(text);
 
       if (webContext) {
-        console.log("✅ Tavily поиск успешен");
+        console.log(
+          "✅ Tavily поиск успешен"
+        );
       } else {
-        console.log("⚠️ Tavily поиск не удался");
+        console.log(
+          "⚠️ Tavily поиск не удался"
+        );
       }
     } else {
-      console.log("🧠 Интернет не нужен");
+      console.log(
+        "🧠 Интернет не нужен"
+      );
     }
 
     // ==================================================
-    // GEMINI
+    // OPENROUTER
     // ==================================================
 
-    const answer = await askGemini(text, webContext);
+    const answer = await askAI(
+      text,
+      webContext
+    );
 
     // ==================================================
     // TELEGRAM RESPONSE
     // ==================================================
 
-    await sendMessage(chatId, answer);
+    await sendMessage(
+      chatId,
+      answer
+    );
 
-    console.log("✅ Ответ отправлен");
+    console.log(
+      "✅ Ответ отправлен"
+    );
 
     return Response.json({
       ok: true,
     });
   } catch (error) {
-    console.error("🔥 BOT ERROR:", error);
+    console.error(
+      "🔥 BOT ERROR:",
+      error
+    );
 
     return Response.json({
       ok: true,
@@ -430,10 +539,16 @@ export async function GET() {
   return Response.json({
     status: "Bot is running",
 
-    telegram: !!TELEGRAM_BOT_TOKEN,
-    gemini: !!GEMINI_API_KEY,
-    tavily: !!TAVILY_API_KEY,
+    telegram:
+      !!TELEGRAM_BOT_TOKEN,
 
-    privateMode: !!ALLOWED_USER_ID,
+    openrouter:
+      !!OPENROUTER_API_KEY,
+
+    tavily:
+      !!TAVILY_API_KEY,
+
+    privateMode:
+      !!ALLOWED_USER_ID,
   });
 }
