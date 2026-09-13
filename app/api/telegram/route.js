@@ -19,6 +19,45 @@ const OPENROUTER_API =
   "https://openrouter.ai/api/v1/chat/completions";
 
 // ======================================================
+// ВРЕМЕННАЯ ПАМЯТЬ
+// ======================================================
+
+// Важно:
+// На Vercel эта память может иногда очищаться.
+// Позже подключим постоянную базу.
+
+if (!globalThis.__telegramAIHistory) {
+  globalThis.__telegramAIHistory = new Map();
+}
+
+const memory = globalThis.__telegramAIHistory;
+
+function getHistory(userId) {
+  return memory.get(String(userId)) || [];
+}
+
+function saveHistory(userId, history) {
+  // Храним последние 12 сообщений
+  const trimmed = history.slice(-12);
+
+  memory.set(
+    String(userId),
+    trimmed
+  );
+}
+
+function addToHistory(userId, role, content) {
+  const history = getHistory(userId);
+
+  history.push({
+    role,
+    content,
+  });
+
+  saveHistory(userId, history);
+}
+
+// ======================================================
 // TELEGRAM
 // ======================================================
 
@@ -34,9 +73,11 @@ async function sendMessage(chatId, text) {
       `${TELEGRAM_API}/sendMessage`,
       {
         method: "POST",
+
         headers: {
           "Content-Type": "application/json",
         },
+
         body: JSON.stringify({
           chat_id: chatId,
           text: part,
@@ -46,7 +87,7 @@ async function sendMessage(chatId, text) {
 
     if (!response.ok) {
       console.error(
-        "Telegram error:",
+        "❌ Telegram:",
         await response.text()
       );
     }
@@ -54,107 +95,161 @@ async function sendMessage(chatId, text) {
 }
 
 // ======================================================
-// ТИП ЗАПРОСА
+// ЯЗЫК
 // ======================================================
 
-function isFastWebRequest(text) {
+function detectLanguage(text) {
+  const t = text.toLowerCase();
+
+  // Явные украинские буквы/слова
+  if (
+    /[іїєґ]/i.test(text) ||
+    /\b(що|як|цей|ця|це|зараз|сьогодні|будь|будь ласка|скороти|поясни)\b/i.test(t)
+  ) {
+    return "uk";
+  }
+
+  // Кириллица
+  if (/[а-яё]/i.test(text)) {
+    return "ru";
+  }
+
+  return "en";
+}
+
+function languageName(language) {
+  if (language === "uk") {
+    return "украинском языке";
+  }
+
+  if (language === "ru") {
+    return "русском языке";
+  }
+
+  return "английском языке";
+}
+
+// ======================================================
+// НУЖЕН ЛИ ИНТЕРНЕТ
+// ======================================================
+
+function needsInternet(text) {
   const t = text.toLowerCase();
 
   const words = [
+    // время / актуальность
+    "сейчас",
+    "сегодня",
+    "вчера",
+    "завтра",
+    "на данный момент",
+    "актуаль",
+
+    // новости
+    "новости",
+    "что нового",
+    "последние новости",
+    "последние события",
+
     // погода
     "погода",
     "погоде",
     "температура",
     "дождь",
     "снег",
-    "weather",
+    "ветер",
 
-    // валюты
-    "курс дол",
-    "курс евро",
-    "курс грив",
+    // деньги
+    "курс",
     "доллар",
     "долара",
-    "долларов",
     "евро",
+    "гривн",
     "usd",
     "eur",
     "uah",
 
     // цены
-    "цена сейчас",
-    "сколько стоит сейчас",
-    "какая цена",
-    "ціна",
-    "скільки коштує",
-
-    // простые свежие данные
-    "который час",
-    "сколько сейчас времени",
-    "який зараз час",
-  ];
-
-  return words.some((word) => t.includes(word));
-}
-
-function needsInternet(text) {
-  const t = text.toLowerCase();
-
-  const words = [
-    "сейчас",
-    "сегодня",
-    "вчера",
-    "завтра",
-
-    "новости",
-    "что нового",
-    "последние",
-    "последний",
-    "последняя",
-    "актуаль",
-
-    "погода",
-    "температура",
-
-    "курс",
-    "доллар",
-    "долара",
-    "евро",
-
     "цена",
     "сколько стоит",
 
+    // игры / обновления
     "обновление",
     "обнова",
-
-    "вышел",
     "вышло",
-    "выйдет",
+    "вышел",
+    "вышла",
     "когда выйдет",
     "когда будет",
 
+    // украинский
     "зараз",
     "сьогодні",
+    "вчора",
     "новини",
     "що нового",
     "погода",
+    "погоді",
     "курс",
     "ціна",
+    "скільки коштує",
     "оновлення",
+    "коли вийде",
 
+    // english
     "today",
+    "right now",
     "current",
     "currently",
     "latest",
     "news",
     "weather",
     "price",
+    "exchange rate",
     "update",
     "release",
-    "right now",
   ];
 
-  return words.some((word) => t.includes(word));
+  return words.some(
+    (word) => t.includes(word)
+  );
+}
+
+// ======================================================
+// УЛУЧШАЕМ ПОИСКОВЫЙ ЗАПРОС
+// ======================================================
+
+function prepareSearchQuery(text, language) {
+  const t = text.toLowerCase();
+
+  // Если человек просто написал "курс доллара",
+  // для нашего бота считаем USD -> UAH.
+
+  const dollarRequest =
+    t.includes("курс доллара") ||
+    t.includes("курс долара") ||
+    t === "доллар" ||
+    t === "долар";
+
+  const mentionsOtherCurrency =
+    t.includes("руб") ||
+    t.includes("ruble") ||
+    t.includes("eur") ||
+    t.includes("евро") ||
+    t.includes("euro") ||
+    t.includes("тенге") ||
+    t.includes("злот");
+
+  if (
+    dollarRequest &&
+    !mentionsOtherCurrency
+  ) {
+    return language === "uk"
+      ? "актуальний курс долара США до української гривні USD UAH сьогодні Україна"
+      : "актуальный курс доллара США к украинской гривне USD UAH сегодня Украина";
+  }
+
+  return text;
 }
 
 // ======================================================
@@ -164,11 +259,17 @@ function needsInternet(text) {
 async function searchWeb(query) {
   try {
     if (!TAVILY_API_KEY) {
-      console.error("TAVILY_API_KEY отсутствует");
+      console.error(
+        "❌ TAVILY_API_KEY отсутствует"
+      );
+
       return null;
     }
 
-    console.log("🌐 Tavily query:", query);
+    console.log(
+      "🌐 Tavily:",
+      query
+    );
 
     const response = await fetch(
       "https://api.tavily.com/search",
@@ -190,7 +291,8 @@ async function searchWeb(query) {
       }
     );
 
-    const raw = await response.text();
+    const raw =
+      await response.text();
 
     console.log(
       "🌐 Tavily status:",
@@ -199,16 +301,14 @@ async function searchWeb(query) {
 
     if (!response.ok) {
       console.error(
-        "❌ Tavily error:",
+        "❌ Tavily:",
         raw
       );
 
       return null;
     }
 
-    const data = JSON.parse(raw);
-
-    return data;
+    return JSON.parse(raw);
   } catch (error) {
     console.error(
       "❌ Tavily exception:",
@@ -220,41 +320,7 @@ async function searchWeb(query) {
 }
 
 // ======================================================
-// БЫСТРЫЙ ОТВЕТ TAVILY
-// ======================================================
-
-function makeFastWebAnswer(data) {
-  if (!data) {
-    return null;
-  }
-
-  let answer = "";
-
-  if (data.answer) {
-    answer += data.answer.trim();
-  }
-
-  // Добавляем 1-2 источника
-  if (
-    Array.isArray(data.results) &&
-    data.results.length > 0
-  ) {
-    answer += "\n\nИсточники:";
-
-    const sources = data.results.slice(0, 2);
-
-    for (const item of sources) {
-      if (item.url) {
-        answer += `\n${item.url}`;
-      }
-    }
-  }
-
-  return answer || null;
-}
-
-// ======================================================
-// КОНТЕКСТ ДЛЯ AI
+// ПРЕВРАЩАЕМ TAVILY В КОНТЕКСТ
 // ======================================================
 
 function makeWebContext(data) {
@@ -266,7 +332,7 @@ function makeWebContext(data) {
 
   if (data.answer) {
     result += `
-КРАТКИЙ ОТВЕТ ПОИСКА:
+КРАТКИЙ РЕЗУЛЬТАТ ПОИСКА:
 ${data.answer}
 
 `;
@@ -274,15 +340,16 @@ ${data.answer}
 
   if (
     Array.isArray(data.results) &&
-    data.results.length > 0
+    data.results.length
   ) {
     result += data.results
+      .slice(0, 5)
       .map((item, index) => {
         return `
 ИСТОЧНИК ${index + 1}
 
 Название:
-${item.title || "Без названия"}
+${item.title || "Нет названия"}
 
 Информация:
 ${item.content || "Нет информации"}
@@ -294,14 +361,19 @@ ${item.url || ""}
       .join("\n");
   }
 
-  return result || null;
+  return result.trim() || null;
 }
 
 // ======================================================
 // OPENROUTER
 // ======================================================
 
-async function askAI(userText, webContext = null) {
+async function askAI({
+  userText,
+  userId,
+  webContext = null,
+  language,
+}) {
   if (!OPENROUTER_API_KEY) {
     return "⚠️ OPENROUTER_API_KEY не настроен.";
   }
@@ -315,40 +387,130 @@ async function askAI(userText, webContext = null) {
     );
 
   let systemPrompt = `
-Ты универсальный AI-ассистент.
+Ты персональный AI-ассистент в Telegram.
 
-Текущая дата и время:
+Сейчас:
 ${currentDate}
 
-Правила:
+ОБЯЗАТЕЛЬНЫЕ ПРАВИЛА:
 
-- Отвечай на языке пользователя.
-- Пиши понятно и естественно.
-- Не пиши слишком длинно без необходимости.
-- Не выдумывай свежие факты.
-- Если предоставлены результаты поиска,
-  используй их как источник актуальной информации.
-- Если есть веб-данные, не говори,
-  что у тебя нет доступа к интернету.
+1. Ответь на ${languageName(language)}.
+
+2. Если пользователь меняет язык,
+переключайся вместе с ним.
+
+3. Пиши естественно, аккуратно и понятно.
+
+4. Не используй слишком много заголовков.
+
+5. Для короткого вопроса давай короткий ответ.
+
+6. Можно использовать подходящие эмодзи,
+но умеренно.
+
+7. Учитывай историю переписки.
+
+Например:
+
+Пользователь:
+"объясни чёрную дыру"
+
+Ассистент:
+даёт объяснение
+
+Пользователь:
+"сократи"
+
+Ты должен сократить СВОЙ ПРЕДЫДУЩИЙ ответ,
+а не просить пользователя прислать текст заново.
+
+То же самое относится к:
+"подробнее",
+"проще",
+"а почему?",
+"переделай",
+"переведи это",
+"твой прошлый текст"
+и другим продолжениям разговора.
+
+8. Не придумывай свежие данные.
+
+9. Если предоставлены результаты поиска,
+считай их свежим веб-контекстом.
+
+10. Не говори, что у тебя нет доступа
+к интернету, если веб-контекст предоставлен.
+
+11. НЕ показывай пользователю технические
+результаты поиска.
+
+12. НЕ добавляй длинные URL в ответ,
+если пользователь сам не попросил источники.
+
+13. Не упоминай Tavily или OpenRouter,
+если пользователь об этом не спрашивает.
+
+14. Для валют:
+если пользователь на русском или украинском
+просто спрашивает "курс доллара"
+без указания второй валюты,
+подразумевай доллар США к украинской гривне:
+USD -> UAH.
+
+15. Для погоды красиво укажи основные данные,
+если они присутствуют:
+температуру, ощущаемую температуру,
+условия, ветер и влажность.
+
+16. Никогда не превращай русский вопрос
+в английский ответ только потому,
+что источник поиска написан на английском.
 `;
 
   if (webContext) {
     systemPrompt += `
 
 ==================================================
-АКТУАЛЬНЫЕ ДАННЫЕ ИЗ ИНТЕРНЕТА
+СВЕЖАЯ ИНФОРМАЦИЯ ИЗ ИНТЕРНЕТА
 ==================================================
 
 ${webContext}
 
 ==================================================
 
-Ответь пользователю с учётом этих данных.
-Не придумывай факты.
+Используй эти сведения для актуальной части ответа.
+
+Сформулируй результат самостоятельно
+на языке пользователя.
+
+Не копируй сырой ответ поисковой системы.
+
+Не вставляй список URL,
+если пользователь не просил источники.
 `;
   }
 
-  console.log("🤖 OpenRouter request");
+  const history =
+    getHistory(userId);
+
+  const messages = [
+    {
+      role: "system",
+      content: systemPrompt,
+    },
+
+    ...history,
+
+    {
+      role: "user",
+      content: userText,
+    },
+  ];
+
+  console.log(
+    "🤖 OpenRouter | history:",
+    history.length
+  );
 
   const response = await fetch(
     OPENROUTER_API,
@@ -357,31 +519,25 @@ ${webContext}
 
       headers: {
         "Content-Type": "application/json",
-        Authorization: `Bearer ${OPENROUTER_API_KEY}`,
-        "X-Title": "Private Telegram AI Bot",
+        Authorization:
+          `Bearer ${OPENROUTER_API_KEY}`,
+        "X-Title":
+          "Private Telegram AI Bot",
       },
 
       body: JSON.stringify({
         model: "openrouter/free",
 
-        messages: [
-          {
-            role: "system",
-            content: systemPrompt,
-          },
-          {
-            role: "user",
-            content: userText,
-          },
-        ],
+        messages,
 
-        temperature: 0.7,
-        max_tokens: 1500,
+        temperature: 0.6,
+        max_tokens: 1800,
       }),
     }
   );
 
-  const raw = await response.text();
+  const raw =
+    await response.text();
 
   console.log(
     "🤖 OpenRouter status:",
@@ -390,11 +546,11 @@ ${webContext}
 
   if (!response.ok) {
     console.error(
-      "❌ OpenRouter error:",
+      "❌ OpenRouter:",
       raw
     );
 
-    return `⚠️ Ошибка OpenRouter (${response.status}).`;
+    return `⚠️ Ошибка AI (${response.status}). Попробуй ещё раз.`;
   }
 
   let data;
@@ -402,27 +558,27 @@ ${webContext}
   try {
     data = JSON.parse(raw);
   } catch {
-    return "⚠️ Ошибка ответа OpenRouter.";
+    return "⚠️ Не удалось обработать ответ AI.";
   }
 
   const answer =
     data?.choices?.[0]?.message?.content;
 
   if (!answer) {
-    return "⚠️ AI не вернул ответ.";
+    return "⚠️ AI не вернул ответ. Попробуй ещё раз.";
   }
 
-  return answer;
+  return answer.trim();
 }
 
 // ======================================================
-// WEBHOOK
+// TELEGRAM POST
 // ======================================================
 
 export async function POST(request) {
   try {
     console.log(
-      "🚀 VERSION: OPENROUTER-TAVILY-FAST-V2"
+      "🚀 VERSION: AI-GUIDE-V3-MEMORY"
     );
 
     const update =
@@ -444,7 +600,7 @@ export async function POST(request) {
       message.from?.id;
 
     // ==================================================
-    // ПРИВАТНЫЙ ДОСТУП
+    // ПРИВАТКА
     // ==================================================
 
     if (
@@ -462,11 +618,11 @@ export async function POST(request) {
     }
 
     // ==================================================
-    // ТЕКСТ
+    // TEXT
     // ==================================================
 
     const text =
-      message.text;
+      message.text?.trim();
 
     if (!text) {
       await sendMessage(
@@ -480,76 +636,117 @@ export async function POST(request) {
     }
 
     console.log(
-      "💬 Сообщение:",
+      "💬 User:",
       text
     );
 
     // ==================================================
-    // 1. БЫСТРЫЙ WEB
+    // /CLEAR
     // ==================================================
 
-    if (isFastWebRequest(text)) {
-      console.log(
-        "⚡ Быстрый интернет-запрос"
+    if (
+      text.toLowerCase() === "/clear" ||
+      text.toLowerCase() === "/reset"
+    ) {
+      memory.delete(
+        String(userId)
       );
 
-      const webData =
-        await searchWeb(text);
-
-      const fastAnswer =
-        makeFastWebAnswer(webData);
-
-      if (fastAnswer) {
-        await sendMessage(
-          chatId,
-          fastAnswer
-        );
-
-        console.log(
-          "⚡ Ответ отправлен напрямую из Tavily"
-        );
-
-        return Response.json({
-          ok: true,
-        });
-      }
-
-      console.log(
-        "⚠️ Быстрый поиск не дал ответа, используем AI"
+      await sendMessage(
+        chatId,
+        "🧹 История разговора очищена."
       );
+
+      return Response.json({
+        ok: true,
+      });
     }
 
     // ==================================================
-    // 2. АКТУАЛЬНЫЙ СЛОЖНЫЙ ЗАПРОС
+    // LANGUAGE
+    // ==================================================
+
+    const language =
+      detectLanguage(text);
+
+    // ==================================================
+    // INTERNET
     // ==================================================
 
     let webContext = null;
 
     if (needsInternet(text)) {
       console.log(
-        "🌐 Нужен интернет + AI"
+        "🌐 Нужен свежий интернет"
+      );
+
+      const searchQuery =
+        prepareSearchQuery(
+          text,
+          language
+        );
+
+      console.log(
+        "🔎 Search query:",
+        searchQuery
       );
 
       const webData =
-        await searchWeb(text);
+        await searchWeb(
+          searchQuery
+        );
 
       webContext =
-        makeWebContext(webData);
+        makeWebContext(
+          webData
+        );
+
+      if (webContext) {
+        console.log(
+          "✅ Web context получен"
+        );
+      } else {
+        console.log(
+          "⚠️ Web context отсутствует"
+        );
+      }
     } else {
       console.log(
-        "🧠 Обычный AI запрос"
+        "🧠 Интернет не нужен"
       );
     }
 
     // ==================================================
-    // 3. OPENROUTER
+    // AI
     // ==================================================
 
     const answer =
-      await askAI(
-        text,
-        webContext
-      );
+      await askAI({
+        userText: text,
+        userId,
+        webContext,
+        language,
+      });
+
+    // ==================================================
+    // MEMORY
+    // ==================================================
+
+    addToHistory(
+      userId,
+      "user",
+      text
+    );
+
+    addToHistory(
+      userId,
+      "assistant",
+      answer
+    );
+
+    // ==================================================
+    // SEND
+    // ==================================================
 
     await sendMessage(
       chatId,
@@ -576,13 +773,13 @@ export async function POST(request) {
 }
 
 // ======================================================
-// GET TEST
+// GET
 // ======================================================
 
 export async function GET() {
   return Response.json({
     version:
-      "OPENROUTER-TAVILY-FAST-V2",
+      "AI-GUIDE-V3-MEMORY",
 
     status:
       "Bot is running",
@@ -598,5 +795,8 @@ export async function GET() {
 
     privateMode:
       !!ALLOWED_USER_ID,
+
+    memory:
+      "temporary",
   });
 }
