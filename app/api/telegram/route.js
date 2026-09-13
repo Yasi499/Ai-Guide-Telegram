@@ -1,5 +1,9 @@
 export const runtime = "nodejs";
 
+// ======================================================
+// ENV
+// ======================================================
+
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
 const TAVILY_API_KEY = process.env.TAVILY_API_KEY;
@@ -8,14 +12,13 @@ const ALLOWED_USER_ID = process.env.TELEGRAM_ALLOWED_USER_ID
   ? Number(process.env.TELEGRAM_ALLOWED_USER_ID)
   : null;
 
-const TELEGRAM_API =
-  `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}`;
+const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}`;
 
 const OPENROUTER_API =
   "https://openrouter.ai/api/v1/chat/completions";
 
 // ======================================================
-// TELEGRAM
+// TELEGRAM SEND
 // ======================================================
 
 async function sendMessage(chatId, text) {
@@ -23,19 +26,28 @@ async function sendMessage(chatId, text) {
     text = "Не удалось получить ответ.";
   }
 
+  // Telegram ограничивает длину одного сообщения
   for (let i = 0; i < text.length; i += 4000) {
     const part = text.slice(i, i + 4000);
 
-    await fetch(`${TELEGRAM_API}/sendMessage`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        chat_id: chatId,
-        text: part,
-      }),
-    });
+    const response = await fetch(
+      `${TELEGRAM_API}/sendMessage`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          chat_id: chatId,
+          text: part,
+        }),
+      }
+    );
+
+    if (!response.ok) {
+      const error = await response.text();
+      console.error("❌ Telegram error:", error);
+    }
   }
 }
 
@@ -71,14 +83,13 @@ function needsInternet(text) {
     "обнова",
     "вышло",
     "вышел",
-    "результат матча",
+    "результат",
     "кто победил",
 
     // Украинский
     "зараз",
     "сьогодні",
     "вчора",
-    "завтра",
     "новини",
     "що нового",
     "останні",
@@ -111,7 +122,7 @@ function needsInternet(text) {
 }
 
 // ======================================================
-// TAVILY — ЖИВОЙ ИНТЕРНЕТ
+// TAVILY SEARCH
 // ======================================================
 
 async function searchWeb(query) {
@@ -134,7 +145,7 @@ async function searchWeb(query) {
         },
 
         body: JSON.stringify({
-          query: query,
+          query,
           search_depth: "basic",
           max_results: 5,
           include_answer: true,
@@ -148,11 +159,11 @@ async function searchWeb(query) {
     console.log("🌐 Tavily status:", response.status);
     console.log(
       "🌐 Tavily response:",
-      raw.slice(0, 3000)
+      raw.slice(0, 2000)
     );
 
     if (!response.ok) {
-      console.error("❌ Tavily API error:", raw);
+      console.error("❌ Tavily error:", raw);
       return null;
     }
 
@@ -161,10 +172,7 @@ async function searchWeb(query) {
     try {
       data = JSON.parse(raw);
     } catch (error) {
-      console.error(
-        "❌ Tavily JSON parse error:",
-        error
-      );
+      console.error("❌ Tavily JSON error:", error);
       return null;
     }
 
@@ -172,7 +180,7 @@ async function searchWeb(query) {
 
     if (data.answer) {
       result += `
-Краткий ответ поиска:
+ОТВЕТ ПОИСКА:
 ${data.answer}
 
 `;
@@ -193,7 +201,7 @@ ${item.title || "Без названия"}
 Информация:
 ${item.content || "Нет описания"}
 
-Ссылка:
+URL:
 ${item.url || "Нет ссылки"}
 `;
         })
@@ -201,33 +209,24 @@ ${item.url || "Нет ссылки"}
     }
 
     if (!result.trim()) {
-      console.log(
-        "⚠️ Tavily не вернул результатов"
-      );
-
+      console.log("⚠️ Tavily: результатов нет");
       return null;
     }
 
     return result;
   } catch (error) {
-    console.error(
-      "❌ Tavily search error:",
-      error
-    );
-
+    console.error("❌ Tavily exception:", error);
     return null;
   }
 }
 
 // ======================================================
-// OPENROUTER FREE
+// OPENROUTER
 // ======================================================
 
 async function askAI(userText, webContext = null) {
   if (!OPENROUTER_API_KEY) {
-    throw new Error(
-      "OPENROUTER_API_KEY отсутствует"
-    );
+    return "⚠️ OPENROUTER_API_KEY не настроен.";
   }
 
   const currentDate = new Date().toLocaleString(
@@ -243,57 +242,45 @@ async function askAI(userText, webContext = null) {
 Текущая дата и время:
 ${currentDate}
 
-Правила:
+ПРАВИЛА:
 
-1. Отвечай на языке пользователя.
+- Отвечай на языке пользователя.
+- Русский вопрос -> русский ответ.
+- Украинский вопрос -> украинский ответ.
+- Английский вопрос -> английский ответ.
 
-2. Если пользователь пишет на русском —
-отвечай на русском.
+- Отвечай естественно и понятно.
+- Не пиши слишком много без необходимости.
 
-3. Если пользователь пишет на украинском —
-отвечай на украинском.
+- Не выдумывай актуальные данные.
 
-4. Если пользователь пишет на английском —
-отвечай на английском.
+- Если ниже предоставлена информация из веб-поиска,
+используй её для актуальных данных.
 
-5. Пиши естественно и понятно.
+- Если веб-поиск был выполнен,
+не говори пользователю, что у тебя нет доступа к интернету.
 
-6. Не придумывай свежую информацию.
+- Для погоды, новостей, цен, курсов,
+обновлений и текущих событий используй результаты поиска.
 
-7. Если тебе переданы результаты поиска из интернета,
-используй их для актуальных фактов.
-
-8. Если свежих данных нет,
-не выдавай старые данные за актуальные.
-
-9. Не говори, что у тебя нет интернета,
-если тебе были переданы результаты поиска.
-
-10. Если поиск не дал точного ответа,
+- Если найденной информации недостаточно,
 честно скажи об этом.
-
-11. Не перегружай ответ лишним текстом.
 `;
 
   if (webContext) {
     systemPrompt += `
 
 ==================================================
-СВЕЖИЕ ДАННЫЕ ИЗ ИНТЕРНЕТА
+РЕЗУЛЬТАТЫ ЖИВОГО ПОИСКА В ИНТЕРНЕТЕ
 ==================================================
 
 ${webContext}
 
 ==================================================
 
-Используй эти данные при ответе.
+Сформируй ответ пользователю на основе этих результатов.
 
-Для текущих событий, цен, погоды,
-новостей и другой меняющейся информации
-ориентируйся прежде всего на эти результаты.
-
-Не придумывай факты, которых нет
-в результатах поиска.
+Не придумывай факты, которых нет в результатах.
 `;
   }
 
@@ -306,15 +293,8 @@ ${webContext}
 
       headers: {
         "Content-Type": "application/json",
-
-        Authorization:
-          `Bearer ${OPENROUTER_API_KEY}`,
-
-        "HTTP-Referer":
-          "https://gemini-telegram-bot-wheat.vercel.app",
-
-        "X-Title":
-          "Private Telegram AI Bot",
+        Authorization: `Bearer ${OPENROUTER_API_KEY}`,
+        "X-Title": "Private Telegram AI Bot",
       },
 
       body: JSON.stringify({
@@ -325,7 +305,6 @@ ${webContext}
             role: "system",
             content: systemPrompt,
           },
-
           {
             role: "user",
             content: userText,
@@ -333,7 +312,6 @@ ${webContext}
         ],
 
         temperature: 0.7,
-
         max_tokens: 2000,
       }),
     }
@@ -348,18 +326,16 @@ ${webContext}
 
   console.log(
     "🤖 OpenRouter response:",
-    raw.slice(0, 3000)
+    raw.slice(0, 2000)
   );
 
   if (!response.ok) {
     console.error(
-      "❌ OpenRouter error:",
+      "❌ OpenRouter API error:",
       raw
     );
 
-    throw new Error(
-      `OpenRouter API error ${response.status}`
-    );
+    return `⚠️ Ошибка OpenRouter (${response.status}).`;
   }
 
   let data;
@@ -372,9 +348,7 @@ ${webContext}
       error
     );
 
-    throw new Error(
-      "OpenRouter JSON parse error"
-    );
+    return "⚠️ OpenRouter вернул неправильный ответ.";
   }
 
   const answer =
@@ -382,11 +356,11 @@ ${webContext}
 
   if (!answer) {
     console.error(
-      "❌ OpenRouter пустой ответ:",
+      "❌ OpenRouter empty response:",
       raw
     );
 
-    return "Не удалось получить ответ от AI.";
+    return "⚠️ AI не вернул ответ.";
   }
 
   return answer;
@@ -398,25 +372,28 @@ ${webContext}
 
 export async function POST(request) {
   try {
-    const update = await request.json();
-
     console.log(
-      "📩 Telegram update received"
+      "🚀 VERSION: OPENROUTER-TEST-2026"
     );
+
+    const update = await request.json();
 
     const message = update.message;
 
+    // Например Telegram service update
     if (!message) {
       return Response.json({
         ok: true,
       });
     }
 
-    const chatId = message.chat.id;
+    const chatId = message.chat?.id;
     const userId = message.from?.id;
 
+    console.log("👤 User:", userId);
+
     // ==================================================
-    // ПРИВАТКА
+    // ПРИВАТНЫЙ ДОСТУП
     // ==================================================
 
     if (
@@ -424,7 +401,7 @@ export async function POST(request) {
       userId !== ALLOWED_USER_ID
     ) {
       console.log(
-        "⛔ Заблокирован пользователь:",
+        "⛔ Пользователь заблокирован:",
         userId
       );
 
@@ -447,7 +424,7 @@ export async function POST(request) {
     if (!text) {
       await sendMessage(
         chatId,
-        "Пока эта версия работает только с текстовыми сообщениями."
+        "Пока эта версия работает только с текстом."
       );
 
       return Response.json({
@@ -455,29 +432,18 @@ export async function POST(request) {
       });
     }
 
-    console.log(
-      "👤 User:",
-      userId
-    );
-
-    console.log(
-      "💬 Message:",
-      text
-    );
+    console.log("💬 Message:", text);
 
     // ==================================================
-    // НУЖЕН ЛИ ИНТЕРНЕТ
+    // WEB SEARCH
     // ==================================================
 
     let webContext = null;
 
     if (needsInternet(text)) {
-      console.log(
-        "🌐 Нужен интернет"
-      );
+      console.log("🌐 Нужен интернет");
 
-      webContext =
-        await searchWeb(text);
+      webContext = await searchWeb(text);
 
       if (webContext) {
         console.log(
@@ -490,12 +456,12 @@ export async function POST(request) {
       }
     } else {
       console.log(
-        "🧠 Интернет не нужен"
+        "🧠 Интернет для запроса не нужен"
       );
     }
 
     // ==================================================
-    // OPENROUTER
+    // AI
     // ==================================================
 
     const answer = await askAI(
@@ -504,7 +470,7 @@ export async function POST(request) {
     );
 
     // ==================================================
-    // TELEGRAM RESPONSE
+    // ОТПРАВЛЯЕМ
     // ==================================================
 
     await sendMessage(
@@ -537,6 +503,8 @@ export async function POST(request) {
 
 export async function GET() {
   return Response.json({
+    version: "OPENROUTER-TEST-2026",
+
     status: "Bot is running",
 
     telegram:
