@@ -1,17 +1,12 @@
 export const runtime = "nodejs";
 
 // ======================================================
-// ENV / CONFIG
+// CONFIG
 // ======================================================
 
-const TELEGRAM_BOT_TOKEN =
-  process.env.TELEGRAM_BOT_TOKEN;
-
-const OPENROUTER_API_KEY =
-  process.env.OPENROUTER_API_KEY;
-
-const TAVILY_API_KEY =
-  process.env.TAVILY_API_KEY;
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
+const TAVILY_API_KEY = process.env.TAVILY_API_KEY;
 
 const UPSTASH_REDIS_REST_URL =
   process.env.UPSTASH_REDIS_REST_URL;
@@ -19,10 +14,9 @@ const UPSTASH_REDIS_REST_URL =
 const UPSTASH_REDIS_REST_TOKEN =
   process.env.UPSTASH_REDIS_REST_TOKEN;
 
-const ALLOWED_USER_ID =
-  process.env.TELEGRAM_ALLOWED_USER_ID
-    ? Number(process.env.TELEGRAM_ALLOWED_USER_ID)
-    : null;
+const ALLOWED_USER_ID = process.env.TELEGRAM_ALLOWED_USER_ID
+  ? Number(process.env.TELEGRAM_ALLOWED_USER_ID)
+  : null;
 
 const TELEGRAM_API =
   `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}`;
@@ -32,13 +26,11 @@ const OPENROUTER_API =
 
 const AI_MODEL = "openrouter/free";
 
-// Сколько сообщений храним.
-// 20 = примерно 10 обменов user <-> assistant.
 const MAX_HISTORY_MESSAGES = 20;
 
 
 // ======================================================
-// UPSTASH REDIS — ПОСТОЯННАЯ ПАМЯТЬ
+// REDIS MEMORY
 // ======================================================
 
 function memoryKey(userId) {
@@ -51,10 +43,7 @@ async function redisCommand(command) {
     !UPSTASH_REDIS_REST_URL ||
     !UPSTASH_REDIS_REST_TOKEN
   ) {
-    console.error(
-      "❌ Upstash Redis не настроен"
-    );
-
+    console.error("Redis not configured");
     return null;
   }
 
@@ -76,25 +65,21 @@ async function redisCommand(command) {
       }
     );
 
-    const raw =
-      await response.text();
+    const raw = await response.text();
 
     if (!response.ok) {
-      console.error(
-        "❌ Redis error:",
-        raw
-      );
-
+      console.error("Redis error:", raw);
       return null;
     }
 
-    const data =
-      JSON.parse(raw);
+    const data = JSON.parse(raw);
 
     return data.result;
+
   } catch (error) {
+
     console.error(
-      "❌ Redis exception:",
+      "Redis exception:",
       error
     );
 
@@ -104,30 +89,23 @@ async function redisCommand(command) {
 
 
 async function getHistory(userId) {
-  const result =
-    await redisCommand([
-      "GET",
-      memoryKey(userId),
-    ]);
+  const result = await redisCommand([
+    "GET",
+    memoryKey(userId),
+  ]);
 
   if (!result) {
     return [];
   }
 
   try {
-    const history =
-      JSON.parse(result);
+    const history = JSON.parse(result);
 
-    if (!Array.isArray(history)) {
-      return [];
-    }
+    return Array.isArray(history)
+      ? history
+      : [];
 
-    return history;
-  } catch (error) {
-    console.error(
-      "❌ History JSON error:",
-      error
-    );
+  } catch {
 
     return [];
   }
@@ -181,7 +159,7 @@ async function clearHistory(userId) {
 
 
 // ======================================================
-// TELEGRAM
+// TELEGRAM SEND
 // ======================================================
 
 async function sendMessage(
@@ -193,7 +171,6 @@ async function sendMessage(
       "Не удалось получить ответ.";
   }
 
-  // Telegram имеет лимит на размер сообщения.
   for (
     let i = 0;
     i < text.length;
@@ -202,30 +179,124 @@ async function sendMessage(
     const part =
       text.slice(i, i + 4000);
 
-    const response =
-      await fetch(
-        `${TELEGRAM_API}/sendMessage`,
-        {
-          method: "POST",
+    const response = await fetch(
+      `${TELEGRAM_API}/sendMessage`,
+      {
+        method: "POST",
 
-          headers: {
-            "Content-Type":
-              "application/json",
-          },
+        headers: {
+          "Content-Type":
+            "application/json",
+        },
 
-          body: JSON.stringify({
-            chat_id: chatId,
-            text: part,
-          }),
-        }
-      );
+        body: JSON.stringify({
+          chat_id: chatId,
+          text: part,
+        }),
+      }
+    );
 
     if (!response.ok) {
       console.error(
-        "❌ Telegram:",
+        "Telegram:",
         await response.text()
       );
     }
+  }
+}
+
+
+// ======================================================
+// TELEGRAM PHOTO
+// ======================================================
+
+async function getTelegramPhotoBase64(
+  fileId
+) {
+  try {
+
+    // Получаем путь к файлу
+    const infoResponse =
+      await fetch(
+        `${TELEGRAM_API}/getFile?file_id=${encodeURIComponent(fileId)}`
+      );
+
+    const info =
+      await infoResponse.json();
+
+
+    if (
+      !info.ok ||
+      !info.result?.file_path
+    ) {
+      console.error(
+        "Telegram getFile error:",
+        info
+      );
+
+      return null;
+    }
+
+
+    const filePath =
+      info.result.file_path;
+
+
+    // Скачиваем изображение
+    const imageResponse =
+      await fetch(
+        `https://api.telegram.org/file/bot${TELEGRAM_BOT_TOKEN}/${filePath}`
+      );
+
+
+    if (!imageResponse.ok) {
+      console.error(
+        "Photo download error:",
+        imageResponse.status
+      );
+
+      return null;
+    }
+
+
+    const arrayBuffer =
+      await imageResponse.arrayBuffer();
+
+
+    // В Node.js Buffer доступен
+    const base64 =
+      Buffer
+        .from(arrayBuffer)
+        .toString("base64");
+
+
+    // Telegram-фотографии обычно JPEG
+    let mimeType =
+      "image/jpeg";
+
+
+    if (
+      filePath
+        .toLowerCase()
+        .endsWith(".png")
+    ) {
+      mimeType =
+        "image/png";
+    }
+
+
+    return (
+      `data:${mimeType};base64,${base64}`
+    );
+
+  } catch (error) {
+
+    console.error(
+      "Photo exception:",
+      error
+    );
+
+    return null;
   }
 }
 
@@ -236,59 +307,60 @@ async function sendMessage(
 
 function detectLanguage(text) {
   const t =
-    text.toLowerCase();
+    (text || "").toLowerCase();
 
   if (
-    /[іїєґ]/i.test(text) ||
-    /\b(що|цей|ця|зараз|сьогодні|поясни|скороти|новини|свіжі|останні|напиши)\b/i.test(t)
+    /[іїєґ]/i.test(text || "") ||
+    /\b(що|цей|ця|зараз|сьогодні|поясни|скороти|новини|свіжі|останні)\b/i.test(t)
   ) {
     return "uk";
   }
 
-  if (/[а-яё]/i.test(text)) {
+  if (
+    /[а-яё]/i.test(text || "")
+  ) {
     return "ru";
   }
 
-  return "en";
+  // Для фото без подписи
+  // используем русский по умолчанию.
+  return "ru";
 }
 
 
-function languageInstruction(
-  language
-) {
+function languageInstruction(language) {
   if (language === "uk") {
-    return `
-Отвечай на украинском языке.
-Если предыдущие сообщения были на русском,
-но текущий вопрос украинский — отвечай украинским.
-`;
+    return (
+      "Отвечай на украинском языке."
+    );
   }
 
-  if (language === "ru") {
-    return `
-Отвечай на русском языке.
-Если веб-источники английские,
-всё равно отвечай пользователю по-русски.
-`;
+  if (language === "en") {
+    return (
+      "Answer in English."
+    );
   }
 
-  return `
-Answer in English.
-`;
+  return (
+    "Отвечай на русском языке."
+  );
 }
 
 
 // ======================================================
-// НУЖЕН ЛИ ИНТЕРНЕТ
+// INTERNET DETECTION
 // ======================================================
 
 function needsInternet(text) {
+  if (!text) {
+    return false;
+  }
+
   const t =
     text.toLowerCase();
 
   const triggers = [
 
-    // Актуальность
     "сейчас",
     "сегодня",
     "вчера",
@@ -298,7 +370,6 @@ function needsInternet(text) {
     "последн",
     "недавно",
 
-    // Новости
     "новости",
     "что нового",
     "что там с",
@@ -306,14 +377,12 @@ function needsInternet(text) {
     "что произошло",
     "что случилось",
 
-    // Погода
     "погода",
     "температура",
     "дождь",
     "снег",
     "ветер",
 
-    // Валюты
     "курс",
     "доллар",
     "долара",
@@ -323,11 +392,9 @@ function needsInternet(text) {
     "uah",
     "eur",
 
-    // Цены
     "цена",
     "сколько стоит",
 
-    // Игры / новости / утечки
     "обновление",
     "обнова",
     "патч",
@@ -336,6 +403,7 @@ function needsInternet(text) {
     "вышло",
     "выйдет",
     "релиз",
+
     "утечк",
     "слив",
     "сливал",
@@ -343,7 +411,6 @@ function needsInternet(text) {
     "инсайдер",
     "инсайд",
 
-    // Украинский
     "зараз",
     "сьогодні",
     "свіж",
@@ -355,7 +422,6 @@ function needsInternet(text) {
     "оновлення",
     "витік",
 
-    // English
     "today",
     "current",
     "currently",
@@ -369,6 +435,7 @@ function needsInternet(text) {
     "leak",
   ];
 
+
   return triggers.some(
     (trigger) =>
       t.includes(trigger)
@@ -377,14 +444,19 @@ function needsInternet(text) {
 
 
 // ======================================================
-// FOLLOW-UP
+// FOLLOW-UP DETECTION
 // ======================================================
 
 function isContextFollowUp(text) {
+  if (!text) {
+    return false;
+  }
+
   const t =
-    text.toLowerCase().trim();
+    text.toLowerCase();
 
   const patterns = [
+
     "по этому",
     "про это",
     "об этом",
@@ -396,7 +468,6 @@ function isContextFollowUp(text) {
 
     "а сейчас",
     "а сегодня",
-
     "а что сейчас",
     "а что нового",
 
@@ -418,8 +489,8 @@ function isContextFollowUp(text) {
     "about it",
     "about this",
     "latest on this",
-    "what about now",
   ];
+
 
   return patterns.some(
     (pattern) =>
@@ -429,7 +500,7 @@ function isContextFollowUp(text) {
 
 
 // ======================================================
-// КОНТЕКСТ ДЛЯ ПОИСКА
+// SEARCH CONTEXT
 // ======================================================
 
 async function getConversationContext(
@@ -438,9 +509,6 @@ async function getConversationContext(
   const history =
     await getHistory(userId);
 
-  if (!history.length) {
-    return "";
-  }
 
   return history
     .slice(-8)
@@ -451,21 +519,19 @@ async function getConversationContext(
           ? "User"
           : "Assistant";
 
-      const content =
-        String(
-          item.content
-        ).slice(0, 1200);
 
       return (
-        `${speaker}: ${content}`
+        `${speaker}: ` +
+        `${String(item.content).slice(0, 1200)}`
       );
+
     })
     .join("\n");
 }
 
 
 // ======================================================
-// СОЗДАНИЕ ПОИСКОВОГО ЗАПРОСА
+// SEARCH QUERY
 // ======================================================
 
 async function buildSearchQuery(
@@ -476,45 +542,38 @@ async function buildSearchQuery(
   const t =
     text.toLowerCase();
 
-  // ------------------------------------------
-  // КУРС ДОЛЛАРА
-  // ------------------------------------------
 
+  // USD -> UAH
   const genericDollar =
-    t.includes(
-      "курс доллара"
-    ) ||
-    t.includes(
-      "курс долара"
-    ) ||
-    t === "доллар" ||
-    t === "долар";
+    t.includes("курс доллара") ||
+    t.includes("курс долара");
 
-  const specifiedCurrency =
+
+  const anotherCurrency =
     t.includes("руб") ||
     t.includes("rub") ||
-
     t.includes("евро") ||
     t.includes("eur") ||
-    t.includes("euro") ||
-
     t.includes("злот") ||
     t.includes("pln") ||
+    t.includes("тенге");
 
-    t.includes("тенге") ||
-    t.includes("kzt");
 
   if (
     genericDollar &&
-    !specifiedCurrency
+    !anotherCurrency
   ) {
+
     if (language === "uk") {
+
       return (
         "актуальний курс долара США " +
         "до української гривні " +
         "USD UAH сьогодні Україна"
       );
+
     }
+
 
     return (
       "актуальный курс доллара США " +
@@ -524,51 +583,42 @@ async function buildSearchQuery(
   }
 
 
-  // ------------------------------------------
-  // КОНТЕКСТНЫЙ FOLLOW-UP
-  // ------------------------------------------
-
+  // Контекстный поиск
   if (
     isContextFollowUp(text)
   ) {
+
     const context =
       await getConversationContext(
         userId
       );
 
+
     if (context) {
+
       return `
-Найди самую свежую и релевантную
-информацию по теме разговора.
+Найди свежую информацию
+по теме текущего разговора.
 
 КОНТЕКСТ:
 
 ${context}
 
-НОВЫЙ ВОПРОС:
+ВОПРОС:
 
 ${text}
 
-Определи главную тему из контекста.
+Определи конкретную тему,
+человека, игру, компанию,
+событие или утечку из контекста.
 
-Особенно учитывай:
-- имена людей;
-- названия аккаунтов;
-- игры;
-- компании;
-- события;
-- даты;
-- утечки;
-- новости.
-
-Не ищи только фразу
-"${text}".
-
-Ищи именно тему,
-о которой пользователь говорил раньше.
+Не ищи только слова
+из текущего короткого вопроса.
 `.trim();
+
     }
   }
+
 
   return text;
 }
@@ -579,19 +629,19 @@ ${text}
 // ======================================================
 
 async function searchWeb(query) {
-  if (!TAVILY_API_KEY) {
-    console.error(
-      "❌ TAVILY_API_KEY не настроен"
-    );
 
+  if (!TAVILY_API_KEY) {
     return null;
   }
 
+
   try {
+
     console.log(
-      "🌐 Tavily query:",
+      "Tavily:",
       query.slice(0, 1500)
     );
+
 
     const response =
       await fetch(
@@ -608,44 +658,47 @@ async function searchWeb(query) {
           },
 
           body: JSON.stringify({
+
             query,
 
             search_depth:
               "basic",
 
-            max_results: 7,
+            max_results:
+              7,
 
             include_answer:
               true,
 
             include_raw_content:
               false,
+
           }),
         }
       );
 
+
     const raw =
       await response.text();
 
-    console.log(
-      "🌐 Tavily status:",
-      response.status
-    );
 
     if (!response.ok) {
+
       console.error(
-        "❌ Tavily:",
+        "Tavily:",
         raw
       );
 
       return null;
     }
 
+
     return JSON.parse(raw);
 
   } catch (error) {
+
     console.error(
-      "❌ Tavily exception:",
+      "Tavily exception:",
       error
     );
 
@@ -659,19 +712,25 @@ async function searchWeb(query) {
 // ======================================================
 
 function makeWebContext(data) {
+
   if (!data) {
     return null;
   }
 
-  let context = "";
+
+  let result = "";
+
 
   if (data.answer) {
-    context += `
+
+    result += `
+
 SEARCH SUMMARY:
 
 ${data.answer}
 
 `;
+
   }
 
 
@@ -680,56 +739,56 @@ ${data.answer}
       data.results
     )
   ) {
-    context +=
+
+    result +=
       data.results
         .slice(0, 7)
         .map(
           (
             item,
             index
-          ) => {
+          ) => `
 
-            return `
 RESULT ${index + 1}
 
 TITLE:
 ${item.title || "Unknown"}
 
 CONTENT:
-${item.content || "No content"}
+${item.content || "Unknown"}
 
 URL:
 ${item.url || "Unknown"}
 
-`;
-
-          }
+`
         )
         .join("\n");
+
   }
 
 
   return (
-    context.trim() ||
+    result.trim() ||
     null
   );
 }
 
 
 // ======================================================
-// УБИРАЕМ МУСОР FREE-МОДЕЛЕЙ
+// CLEAN MODEL OUTPUT
 // ======================================================
 
 function cleanAIResponse(text) {
+
   if (!text) {
     return "";
   }
+
 
   let cleaned =
     String(text);
 
 
-  // Tool calls
   cleaned =
     cleaned.replace(
       /<\|tool_call_start\|>[\s\S]*?<\|tool_call_end\|>/gi,
@@ -758,7 +817,6 @@ function cleanAIResponse(text) {
     );
 
 
-  // Safety
   cleaned =
     cleaned.replace(
       /^\s*User Safety\s*:\s*safe\s*$/gim,
@@ -780,7 +838,6 @@ function cleanAIResponse(text) {
     );
 
 
-  // google(...)
   cleaned =
     cleaned.replace(
       /^\s*google\s*\([^\n]*\)\s*$/gim,
@@ -788,7 +845,6 @@ function cleanAIResponse(text) {
     );
 
 
-  // Лишние пустые строки
   cleaned =
     cleaned.replace(
       /\n{3,}/g,
@@ -801,17 +857,15 @@ function cleanAIResponse(text) {
 
 
 // ======================================================
-// OPENROUTER
+// OPENROUTER TEXT REQUEST
 // ======================================================
 
 async function requestOpenRouter(
   messages
 ) {
-  if (!OPENROUTER_API_KEY) {
-    return null;
-  }
 
   try {
+
     const response =
       await fetch(
         OPENROUTER_API,
@@ -819,6 +873,7 @@ async function requestOpenRouter(
           method: "POST",
 
           headers: {
+
             "Content-Type":
               "application/json",
 
@@ -827,9 +882,11 @@ async function requestOpenRouter(
 
             "X-Title":
               "AI Guide Telegram Bot",
+
           },
 
           body: JSON.stringify({
+
             model:
               AI_MODEL,
 
@@ -840,6 +897,7 @@ async function requestOpenRouter(
 
             max_tokens:
               1800,
+
           }),
         }
       );
@@ -850,14 +908,15 @@ async function requestOpenRouter(
 
 
     console.log(
-      "🤖 OpenRouter status:",
+      "OpenRouter:",
       response.status
     );
 
 
     if (!response.ok) {
+
       console.error(
-        "❌ OpenRouter:",
+        "OpenRouter:",
         raw
       );
 
@@ -881,7 +940,7 @@ async function requestOpenRouter(
   } catch (error) {
 
     console.error(
-      "❌ OpenRouter exception:",
+      "OpenRouter exception:",
       error
     );
 
@@ -891,7 +950,7 @@ async function requestOpenRouter(
 
 
 // ======================================================
-// AI
+// TEXT AI
 // ======================================================
 
 async function askAI({
@@ -900,14 +959,6 @@ async function askAI({
   language,
   webContext,
 }) {
-
-  if (!OPENROUTER_API_KEY) {
-    return (
-      "⚠️ OPENROUTER_API_KEY " +
-      "не настроен."
-    );
-  }
-
 
   const currentTime =
     new Date()
@@ -921,184 +972,59 @@ async function askAI({
 
 
   let systemPrompt = `
-Ты AI Guide — персональный
-AI-ассистент пользователя в Telegram.
 
-ТЕКУЩАЯ ДАТА И ВРЕМЯ:
+Ты AI Guide —
+персональный Telegram AI-ассистент.
+
+Сейчас:
 
 ${currentTime}
 
 ${languageInstruction(language)}
 
-================================
-ПАМЯТЬ
-================================
+Учитывай историю разговора.
 
-У тебя есть история последних сообщений.
-
-Используй её.
-
-Понимай продолжения:
+Если пользователь пишет:
 
 "сократи"
-
-"сделай короче"
-
 "подробнее"
-
-"объясни проще"
-
-"что?"
-
-"а почему?"
-
-"твой прошлый текст"
-
-"позапрошлый ответ"
-
 "про него"
-
 "что с ним?"
-
 "по этому делу"
+"твой прошлый ответ"
 
-"дай свежие новости"
+понимай контекст предыдущих сообщений.
 
-"а что сейчас?"
+Не проси отправлять текст повторно,
+если он уже есть в истории.
 
-Если нужный текст или тема уже есть
-в истории разговора,
-НЕ проси пользователя отправить
-информацию повторно.
+Для актуальной информации
+используй WEB DATA,
+если она предоставлена.
 
+Не придумывай свежие факты.
 
-================================
-СТИЛЬ
-================================
+Не заменяй событие 2026 года
+старой похожей историей.
 
-Отвечай естественно.
+Ты не управляешь Google,
+браузером или tools.
 
-Не пиши слишком официально.
-
-На простой вопрос —
-короткий понятный ответ.
-
-На сложный вопрос —
-нормальное объяснение.
-
-Можно использовать эмодзи,
-но умеренно.
-
-
-================================
-ИНТЕРНЕТ
-================================
-
-Ты НЕ управляешь поиском.
-
-Ты НЕ должен самостоятельно
-вызывать:
-
-Google
-google(...)
-search(...)
-browser(...)
-tools
-functions
-
-Поиск выполняет сервер через Tavily.
-
-Если WEB DATA присутствует,
-значит свежий поиск УЖЕ выполнен.
-
-Используй эти данные.
-
-
-НИКОГДА НЕ ВЫВОДИ:
+Никогда не выводи:
 
 <|tool_call_start|>
-
 <|tool_call_end|>
-
 User Safety: safe
-
 Response Safety: safe
 
+Не показывай URL,
+если пользователь сам
+не попросил источники.
 
-================================
-АКТУАЛЬНАЯ ИНФОРМАЦИЯ
-================================
+Если пользователь просто спрашивает
+"курс доллара",
+подразумевай USD -> UAH.
 
-Для:
-
-новостей,
-утечек,
-инсайдов,
-погоды,
-курсов валют,
-цен,
-релизов,
-обновлений
-
-используй WEB DATA.
-
-Не выдавай старые сведения
-за свежие.
-
-Особенно следи за датами.
-
-Если вопрос относится к 2026 году,
-не заменяй его похожей историей
-из 2022 или другого года.
-
-Если поиск не подтверждает
-утверждение пользователя —
-скажи об этом.
-
-Не придумывай:
-
-людей,
-аккаунты,
-утечки,
-новости,
-даты,
-официальные заявления.
-
-
-================================
-ИСТОЧНИКИ
-================================
-
-Не кидай пользователю
-список сырых URL без необходимости.
-
-Если он прямо просит:
-
-"дай ссылки"
-
-"дай источники"
-
-"откуда инфа"
-
-тогда можешь показать
-релевантные URL из WEB DATA.
-
-
-================================
-ВАЛЮТА
-================================
-
-Если пользователь просто пишет:
-
-"курс доллара"
-
-и не указывает вторую валюту,
-
-подразумевай:
-
-USD -> UAH
-
-доллар США к украинской гривне.
 `;
 
 
@@ -1106,53 +1032,28 @@ USD -> UAH
 
     systemPrompt += `
 
-================================
-WEB DATA — СВЕЖИЙ ПОИСК
-================================
+==========================
+WEB DATA
+==========================
 
 ${webContext}
 
-================================
+==========================
 
-Эти данные получены сервером
-прямо перед текущим ответом.
+Это свежие результаты поиска.
 
-Используй только результаты,
-относящиеся к вопросу.
+Проверяй даты и релевантность.
 
-Проверяй даты.
+Если точного подтверждения нет,
+честно скажи об этом.
 
-Если найденные страницы говорят
-о другом человеке или событии,
-не используй их как подтверждение.
-
-Если точной информации нет —
-честно скажи:
-
-что надёжного подтверждения
-найти не удалось.
-
-Не заменяй неизвестную свежую
-информацию похожей старой историей.
-
-Сформулируй ответ самостоятельно,
-а не копируй поисковую выдачу.
 `;
+
   }
 
 
-  // ==================================================
-  // ЗАГРУЖАЕМ ИСТОРИЮ ИЗ REDIS
-  // ==================================================
-
   const history =
     await getHistory(userId);
-
-
-  console.log(
-    "🧠 Redis history:",
-    history.length
-  );
 
 
   const messages = [
@@ -1190,49 +1091,160 @@ ${webContext}
     );
 
 
-  if (!answer) {
-
-    if (language === "uk") {
-      return (
-        "⚠️ Не вдалося отримати " +
-        "нормальну відповідь. " +
-        "Спробуй ще раз."
-      );
-    }
-
-
-    if (language === "en") {
-      return (
-        "⚠️ I couldn't get a proper " +
-        "response. Please try again."
-      );
-    }
-
-
-    return (
-      "⚠️ Не удалось получить " +
-      "нормальный ответ. " +
-      "Попробуй ещё раз."
-    );
-  }
-
-
-  return answer;
+  return (
+    answer ||
+    "⚠️ Не удалось получить нормальный ответ. Попробуй ещё раз."
+  );
 }
 
 
 // ======================================================
-// TELEGRAM WEBHOOK
+// VISION AI
 // ======================================================
 
-export async function POST(
-  request
-) {
+async function askVisionAI({
+  imageData,
+  caption,
+  userId,
+  language,
+}) {
+
+  const history =
+    await getHistory(userId);
+
+
+  // В историю передаём только текст.
+  // Старые изображения в Redis не сохраняем.
+  const safeHistory =
+    history.slice(-12);
+
+
+  const systemPrompt = `
+
+Ты AI Guide —
+персональный Telegram AI-ассистент.
+
+${languageInstruction(language)}
+
+Пользователь отправил изображение.
+
+Внимательно изучи его.
+
+Если это:
+
+- школьное задание —
+  реши его и объясни;
+
+- скриншот ошибки —
+  найди проблему;
+
+- интерфейс программы —
+  объясни, что на нём;
+
+- предмет —
+  расскажи, что видно;
+
+- текст —
+  прочитай и выполни просьбу пользователя;
+
+- фотография —
+  ответь на вопрос пользователя
+  об изображении.
+
+Не придумывай мелкие детали,
+которые невозможно уверенно увидеть.
+
+Учитывай предыдущую историю разговора.
+
+Если подписи к фотографии нет,
+сам опиши главное на изображении
+и предложи полезную помощь.
+
+Не выводи:
+
+User Safety: safe
+Response Safety: safe
+<|tool_call_start|>
+
+`;
+
+
+  const userPrompt =
+    caption ||
+    "Что изображено на этой фотографии? Объясни главное и помоги, если на ней есть задание, текст или проблема.";
+
+
+  const messages = [
+
+    {
+      role:
+        "system",
+
+      content:
+        systemPrompt,
+    },
+
+    ...safeHistory,
+
+    {
+      role:
+        "user",
+
+      content: [
+
+        {
+          type:
+            "text",
+
+          text:
+            userPrompt,
+        },
+
+        {
+          type:
+            "image_url",
+
+          image_url: {
+            url:
+              imageData,
+          },
+        },
+
+      ],
+    },
+
+  ];
+
+
+  let answer =
+    await requestOpenRouter(
+      messages
+    );
+
+
+  answer =
+    cleanAIResponse(
+      answer
+    );
+
+
+  return (
+    answer ||
+    "⚠️ Не удалось проанализировать изображение. Попробуй отправить его ещё раз."
+  );
+}
+
+
+// ======================================================
+// POST
+// ======================================================
+
+export async function POST(request) {
 
   try {
 
     console.log(
-      "🚀 AI-GUIDE-V5-MEMORY"
+      "AI-GUIDE-V6-VISION"
     );
 
 
@@ -1262,7 +1274,7 @@ export async function POST(
 
 
     // ==================================================
-    // PRIVATE ACCESS
+    // PRIVATE
     // ==================================================
 
     if (
@@ -1285,6 +1297,131 @@ export async function POST(
 
 
     // ==================================================
+    // PHOTO
+    // ==================================================
+
+    if (
+      Array.isArray(
+        message.photo
+      ) &&
+      message.photo.length > 0
+    ) {
+
+      console.log(
+        "📷 Получено фото"
+      );
+
+
+      // Telegram присылает несколько размеров.
+      // Берём самый большой.
+      const biggestPhoto =
+        message.photo[
+          message.photo.length - 1
+        ];
+
+
+      const fileId =
+        biggestPhoto.file_id;
+
+
+      const caption =
+        message.caption?.trim() ||
+        "";
+
+
+      const language =
+        detectLanguage(
+          caption
+        );
+
+
+      const imageData =
+        await getTelegramPhotoBase64(
+          fileId
+        );
+
+
+      if (!imageData) {
+
+        await sendMessage(
+          chatId,
+          "⚠️ Не удалось скачать фотографию из Telegram."
+        );
+
+
+        return Response.json({
+          ok: true,
+        });
+
+      }
+
+
+      console.log(
+        "📷 Фото скачано"
+      );
+
+
+      const answer =
+        await askVisionAI({
+
+          imageData,
+
+          caption,
+
+          userId,
+
+          language,
+
+        });
+
+
+      // Сохраняем только текстовое описание
+      // факта отправки фото.
+      // Base64 в Redis НЕ кладём.
+
+      await addHistory(
+
+        userId,
+
+        "user",
+
+        caption
+          ? `[Пользователь отправил изображение]\n${caption}`
+          : "[Пользователь отправил изображение]"
+
+      );
+
+
+      await addHistory(
+
+        userId,
+
+        "assistant",
+
+        answer
+
+      );
+
+
+      await sendMessage(
+        chatId,
+        answer
+      );
+
+
+      console.log(
+        "📷 Vision answer sent"
+      );
+
+
+      return Response.json({
+        ok: true,
+      });
+
+    }
+
+
+    // ==================================================
     // TEXT
     // ==================================================
 
@@ -1296,7 +1433,7 @@ export async function POST(
 
       await sendMessage(
         chatId,
-        "Пока V5 работает с текстовыми сообщениями."
+        "Пока я поддерживаю текст и фотографии 📷"
       );
 
 
@@ -1307,14 +1444,8 @@ export async function POST(
     }
 
 
-    console.log(
-      "💬 User:",
-      text
-    );
-
-
     // ==================================================
-    // CLEAR MEMORY
+    // CLEAR
     // ==================================================
 
     if (
@@ -1344,16 +1475,12 @@ export async function POST(
 
 
     // ==================================================
-    // LANGUAGE
+    // NORMAL TEXT
     // ==================================================
 
     const language =
       detectLanguage(text);
 
-
-    // ==================================================
-    // WEB SEARCH
-    // ==================================================
 
     let webContext =
       null;
@@ -1364,11 +1491,11 @@ export async function POST(
     ) {
 
       console.log(
-        "🌐 Нужен интернет"
+        "🌐 Web search"
       );
 
 
-      const searchQuery =
+      const query =
         await buildSearchQuery(
           text,
           userId,
@@ -1376,18 +1503,9 @@ export async function POST(
         );
 
 
-      console.log(
-        "🔎 Search:",
-        searchQuery.slice(
-          0,
-          1500
-        )
-      );
-
-
       const webData =
         await searchWeb(
-          searchQuery
+          query
         );
 
 
@@ -1396,45 +1514,25 @@ export async function POST(
           webData
         );
 
-
-      if (webContext) {
-
-        console.log(
-          "✅ WEB DATA ready"
-        );
-
-      } else {
-
-        console.log(
-          "⚠️ WEB DATA empty"
-        );
-
-      }
-
-    } else {
-
-      console.log(
-        "🧠 Интернет не нужен"
-      );
-
     }
 
 
-    // ==================================================
-    // ASK AI
-    // ==================================================
-
     const answer =
       await askAI({
+
         text,
+
         userId,
+
         language,
+
         webContext,
+
       });
 
 
     // ==================================================
-    // СОХРАНЯЕМ В REDIS
+    // SAVE MEMORY
     // ==================================================
 
     await addHistory(
@@ -1451,23 +1549,13 @@ export async function POST(
     );
 
 
-    console.log(
-      "💾 History saved to Redis"
-    );
-
-
     // ==================================================
-    // TELEGRAM RESPONSE
+    // SEND
     // ==================================================
 
     await sendMessage(
       chatId,
       answer
-    );
-
-
-    console.log(
-      "✅ Ответ отправлен"
     );
 
 
@@ -1479,13 +1567,10 @@ export async function POST(
   } catch (error) {
 
     console.error(
-      "🔥 BOT ERROR:",
+      "BOT ERROR:",
       error
     );
 
-
-    // Возвращаем Telegram 200,
-    // чтобы он не отправлял update повторно.
 
     return Response.json({
       ok: true,
@@ -1496,7 +1581,7 @@ export async function POST(
 
 
 // ======================================================
-// GET — STATUS
+// GET
 // ======================================================
 
 export async function GET() {
@@ -1504,7 +1589,7 @@ export async function GET() {
   return Response.json({
 
     version:
-      "AI-GUIDE-V5-MEMORY",
+      "AI-GUIDE-V6-VISION",
 
     status:
       "Bot is running",
@@ -1528,15 +1613,10 @@ export async function GET() {
       !!ALLOWED_USER_ID,
 
     memory:
-      (
-        UPSTASH_REDIS_REST_URL &&
-        UPSTASH_REDIS_REST_TOKEN
-      )
-        ? "Upstash Redis"
-        : "NOT CONFIGURED",
+      "Upstash Redis",
 
-    historyMessages:
-      MAX_HISTORY_MESSAGES,
+    vision:
+      true,
 
     search:
       "Tavily",
