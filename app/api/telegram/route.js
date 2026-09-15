@@ -12,12 +12,13 @@ const ffmpegPath = path.join(process.cwd(), "ffmpeg-bin", "ffmpeg");
 export const runtime = "nodejs";
 
 // ======================================================
-// AI GUIDE V7.5.9
+// AI GUIDE V7.6.0
 //
 // Groq:
 // - Text: openai/gpt-oss-120b
 // - Text fallback: openai/gpt-oss-20b
-// - Vision: qwen/qwen3.8-27b
+// - Vision primary: qwen/qwen3.8-27b
+// - Vision fallback: Google Gemini 2.5 Flash
 // - Voice: whisper-large-v3-turbo
 //
 // Features:
@@ -36,6 +37,7 @@ export const runtime = "nodejs";
 // - Better Telegram-safe math
 //
 // Ordinary VIDEO + video notes supported via FFmpeg frames + Whisper.
+// Gemini is used ONLY as Vision fallback.
 // OpenRouter disabled.
 // ======================================================
 
@@ -49,6 +51,9 @@ const TELEGRAM_BOT_TOKEN =
 
 const GROQ_API_KEY =
   process.env.GROQ_API_KEY;
+
+const GEMINI_API_KEY =
+  process.env.GEMINI_API_KEY;
 
 const TAVILY_API_KEY =
   process.env.TAVILY_API_KEY;
@@ -87,6 +92,12 @@ const TEXT_FALLBACK_MODEL =
 
 const VISION_MODEL =
   "qwen/qwen3.8-27b";
+
+const GEMINI_VISION_MODEL =
+  "gemini-2.5-flash";
+
+const GEMINI_OPENAI_CHAT_API =
+  "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions";
 
 const WHISPER_MODEL =
   "whisper-large-v3-turbo";
@@ -1236,6 +1247,73 @@ async function requestGroq({
 }
 
 
+async function requestGeminiVision({
+  messages,
+  temperature = 0.2,
+  maxTokens = 1200,
+}) {
+  if (!GEMINI_API_KEY) {
+    return { ok: false, status: 0, error: "GEMINI_API_KEY missing", text: null };
+  }
+
+  try {
+    const response = await fetch(GEMINI_OPENAI_CHAT_API, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${GEMINI_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: GEMINI_VISION_MODEL,
+        messages,
+        temperature,
+        max_tokens: maxTokens,
+      }),
+    });
+
+    const raw = await response.text();
+    console.log(`Gemini Vision ${GEMINI_VISION_MODEL}:`, response.status);
+
+    if (!response.ok) {
+      console.error(`Gemini Vision ${GEMINI_VISION_MODEL}:`, raw);
+      return { ok: false, status: response.status, error: raw, text: null };
+    }
+
+    const data = JSON.parse(raw);
+    return {
+      ok: true,
+      status: 200,
+      error: null,
+      text: data?.choices?.[0]?.message?.content || null,
+    };
+  } catch (error) {
+    console.error("Gemini Vision exception:", error);
+    return { ok: false, status: 0, error: String(error), text: null };
+  }
+}
+
+async function requestVision({ messages, temperature = 0.1, maxTokens = 1200 }) {
+  let result = await requestGroq({
+    model: VISION_MODEL,
+    messages,
+    temperature,
+    maxTokens,
+  });
+
+  if (result.ok && result.text) return result;
+
+  console.log(`Groq Vision failed (${result.status || "network"}) -> Gemini fallback`);
+  const gemini = await requestGeminiVision({ messages, temperature, maxTokens });
+  if (gemini.ok && gemini.text) return gemini;
+
+  return {
+    ...result,
+    geminiStatus: gemini.status,
+    geminiError: gemini.error,
+  };
+}
+
+
 function isRequestTooLarge(result) {
   const error =
     String(
@@ -1392,8 +1470,7 @@ async function askVisionAI({
   ];
 
   let result =
-    await requestGroq({
-      model: VISION_MODEL,
+    await requestVision({
       messages,
       temperature: 0.1,
       maxTokens: 1300,
@@ -1440,8 +1517,7 @@ R = U / I
     ];
 
     result =
-      await requestGroq({
-        model: VISION_MODEL,
+      await requestVision({
         messages,
         temperature: 0.1,
         maxTokens: 900,
@@ -1457,18 +1533,18 @@ R = U / I
 
   if (isRequestTooLarge(result)) {
     return (
-      "⚠️ Это изображение слишком большое для Groq Vision. Обрежь нужную часть или отправь скриншот поменьше."
+      "⚠️ Не удалось обработать слишком большое изображение. Обрежь нужную часть или отправь скриншот поменьше."
     );
   }
 
   if (result.status === 429) {
     return (
-      "⚠️ Сейчас достигнут лимит Groq Vision. Попробуй немного позже."
+      "⚠️ Сейчас Vision временно недоступен. Попробуй немного позже."
     );
   }
 
   return (
-    "⚠️ Groq Vision не смог обработать изображение."
+    "⚠️ Vision не смог обработать изображение."
   );
 }
 
@@ -2052,7 +2128,7 @@ async function askStickerVisionAI({ image, language, kind = "стикер" }) {
       { type: "image_url", image_url: { url: image.dataUrl } }
     ]
   }];
-  const result = await requestGroq({ model: VISION_MODEL, messages, temperature: 0.65, maxCompletionTokens: 120 });
+  const result = await requestVision({ messages, temperature: 0.65, maxTokens: 180 });
   if (!result.ok) return null;
   return cleanAIResponse(result.text);
 }
