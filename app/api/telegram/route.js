@@ -12,7 +12,7 @@ const ffmpegPath = path.join(process.cwd(), "ffmpeg-bin", "ffmpeg");
 export const runtime = "nodejs";
 
 // ======================================================
-// AI GUIDE V7.5.5
+// AI GUIDE V7.5.6
 //
 // Groq:
 // - Text: openai/gpt-oss-120b
@@ -87,6 +87,9 @@ const TEXT_FALLBACK_MODEL =
 
 const VISION_MODEL =
   "qwen/qwen3.8-27b";
+
+const VISION_FALLBACK_MODEL =
+  "qwen/qwen3.6-27b";
 
 const WHISPER_MODEL =
   "whisper-large-v3-turbo";
@@ -1328,6 +1331,33 @@ async function askTextAI({
 
 
 // ======================================================
+// VISION MODEL FALLBACK V7.5.6
+// qwen3.8 -> qwen3.6 on rate-limit / temporary provider errors
+// ======================================================
+
+function shouldFallbackVision(result) {
+  if (!result || result.ok) return false;
+  return result.status === 429 || result.status === 0 || result.status >= 500;
+}
+
+async function requestVisionGroq(options) {
+  let result = await requestGroq({
+    ...options,
+    model: VISION_MODEL,
+  });
+
+  if (shouldFallbackVision(result)) {
+    console.log(`Vision fallback: ${VISION_MODEL} -> ${VISION_FALLBACK_MODEL} (status ${result.status})`);
+    result = await requestGroq({
+      ...options,
+      model: VISION_FALLBACK_MODEL,
+    });
+  }
+
+  return result;
+}
+
+// ======================================================
 // VISION
 // ======================================================
 
@@ -1393,8 +1423,7 @@ async function askVisionAI({
   ];
 
   let result =
-    await requestGroq({
-      model: VISION_MODEL,
+    await requestVisionGroq({
       messages,
       temperature: 0.1,
       maxTokens: 1300,
@@ -2053,9 +2082,9 @@ async function askStickerVisionAI({ image, language, kind = "стикер" }) {
       { type: "image_url", image_url: { url: image.dataUrl } }
     ]
   }];
-  const result = await requestGroq({ model: VISION_MODEL, messages, temperature: 0.65, maxCompletionTokens: 120 });
+  const result = await requestVisionGroq({ messages, temperature: 0.65, maxCompletionTokens: 120 });
   if (!result.ok) return null;
-  return cleanAIResponse(result.content);
+  return cleanAIResponse(result.text);
 }
 
 // ======================================================
@@ -2795,7 +2824,7 @@ export async function POST(
 ) {
   try {
     console.log(
-      "AI-GUIDE-V7.5.4"
+      "AI-GUIDE-V7.5.6"
     );
 
     const update =
@@ -3171,7 +3200,7 @@ export async function GET() {
 
   return Response.json({
     version:
-      "AI-GUIDE-V7.5.4",
+      "AI-GUIDE-V7.5.6",
 
     status:
       "Bot is running",
