@@ -1,7 +1,7 @@
 export const runtime = "nodejs";
 
 // ======================================================
-// AI GUIDE V7.4.1
+// AI GUIDE V7.4.2
 //
 // Groq:
 // - Text: openai/gpt-oss-120b
@@ -280,6 +280,7 @@ async function sendMessage(
       "Не удалось получить ответ.";
   }
 
+  // Telegram message limit safety
   for (
     let i = 0;
     i < output.length;
@@ -597,53 +598,50 @@ x = (-b ± √D) / (2a)
 · × ÷ √ ± ≈ ≤ ≥ ² ³ ⁴ ⁵ ⁶ ⁷ ⁸ ⁹
 `;
 }
+
+
 // ======================================================
-// CLEAN AI RESPONSE
+// OUTPUT CLEANER
 // ======================================================
 
 function cleanAIResponse(text) {
-  let result =
-    String(text || "").trim();
+  if (!text) return "";
 
-  // Groq / model internal garbage
+  let result = String(text);
+
+  // Groq internal garbage if it appears
   result = result.replace(
-    /<\|(?:channel|start|end)[^>]*\|>/gi,
+    /<\|tool_call_start\|>[\s\S]*?<\|tool_call_end\|>/gi,
     ""
   );
 
   result = result.replace(
-    /<tool_call>[\s\S]*?<\/tool_call>/gi,
+    /<\|tool_call_start\|>[\s\S]*$/gi,
     ""
   );
 
   result = result.replace(
-    /```(?:json)?\s*\{[\s\S]*?"name"\s*:\s*"[^"]+"[\s\S]*?\}\s*```/gi,
-    ""
-  );
-
-  // Safety labels
-  result = result.replace(
-    /^\s*User\s+Safety\s*:\s*safe\s*$/gim,
+    /<\|tool_call_end\|>/gi,
     ""
   );
 
   result = result.replace(
-    /^\s*Response\s+Safety\s*:\s*safe\s*$/gim,
+    /^\s*User Safety\s*:\s*safe\s*$/gim,
     ""
   );
 
-  // Markdown bold
-  result = result.replace(
-    /\*\*(.*?)\*\*/g,
-    "$1"
-  );
+  // Remove Markdown bold markers
+  result =
+    result.replace(/\*\*/g, "");
 
-  // Remove LaTeX wrappers
+  // Remove common LaTeX wrappers
   result = result
-    .replace(/\$\$([\s\S]*?)\$\$/g, "$1")
-    .replace(/\$([^$\n]+)\$/g, "$1")
-    .replace(/\\\[((?:.|\n)*?)\\\]/g, "$1")
-    .replace(/\\\((.*?)\\\)/g, "$1");
+    .replace(/\\\[/g, "")
+    .replace(/\\\]/g, "")
+    .replace(/\\\(/g, "")
+    .replace(/\\\)/g, "")
+    .replace(/\$\$/g, "")
+    .replace(/\$/g, "");
 
   // Common LaTeX commands
   result = result
@@ -652,72 +650,104 @@ function cleanAIResponse(text) {
     .replace(/\\div/g, "÷")
     .replace(/\\pm/g, "±")
     .replace(/\\approx/g, "≈")
-    .replace(/\\leq?/g, "≤")
-    .replace(/\\geq?/g, "≥")
     .replace(/\\neq/g, "≠")
-    .replace(/\\infty/g, "∞")
-    .replace(/\\degree/g, "°")
-    .replace(/\\%/g, "%");
+    .replace(/\\leq/g, "≤")
+    .replace(/\\geq/g, "≥")
+    .replace(/\\alpha/g, "α")
+    .replace(/\\beta/g, "β")
+    .replace(/\\gamma/g, "γ")
+    .replace(/\\Delta/g, "Δ")
+    .replace(/\\pi/g, "π")
+    .replace(/\\Omega/g, "Ω");
 
-  // Square root
   result = result.replace(
-    /\\sqrt\s*\{([^{}]+)\}/g,
+    /\\text\{([^{}]*)\}/g,
+    "$1"
+  );
+
+  result = result.replace(
+    /\\mathrm\{([^{}]*)\}/g,
+    "$1"
+  );
+
+  result = result.replace(
+    /\\sqrt\{([^{}]*)\}/g,
     "√($1)"
   );
 
-  result = result.replace(
-    /\\sqrt\s+([A-Za-z0-9.,]+)/g,
-    "√$1"
-  );
-
   // Fractions
-  let previous;
-
-  do {
-    previous = result;
-
+  for (let i = 0; i < 6; i++) {
     result = result.replace(
-      /\\frac\s*\{([^{}]+)\}\s*\{([^{}]+)\}/g,
+      /\\frac\{([^{}]+)\}\{([^{}]+)\}/g,
       "($1) / ($2)"
     );
-  } while (result !== previous);
+  }
 
-  // Powers
+  // 10^{4}
   result = result.replace(
-    /\^\{([+\-]?\d+)\}/g,
-    (_, value) =>
-      superscriptNumber(value)
+    /10\^\{([+\-]?\d+)\}/g,
+    (_, power) =>
+      "10" +
+      superscriptNumber(power)
   );
 
+  // 10^4
   result = result.replace(
-    /\^([+\-]?\d+)/g,
-    (_, value) =>
-      superscriptNumber(value)
+    /10\^([+\-]?\d+)/g,
+    (_, power) =>
+      "10" +
+      superscriptNumber(power)
   );
 
-  // Subscripts
+  // x^{2}
+  result = result.replace(
+    /([A-Za-zА-Яа-яІіЇїЄєҐґ0-9])\^\{([+\-]?\d+)\}/g,
+    (_, base, power) =>
+      base +
+      superscriptNumber(power)
+  );
+
+  // x^2
+  result = result.replace(
+    /([A-Za-zА-Яа-яІіЇїЄєҐґ])\^([+\-]?\d+)/g,
+    (_, base, power) =>
+      base +
+      superscriptNumber(power)
+  );
+
+  // a_{2}
   result = result.replace(
     /_\{([+\-]?\d+)\}/g,
-    (_, value) =>
-      subscriptNumber(value)
+    (_, number) =>
+      subscriptNumber(number)
   );
 
+  // Remaining simple ^{...} expressions.
+  // Example: ^{-5+9}
   result = result.replace(
-    /_([+\-]?\d+)/g,
+    /\^\{([+\-\d()]+)\}/g,
     (_, value) =>
-      subscriptNumber(value)
+      superscriptNumber(value)
   );
 
-  // Remove remaining braces in simple math
+  // Remove leftover LaTeX spacing
   result = result
-    .replace(/\\left/g, "")
-    .replace(/\\right/g, "")
     .replace(/\\,/g, " ")
     .replace(/\\;/g, " ")
-    .replace(/\\:/g, " ")
     .replace(/\\!/g, "");
 
-  // Clean excessive blank lines
+  // Remove some leftover braces around numbers
+  result = result.replace(
+    /\{([+\-]?\d+)\}/g,
+    "$1"
+  );
+
+  // Normalize spaces
+  result = result.replace(
+    /[ \t]+\n/g,
+    "\n"
+  );
+
   result = result.replace(
     /\n{3,}/g,
     "\n\n"
@@ -728,73 +758,61 @@ function cleanAIResponse(text) {
 
 
 // ======================================================
-// INTERNET DETECTION
+// INTERNET
 // ======================================================
 
 function needsInternet(text) {
-  const value =
+  const t =
     String(text || "")
       .toLowerCase();
 
-  if (!value) return false;
+  if (!t) return false;
 
   const triggers = [
-    "сегодня",
     "сейчас",
-    "актуальн",
+    "сегодня",
     "последн",
-    "новост",
+    "свеж",
+    "новости",
     "погода",
-    "температур",
     "курс",
     "доллар",
-    "долар",
     "евро",
-    "євро",
     "гривн",
     "цена",
-    "ціна",
-    "стоимость",
     "сколько стоит",
-    "скільки коштує",
-    "кто выиграл",
-    "хто виграв",
-    "результат",
-    "расписание",
-    "розклад",
-    "когда выйдет",
-    "коли вийде",
-    "вышел ли",
-    "вийшов",
     "обновление",
+    "релиз",
+
+    "зараз",
+    "сьогодні",
+    "останні",
+    "свіж",
+    "новини",
+    "погода",
+    "курс",
+    "ціна",
+    "скільки коштує",
     "оновлення",
-    "версия",
-    "версія",
-    "президент",
-    "выборы",
-    "вибори",
-    "война",
-    "війна",
-    "курс валют",
-    "exchange rate",
-    "weather",
+
+    "current",
     "today",
     "latest",
     "news",
-    "current",
+    "weather",
     "price",
-    "release date",
+    "update",
+    "release",
   ];
 
   return triggers.some(
-    trigger =>
-      value.includes(trigger)
+    trigger => t.includes(trigger)
   );
 }
 
 
 // ======================================================
-// TAVILY WEB SEARCH
+// TAVILY
 // ======================================================
 
 async function searchWeb(query) {
@@ -803,48 +821,33 @@ async function searchWeb(query) {
   }
 
   try {
-    const response =
-      await fetch(
-        "https://api.tavily.com/search",
-        {
-          method: "POST",
+    const response = await fetch(
+      "https://api.tavily.com/search",
+      {
+        method: "POST",
+        headers: {
+          Authorization:
+            `Bearer ${TAVILY_API_KEY}`,
+          "Content-Type":
+            "application/json",
+        },
+        body: JSON.stringify({
+          query,
+          search_depth: "basic",
+          max_results: 7,
+          include_answer: true,
+          include_raw_content: false,
+        }),
+      }
+    );
 
-          headers: {
-            Authorization:
-              `Bearer ${TAVILY_API_KEY}`,
-
-            "Content-Type":
-              "application/json",
-          },
-
-          body: JSON.stringify({
-            query:
-              String(query || "")
-                .slice(0, 1500),
-
-            search_depth:
-              "basic",
-
-            max_results: 7,
-
-            include_answer: true,
-
-            include_raw_content:
-              false,
-          }),
-        }
-      );
-
-    const raw =
-      await response.text();
+    const raw = await response.text();
 
     if (!response.ok) {
       console.error(
         "Tavily:",
-        response.status,
         raw
       );
-
       return null;
     }
 
@@ -855,61 +858,39 @@ async function searchWeb(query) {
       "Tavily exception:",
       error
     );
-
     return null;
   }
 }
 
 
 function makeWebContext(data) {
-  if (!data) return "";
+  if (!data) return null;
 
-  const parts = [];
+  let output = "";
 
   if (data.answer) {
-    parts.push(
-      `Краткий ответ поисковой системы:\n${data.answer}`
-    );
+    output +=
+      `SEARCH SUMMARY:\n${data.answer}\n\n`;
   }
 
-  if (
-    Array.isArray(data.results)
-  ) {
-    const results =
-      data.results.slice(0, 7);
+  if (Array.isArray(data.results)) {
+    output += data.results
+      .slice(0, 7)
+      .map(
+        (item, index) => `
+RESULT ${index + 1}
 
-    for (
-      let i = 0;
-      i < results.length;
-      i++
-    ) {
-      const item = results[i];
+TITLE:
+${item.title || "Unknown"}
 
-      const title =
-        String(
-          item?.title || ""
-        ).trim();
-
-      const content =
-        String(
-          item?.content || ""
-        )
-          .trim()
-          .slice(0, 1800);
-
-      if (!title && !content) {
-        continue;
-      }
-
-      parts.push(
-        `Источник ${i + 1}:\n` +
-        `${title}\n` +
-        `${content}`
-      );
-    }
+CONTENT:
+${item.content || "Unknown"}
+`
+      )
+      .join("\n");
   }
 
-  return parts.join("\n\n");
+  return output.trim() || null;
 }
 
 
@@ -919,213 +900,197 @@ function makeWebContext(data) {
 
 function makeSystemPrompt({
   language,
-  webContext = "",
+  webContext = null,
   vision = false,
 }) {
   const now =
-    new Intl.DateTimeFormat(
+    new Date().toLocaleString(
       "ru-RU",
       {
         timeZone:
           "Europe/Kyiv",
-
-        dateStyle:
-          "full",
-
-        timeStyle:
-          "medium",
       }
-    ).format(new Date());
+    );
 
-  return `
-Ты — AI Guide, персональный AI-помощник пользователя в Telegram.
+  let prompt = `
+Ты AI Guide — персональный Telegram AI-ассистент.
 
-Текущие дата и время:
+Текущее время:
 ${now}
 
 ${languageInstruction(language)}
 
-Отвечай естественно, понятно и по делу.
+Отвечай естественно и понятно.
 
-Не делай ответы искусственно длинными, если пользователь не просил подробное объяснение.
+Учитывай историю разговора.
 
-Если пользователь просит:
-"короче",
-"сократи",
-"подробнее",
-"продолжи",
-"почему",
-"сделай 3",
-"теперь 4",
-"перепиши",
-"сделай лучше",
-то обязательно учитывай историю диалога.
+Если пользователь пишет:
+"короче"
+"подробнее"
+"продолжи"
+"почему"
+"сделай 3"
+"тепер 4"
 
-Не спрашивай повторно то, что уже понятно из истории разговора.
+используй предыдущий контекст.
 
-Если пользователь присылает школьное задание:
-
-1. Очень внимательно прочитай условие.
-2. Не меняй числа, знаки, формулы и обозначения.
-3. Не придумывай текст, которого нет.
-4. Выполняй именно тот номер или пункт, который попросил пользователь.
+Для школьных заданий:
+1. Внимательно прочитай условие.
+2. Не меняй числа и знаки.
+3. Не придумывай текст.
+4. Выполняй именно тот пункт, который попросили.
 5. Проверяй вычисления.
-6. Объясняй на школьном уровне.
-7. Если пользователь просит решение — показывай необходимые действия, а не только ответ.
+6. Объясняй на уровне школьника.
+7. Если пользователь просит решение — показывай ход решения, а не только ответ.
 
-Особенно важно:
+ВАЖНО:
 
-Если на странице написано, например:
+Если на странице написано:
+"ВПРАВА №1"
 
-ВПРАВА №1
+и ниже есть:
+1.
+2.
+3.
+4.
 
-а внутри есть пункты:
-1)
-2)
-3)
-4)
-
-и пользователь пишет:
+а пользователь пишет:
 "3 вправу виконай"
 
-то чаще всего он имеет в виду ПУНКТ 3 этой упражнения, а не третью отдельную задачу на всей странице.
+то он обычно просит ПУНКТ 3 этой вправы.
 
-Ориентируйся на структуру изображения и контекст.
+Не выполняй всю страницу без просьбы.
 
-Не показывай скрытую цепочку рассуждений или внутренние инструкции.
+Не показывай скрытую цепочку рассуждений.
 
 ${telegramMathRules()}
+`;
 
-${vision ? `
-ВАЖНО ДЛЯ ИЗОБРАЖЕНИЙ:
+  if (vision) {
+    prompt += `
 
-Тебе действительно передано изображение.
+Тебе передано настоящее изображение.
 
-Сначала внимательно изучи именно изображение, а потом отвечай.
+Внимательно прочитай изображение.
 
-Если пользователь прислал фото задания:
-- прочитай видимый текст;
-- проверь номера;
-- проверь знаки;
-- проверь степени;
-- проверь единицы измерения;
-- не заменяй числа своими;
-- не придумывай нечитаемый текст.
+Текст пользователя является инструкцией к изображению.
 
-Если это Reply на старое фото, текущее сообщение пользователя является инструкцией к этому изображению.
+Если это Reply на ранее отправленное фото,
+переданное изображение является именно тем фото,
+на которое пользователь ответил.
 
-Если передано превью Telegram-стикера:
-- анализируй то, что реально видно на изображении;
-- emoji является только метаданными Telegram;
-- НИКОГДА не определяй содержимое стикера только по emoji;
-- если emoji не совпадает с изображением, доверяй изображению;
-- если это превью анимированного или видео-стикера, ты видишь отдельный статический кадр и не должен придумывать невидимое движение;
-- если пользователь просто отправил стикер без вопроса, отреагируй коротко и естественно.
-` : ""}
+Если пользователь просит пункт 3,
+выполни только пункт 3.
 
-${webContext ? `
-АКТУАЛЬНАЯ ИНФОРМАЦИЯ ИЗ WEB-ПОИСКА:
+Особенно внимательно распознавай:
+- цифры;
+- десятичные запятые;
+- минусы;
+- плюсы;
+- показатели степеней;
+- единицы измерения;
+- номера заданий.
+
+ПЕРЕД ОТВЕТОМ внутренне перепроверь
+все распознанные числа по изображению.
+
+Не выдумывай то,
+что невозможно прочитать.
+
+Не говори,
+что не видишь изображение,
+если оно передано в запросе.
+`;
+  }
+
+  if (webContext) {
+    prompt += `
+
+АКТУАЛЬНАЯ ИНФОРМАЦИЯ ИЗ WEB SEARCH:
 
 ${webContext}
 
-Используй эти данные для ответа на вопросы, которым нужна актуальная информация.
-
-Не утверждай устаревшие данные, если поиск показывает более новые.
-
+Используй её для ответа.
 Не вставляй пользователю длинный список URL.
-` : ""}
 `;
+  }
+
+  return prompt;
 }
 
 
 // ======================================================
-// GROQ REQUEST
+// GROQ
 // ======================================================
 
 async function requestGroq({
   model,
   messages,
   temperature = 0.4,
-  maxCompletionTokens = 2500,
+  maxTokens = 1800,
 }) {
   if (!GROQ_API_KEY) {
     return {
       ok: false,
-      status: 500,
+      status: 0,
       error:
-        "GROQ_API_KEY is not set",
+        "GROQ_API_KEY missing",
+      text: null,
     };
   }
 
   try {
-    const response =
-      await fetch(
-        GROQ_CHAT_API,
-        {
-          method: "POST",
+    const response = await fetch(
+      GROQ_CHAT_API,
+      {
+        method: "POST",
+        headers: {
+          Authorization:
+            `Bearer ${GROQ_API_KEY}`,
+          "Content-Type":
+            "application/json",
+        },
+        body: JSON.stringify({
+          model,
+          messages,
+          temperature,
+          max_completion_tokens:
+            maxTokens,
+        }),
+      }
+    );
 
-          headers: {
-            Authorization:
-              `Bearer ${GROQ_API_KEY}`,
+    const raw = await response.text();
 
-            "Content-Type":
-              "application/json",
-          },
-
-          body: JSON.stringify({
-            model,
-            messages,
-            temperature,
-            max_completion_tokens:
-              maxCompletionTokens,
-          }),
-        }
-      );
-
-    const raw =
-      await response.text();
-
-    let data = null;
-
-    try {
-      data = JSON.parse(raw);
-    } catch {}
+    console.log(
+      `Groq ${model}:`,
+      response.status
+    );
 
     if (!response.ok) {
       console.error(
-        "Groq:",
-        model,
-        response.status,
+        `Groq ${model}:`,
         raw
       );
 
       return {
         ok: false,
-        status:
-          response.status,
-        error:
-          data?.error?.message ||
-          raw,
+        status: response.status,
+        error: raw,
+        text: null,
       };
     }
 
-    const content =
-      data?.choices?.[0]
-        ?.message?.content;
-
-    if (!content) {
-      return {
-        ok: false,
-        status: 500,
-        error:
-          "Empty Groq response",
-      };
-    }
+    const data = JSON.parse(raw);
 
     return {
       ok: true,
       status: 200,
-      content,
+      error: null,
+      text:
+        data?.choices?.[0]
+          ?.message?.content ||
+        null,
     };
 
   } catch (error) {
@@ -1136,11 +1101,31 @@ async function requestGroq({
 
     return {
       ok: false,
-      status: 500,
-      error:
-        String(error),
+      status: 0,
+      error: String(error),
+      text: null,
     };
   }
+}
+
+
+function isRequestTooLarge(result) {
+  const error =
+    String(
+      result?.error || ""
+    ).toLowerCase();
+
+  return (
+    error.includes(
+      "request too large"
+    ) ||
+    error.includes(
+      "request_too_large"
+    ) ||
+    error.includes(
+      "too large for model"
+    )
+  );
 }
 
 
@@ -1149,10 +1134,10 @@ async function requestGroq({
 // ======================================================
 
 async function askTextAI({
-  userId,
   text,
+  userId,
   language,
-  webContext = "",
+  webContext = null,
 }) {
   const history =
     await getHistory(userId);
@@ -1164,7 +1149,6 @@ async function askTextAI({
         makeSystemPrompt({
           language,
           webContext,
-          vision: false,
         }),
     },
 
@@ -1172,8 +1156,7 @@ async function askTextAI({
 
     {
       role: "user",
-      content:
-        String(text || ""),
+      content: text,
     },
   ];
 
@@ -1181,135 +1164,102 @@ async function askTextAI({
     await requestGroq({
       model: TEXT_MODEL,
       messages,
-      temperature: 0.4,
-      maxCompletionTokens: 3000,
+      temperature: 0.35,
+      maxTokens: 1800,
     });
 
   if (!result.ok) {
-    console.log(
-      "Primary text model failed, trying fallback..."
-    );
-
     result =
       await requestGroq({
         model:
           TEXT_FALLBACK_MODEL,
         messages,
-        temperature: 0.4,
-        maxCompletionTokens:
-          3000,
+        temperature: 0.35,
+        maxTokens: 1800,
       });
   }
 
-  if (!result.ok) {
-    if (result.status === 429) {
-      return (
-        "Сейчас AI получил слишком много запросов. Попробуй ещё раз через несколько секунд."
-      );
-    }
+  const cleaned =
+    cleanAIResponse(result.text);
 
-    console.error(
-      "Text AI failed:",
-      result.error
-    );
+  if (cleaned) {
+    return cleaned;
+  }
 
+  if (result.status === 429) {
     return (
-      "Не удалось получить ответ от AI. Попробуй ещё раз."
+      "⚠️ Сейчас достигнут лимит Groq. Попробуй немного позже."
     );
   }
 
-  return cleanAIResponse(
-    result.content
+  return (
+    "⚠️ Не удалось получить ответ от Groq. Попробуй ещё раз."
   );
 }
 
 
 // ======================================================
-// VISION AI
+// VISION
 // ======================================================
 
 async function askVisionAI({
-  userId,
   images,
   caption,
+  userId,
   language,
-  webContext = "",
 }) {
-  const validImages =
-    Array.isArray(images)
-      ? images
-          .filter(Boolean)
-          .slice(
-            0,
-            MAX_VISION_IMAGES
-          )
-      : [];
-
-  if (!validImages.length) {
-    return (
-      "Не удалось получить изображение."
-    );
-  }
-
   const history =
     await getHistory(userId);
 
-  const shortHistory =
+  // Very small history for Vision
+  const tinyHistory =
     history
       .slice(-2)
       .map(item => ({
         role: item.role,
-
         content:
-          typeof item.content ===
-          "string"
-            ? item.content.slice(
-                0,
-                600
-              )
-            : "",
+          String(item.content)
+            .slice(0, 600),
       }));
 
-  const content = [];
-
-  content.push({
-    type: "text",
-    text:
-      String(
+  const userContent = [
+    {
+      type: "text",
+      text:
         caption ||
-        "Опиши изображение."
-      ),
-  });
+        "Внимательно проанализируй изображение.",
+    },
+  ];
 
   for (
-    const image of validImages
+    const image of images.slice(
+      0,
+      MAX_VISION_IMAGES
+    )
   ) {
-    content.push({
+    userContent.push({
       type: "image_url",
-
       image_url: {
         url: image.dataUrl,
       },
     });
   }
 
-  const messages = [
+  let messages = [
     {
       role: "system",
-
       content:
         makeSystemPrompt({
           language,
-          webContext,
           vision: true,
         }),
     },
 
-    ...shortHistory,
+    ...tinyHistory,
 
     {
       role: "user",
-      content,
+      content: userContent,
     },
   ];
 
@@ -1318,148 +1268,131 @@ async function askVisionAI({
       model: VISION_MODEL,
       messages,
       temperature: 0.1,
-      maxCompletionTokens: 2200,
+      maxTokens: 1300,
     });
 
-  // Retry with smaller prompt if request is too large
+  // Retry with minimal prompt
   if (
     !result.ok &&
-    (
-      result.status === 400 ||
-      result.status === 413
-    )
+    isRequestTooLarge(result)
   ) {
     console.log(
-      "Vision retry with minimal context..."
+      "Vision too large -> minimal retry"
     );
+
+    messages = [
+      {
+        role: "system",
+        content: `
+${languageInstruction(language)}
+
+Внимательно прочитай изображение.
+
+Выполни только то,
+что попросил пользователь.
+
+Не придумывай нечитаемые числа.
+
+Проверь цифры,
+знаки и степени.
+
+Не используй LaTeX.
+
+Пиши:
+5,4 · 10⁴
+1,02 · 10⁻²
+R = U / I
+`.trim(),
+      },
+
+      {
+        role: "user",
+        content: userContent,
+      },
+    ];
 
     result =
       await requestGroq({
         model: VISION_MODEL,
-
-        messages: [
-          {
-            role: "system",
-            content:
-              `${languageInstruction(language)}
-
-Внимательно анализируй реально переданное изображение.
-
-Не придумывай то, чего не видно.
-
-Если это превью Telegram-стикера, emoji — только метаданные и не является описанием изображения.
-
-${telegramMathRules()}
-`,
-          },
-
-          {
-            role: "user",
-            content,
-          },
-        ],
-
+        messages,
         temperature: 0.1,
-        maxCompletionTokens:
-          1800,
+        maxTokens: 900,
       });
   }
 
-  if (!result.ok) {
-    if (result.status === 429) {
-      return (
-        "Vision сейчас перегружен. Попробуй ещё раз через несколько секунд."
-      );
-    }
+  const cleaned =
+    cleanAIResponse(result.text);
 
-    console.error(
-      "Vision failed:",
-      result.error
-    );
+  if (cleaned) {
+    return cleaned;
+  }
 
+  if (isRequestTooLarge(result)) {
     return (
-      "Не удалось проанализировать изображение."
+      "⚠️ Это изображение слишком большое для Groq Vision. Обрежь нужную часть или отправь скриншот поменьше."
     );
   }
 
-  return cleanAIResponse(
-    result.content
+  if (result.status === 429) {
+    return (
+      "⚠️ Сейчас достигнут лимит Groq Vision. Попробуй немного позже."
+    );
+  }
+
+  return (
+    "⚠️ Groq Vision не смог обработать изображение."
   );
 }
+
+
 // ======================================================
-// WHISPER / AUDIO TRANSCRIPTION
+// WHISPER
 // ======================================================
 
-function audioMimeType(filePath) {
-  const path =
-    String(filePath || "")
-      .toLowerCase();
-
-  if (path.endsWith(".mp3")) {
-    return {
-      mime: "audio/mpeg",
-      filename: "audio.mp3",
-    };
-  }
-
-  if (path.endsWith(".wav")) {
-    return {
-      mime: "audio/wav",
-      filename: "audio.wav",
-    };
-  }
-
-  if (path.endsWith(".m4a")) {
-    return {
-      mime: "audio/mp4",
-      filename: "audio.m4a",
-    };
-  }
-
-  if (path.endsWith(".webm")) {
-    return {
-      mime: "audio/webm",
-      filename: "audio.webm",
-    };
-  }
-
-  return {
-    mime: "audio/ogg",
-    filename: "audio.ogg",
-  };
-}
-
-
-async function transcribeAudio(
-  buffer,
-  filePath
+async function transcribeTelegramAudio(
+  fileId
 ) {
-  if (!GROQ_API_KEY) {
-    return null;
-  }
+  const file =
+    await getTelegramFile(fileId);
+
+  if (!file) return null;
 
   try {
-    const {
-      mime,
-      filename,
-    } =
-      audioMimeType(filePath);
+    const lower =
+      file.filePath.toLowerCase();
 
-    const form =
-      new FormData();
+    let extension = "ogg";
+    let mime = "audio/ogg";
 
-    const blob =
-      new Blob(
-        [buffer],
-        {
-          type: mime,
-        }
-      );
+    if (lower.endsWith(".mp3")) {
+      extension = "mp3";
+      mime = "audio/mpeg";
+    }
+
+    if (lower.endsWith(".wav")) {
+      extension = "wav";
+      mime = "audio/wav";
+    }
+
+    if (lower.endsWith(".m4a")) {
+      extension = "m4a";
+      mime = "audio/mp4";
+    }
+
+    if (lower.endsWith(".webm")) {
+      extension = "webm";
+      mime = "audio/webm";
+    }
+
+    const form = new FormData();
 
     form.append(
       "file",
-      blob,
-      filename
+      new Blob(
+        [file.buffer],
+        { type: mime }
+      ),
+      `voice.${extension}`
     );
 
     form.append(
@@ -1477,140 +1410,103 @@ async function transcribeAudio(
       "0"
     );
 
-    const response =
-      await fetch(
-        GROQ_TRANSCRIBE_API,
-        {
-          method: "POST",
+    const response = await fetch(
+      GROQ_TRANSCRIBE_API,
+      {
+        method: "POST",
+        headers: {
+          Authorization:
+            `Bearer ${GROQ_API_KEY}`,
+        },
+        body: form,
+      }
+    );
 
-          headers: {
-            Authorization:
-              `Bearer ${GROQ_API_KEY}`,
-          },
+    const raw = await response.text();
 
-          body: form,
-        }
-      );
-
-    const raw =
-      await response.text();
+    console.log(
+      "Whisper:",
+      response.status
+    );
 
     if (!response.ok) {
       console.error(
         "Whisper:",
-        response.status,
         raw
       );
-
       return null;
     }
 
-    let data = null;
+    const data = JSON.parse(raw);
 
-    try {
-      data = JSON.parse(raw);
-    } catch {}
-
-    const text =
-      String(
-        data?.text || ""
-      ).trim();
-
-    return text || null;
+    return (
+      data?.text?.trim() ||
+      null
+    );
 
   } catch (error) {
     console.error(
       "Whisper exception:",
       error
     );
-
     return null;
   }
 }
 
 
 // ======================================================
-// VOICE / AUDIO
+// VOICE
 // ======================================================
 
 async function handleVoice({
-  message,
   chatId,
   userId,
   fileId,
-  type,
 }) {
-  const stopThinking =
+  const stop =
     startThinking(chatId);
 
   try {
-    const file =
-      await getTelegramFile(fileId);
+    const transcription =
+      await transcribeTelegramAudio(
+        fileId
+      );
 
-    if (!file) {
+    if (!transcription) {
       await sendMessage(
         chatId,
-        "Не удалось скачать аудио."
+        "⚠️ Не удалось распознать голосовое."
       );
-
       return;
     }
-
-    console.log(
-      "Audio:",
-      type,
-      file.filePath,
-      file.buffer.length
-    );
-
-    const transcript =
-      await transcribeAudio(
-        file.buffer,
-        file.filePath
-      );
-
-    if (!transcript) {
-      await sendMessage(
-        chatId,
-        "Не удалось распознать речь в аудио."
-      );
-
-      return;
-    }
-
-    console.log(
-      "Transcript:",
-      transcript
-    );
 
     const language =
-      detectLanguage(transcript);
+      detectLanguage(transcription);
 
-    let webContext = "";
+    let webContext = null;
 
     if (
-      needsInternet(transcript)
+      needsInternet(transcription)
     ) {
-      const web =
-        await searchWeb(
-          transcript
-        );
-
       webContext =
-        makeWebContext(web);
+        makeWebContext(
+          await searchWeb(
+            transcription
+          )
+        );
     }
 
     const answer =
       await askTextAI({
+        text: transcription,
         userId,
-        text: transcript,
         language,
         webContext,
       });
 
     await saveExchange(
       userId,
-      transcript,
+      `[Голосовое]\n${transcription}`,
       answer
     );
 
@@ -1620,93 +1516,54 @@ async function handleVoice({
     );
 
   } finally {
-    stopThinking();
+    stop();
   }
 }
 
 
 // ======================================================
-// SINGLE PHOTO
+// PHOTO
 // ======================================================
 
 async function handleSinglePhoto({
-  message,
   chatId,
   userId,
+  fileId,
+  caption,
 }) {
-  const stopThinking =
+  const stop =
     startThinking(chatId);
 
   try {
-    const photos =
-      message.photo;
-
-    if (
-      !Array.isArray(photos) ||
-      !photos.length
-    ) {
-      return;
-    }
-
-    const bestPhoto =
-      photos[
-        photos.length - 1
-      ];
-
     const image =
       await getTelegramImageData(
-        bestPhoto.file_id
+        fileId
       );
 
     if (!image) {
       await sendMessage(
         chatId,
-        "Не удалось скачать фото."
+        "⚠️ Не удалось загрузить изображение."
       );
-
       return;
     }
 
-    const caption =
-      String(
-        message.caption || ""
-      ).trim();
-
-    const instruction =
-      caption ||
-      "Внимательно посмотри на это изображение и естественно ответь пользователю. Если это задание — прочитай его и помоги выполнить.";
-
     const language =
-      detectLanguage(
-        caption || "ru"
-      );
-
-    let webContext = "";
-
-    if (
-      caption &&
-      needsInternet(caption)
-    ) {
-      const web =
-        await searchWeb(caption);
-
-      webContext =
-        makeWebContext(web);
-    }
+      detectLanguage(caption);
 
     const answer =
       await askVisionAI({
-        userId,
         images: [image],
-        caption: instruction,
+        caption,
+        userId,
         language,
-        webContext,
       });
 
     await saveExchange(
       userId,
-      caption ||
-        "[Пользователь отправил фото]",
+      caption
+        ? `[Фото]\n${caption}`
+        : "[Фото]",
       answer
     );
 
@@ -1716,120 +1573,75 @@ async function handleSinglePhoto({
     );
 
   } finally {
-    stopThinking();
+    stop();
   }
 }
 
 
 // ======================================================
-// REPLY TO OLD PHOTO
+// REPLY TO PHOTO
 // ======================================================
 
 async function handleReplyToPhoto({
-  message,
   chatId,
   userId,
+  message,
+  text,
 }) {
-  const replied =
+  const reply =
     message.reply_to_message;
 
   if (
-    !replied ||
-    !Array.isArray(replied.photo) ||
-    !replied.photo.length
+    !reply?.photo?.length
   ) {
     return false;
   }
 
-  const currentText =
-    String(
-      message.text ||
-      message.caption ||
-      ""
-    ).trim();
+  const photo =
+    reply.photo[
+      reply.photo.length - 1
+    ];
 
-  if (!currentText) {
-    return false;
-  }
-
-  const stopThinking =
+  const stop =
     startThinking(chatId);
 
   try {
-    const photos =
-      replied.photo;
-
-    const bestPhoto =
-      photos[
-        photos.length - 1
-      ];
-
     const image =
       await getTelegramImageData(
-        bestPhoto.file_id
+        photo.file_id
       );
 
     if (!image) {
       await sendMessage(
         chatId,
-        "Не удалось получить фото из Reply."
+        "⚠️ Не удалось загрузить фото из Reply."
       );
-
       return true;
     }
 
-    const language =
-      detectLanguage(
-        currentText
-      );
+    let instruction =
+      text ||
+      "Проанализируй это фото.";
 
-    let webContext = "";
-
-    if (
-      needsInternet(
-        currentText
-      )
-    ) {
-      const web =
-        await searchWeb(
-          currentText
-        );
-
-      webContext =
-        makeWebContext(web);
+    if (reply.caption) {
+      instruction +=
+        `\n\nИсходная подпись фото: ${reply.caption}`;
     }
 
-    const originalCaption =
-      String(
-        replied.caption || ""
-      ).trim();
-
-    const instruction = `
-Пользователь отвечает на ранее отправленное изображение.
-
-Текущая инструкция пользователя:
-${currentText}
-
-${originalCaption
-  ? `Подпись исходного изображения:
-${originalCaption}`
-  : ""}
-
-Выполни именно текущую инструкцию пользователя, используя изображение.
-`;
+    const language =
+      detectLanguage(instruction);
 
     const answer =
       await askVisionAI({
-        userId,
         images: [image],
         caption: instruction,
+        userId,
         language,
-        webContext,
       });
 
     await saveExchange(
       userId,
-      currentText,
+      `[Reply на фото]\n${instruction}`,
       answer
     );
 
@@ -1841,20 +1653,21 @@ ${originalCaption}`
     return true;
 
   } finally {
-    stopThinking();
+    stop();
   }
 }
 
 
 // ======================================================
-// PHOTO ALBUM
+// ALBUM
 // ======================================================
 
-async function addPhotoToAlbum({
+async function addAlbumPhoto({
   userId,
   mediaGroupId,
   fileId,
   caption,
+  messageId,
 }) {
   const key =
     albumKey(
@@ -1862,41 +1675,35 @@ async function addPhotoToAlbum({
       mediaGroupId
     );
 
-  const item =
-    JSON.stringify({
-      fileId,
-      caption:
-        String(caption || ""),
-    });
-
   await redisCommand([
     "RPUSH",
     key,
-    item,
+    JSON.stringify({
+      fileId,
+      caption: caption || "",
+      messageId: messageId || 0,
+    }),
   ]);
 
   await redisCommand([
     "EXPIRE",
     key,
-    "30",
+    "60",
   ]);
 }
 
 
-async function getAlbumItems({
+async function getAlbum(
   userId,
-  mediaGroupId,
-}) {
-  const key =
-    albumKey(
-      userId,
-      mediaGroupId
-    );
-
+  mediaGroupId
+) {
   const result =
     await redisCommand([
       "LRANGE",
-      key,
+      albumKey(
+        userId,
+        mediaGroupId
+      ),
       "0",
       "-1",
     ]);
@@ -1905,44 +1712,37 @@ async function getAlbumItems({
     return [];
   }
 
-  return result
-    .map(item => {
-      try {
-        return JSON.parse(item);
-      } catch {
-        return null;
-      }
-    })
-    .filter(Boolean);
+  const items = [];
+
+  for (const raw of result) {
+    try {
+      items.push(
+        JSON.parse(raw)
+      );
+    } catch {}
+  }
+
+  items.sort(
+    (a, b) =>
+      (a.messageId || 0) -
+      (b.messageId || 0)
+  );
+
+  // Dedupe
+  return items.filter(
+    (item, index, array) =>
+      array.findIndex(
+        x =>
+          x.fileId === item.fileId
+      ) === index
+  );
 }
 
 
-async function deleteAlbum({
+async function tryAlbumLock(
   userId,
-  mediaGroupId,
-}) {
-  await redisCommand([
-    "DEL",
-    albumKey(
-      userId,
-      mediaGroupId
-    ),
-  ]);
-
-  await redisCommand([
-    "DEL",
-    albumLockKey(
-      userId,
-      mediaGroupId
-    ),
-  ]);
-}
-
-
-async function acquireAlbumLock({
-  userId,
-  mediaGroupId,
-}) {
+  mediaGroupId
+) {
   const result =
     await redisCommand([
       "SET",
@@ -1953,85 +1753,60 @@ async function acquireAlbumLock({
       "1",
       "NX",
       "EX",
-      "20",
+      "30",
     ]);
 
   return result === "OK";
 }
 
 
-async function handlePhotoAlbum({
-  message,
+async function handleAlbum({
   chatId,
   userId,
+  mediaGroupId,
+  fileId,
+  caption,
+  messageId,
 }) {
-  const photos =
-    message.photo;
-
-  if (
-    !Array.isArray(photos) ||
-    !photos.length
-  ) {
-    return;
-  }
-
-  const mediaGroupId =
-    message.media_group_id;
-
-  const bestPhoto =
-    photos[
-      photos.length - 1
-    ];
-
-  await addPhotoToAlbum({
+  await addAlbumPhoto({
     userId,
     mediaGroupId,
-    fileId:
-      bestPhoto.file_id,
-    caption:
-      message.caption || "",
+    fileId,
+    caption,
+    messageId,
   });
 
-  // Даём Telegram время прислать
-  // остальные фотографии альбома.
   await sleep(1600);
 
-  const locked =
-    await acquireAlbumLock({
+  const lock =
+    await tryAlbumLock(
       userId,
-      mediaGroupId,
-    });
+      mediaGroupId
+    );
 
-  // Другой update этого же альбома
-  // уже начал обработку.
-  if (!locked) {
-    return;
-  }
+  if (!lock) return;
 
-  const stopThinking =
+  await sleep(500);
+
+  const album =
+    await getAlbum(
+      userId,
+      mediaGroupId
+    );
+
+  if (!album.length) return;
+
+  const stop =
     startThinking(chatId);
 
   try {
-    const items =
-      await getAlbumItems({
-        userId,
-        mediaGroupId,
-      });
-
-    if (!items.length) {
-      return;
-    }
-
-    const selected =
-      items.slice(
-        0,
-        MAX_VISION_IMAGES
-      );
-
     const images = [];
 
     for (
-      const item of selected
+      const item of album.slice(
+        0,
+        MAX_VISION_IMAGES
+      )
     ) {
       const image =
         await getTelegramImageData(
@@ -2046,58 +1821,39 @@ async function handlePhotoAlbum({
     if (!images.length) {
       await sendMessage(
         chatId,
-        "Не удалось скачать фотографии."
+        "⚠️ Не удалось загрузить фотографии."
       );
-
       return;
     }
 
-    const caption =
-      selected
-        .map(x =>
-          String(
-            x.caption || ""
-          ).trim()
-        )
-        .find(Boolean) || "";
+    const albumCaption =
+      album
+        .map(x => x.caption)
+        .find(Boolean) ||
+      "";
 
     const language =
       detectLanguage(
-        caption || "ru"
+        albumCaption
       );
-
-    let webContext = "";
-
-    if (
-      caption &&
-      needsInternet(caption)
-    ) {
-      const web =
-        await searchWeb(
-          caption
-        );
-
-      webContext =
-        makeWebContext(web);
-    }
-
-    const instruction =
-      caption ||
-      `Пользователь отправил несколько изображений (${images.length}). Внимательно проанализируй их вместе и естественно ответь.`;
 
     const answer =
       await askVisionAI({
-        userId,
         images,
-        caption: instruction,
+        caption:
+          albumCaption ||
+          "Проанализируй эти фотографии вместе.",
+        userId,
         language,
-        webContext,
       });
 
     await saveExchange(
       userId,
-      caption ||
-        `[Пользователь отправил ${images.length} фото]`,
+      `[Альбом: ${images.length} фото]${
+        albumCaption
+          ? `\n${albumCaption}`
+          : ""
+      }`,
       answer
     );
 
@@ -2107,422 +1863,140 @@ async function handlePhotoAlbum({
     );
 
   } finally {
-    await deleteAlbum({
-      userId,
-      mediaGroupId,
-    });
+    stop();
 
-    stopThinking();
+    await redisCommand([
+      "DEL",
+      albumKey(
+        userId,
+        mediaGroupId
+      ),
+    ]);
   }
 }
 
 
 // ======================================================
-// STICKERS V7.4.1
+// LIGHTWEIGHT MEDIA VISION V7.4.2
 // ======================================================
 
-function stickerType(sticker) {
-  if (sticker?.is_video) {
-    return "video";
-  }
-
-  if (sticker?.is_animated) {
-    return "animated";
-  }
-
-  return "static";
-}
-
-
-function getStickerThumbnailFileId(
-  sticker
-) {
-  // Современный Telegram Bot API:
-  // sticker.thumbnail
-  //
-  // thumb оставляем как fallback
-  // для старого формата/совместимости.
-
-  return (
-    sticker?.thumbnail?.file_id ||
-    sticker?.thumb?.file_id ||
-    null
+async function getConversationLanguage(userId, currentText = "") {
+  const now = String(currentText || "").trim();
+  if (/[а-яёіїєґ]/i.test(now)) return detectLanguage(now);
+  const history = await getHistory(userId);
+  const last = history.slice().reverse().find(x =>
+    x.role === "user" && /[а-яёіїєґ]/i.test(String(x.content || ""))
   );
+  return last ? detectLanguage(last.content) : "ru";
 }
 
+async function askStickerVisionAI({ image, language, kind = "стикер" }) {
+  const lang = languageInstruction(language);
+  const messages = [{
+    role: "user",
+    content: [
+      { type: "text", text: `${lang}
+Это ${kind} из Telegram. Посмотри на реальное изображение. Не описывай его подробно, если пользователь об этом не спрашивал. Отреагируй как живой собеседник: весело, коротко, обычно 2–10 слов, можно 1–2 подходящих emoji. Не начинай с «вижу», «на превью», «на изображении». Не упоминай Telegram/API/файл. Не придумывай движение по одному кадру.` },
+      { type: "image_url", image_url: { url: image.dataUrl } }
+    ]
+  }];
+  const result = await requestGroq({ model: VISION_MODEL, messages, temperature: 0.65, maxCompletionTokens: 120 });
+  if (!result.ok) return null;
+  return cleanAIResponse(result.content);
+}
 
-async function handleSticker({
-  message,
-  chatId,
-  userId,
-}) {
-  const sticker =
-    message.sticker;
+// ======================================================
+// STICKER
+// ======================================================
 
-  if (!sticker) {
-    return;
-  }
-
-  const stopThinking =
-    startThinking(chatId);
-
+async function handleSticker({ chatId, userId, sticker }) {
+  const stop = startThinking(chatId);
   try {
-    const emoji =
-      String(
-        sticker.emoji || ""
-      ).trim();
+    const language = await getConversationLanguage(userId);
+    const emoji = String(sticker.emoji || "");
+    const animated = !!sticker.is_animated;
+    const video = !!sticker.is_video;
+    const kind = video ? "видеостикер" : animated ? "анимированный стикер" : "стикер";
 
-    const type =
-      stickerType(sticker);
+    let image = null;
+    if (!animated && !video && sticker.file_id) {
+      image = await getTelegramImageData(sticker.file_id);
+    } else {
+      const previewId = sticker.thumbnail?.file_id || sticker.thumb?.file_id || null;
+      if (previewId) image = await getTelegramImageData(previewId);
+    }
 
-    const language = "ru";
-
-    console.log(
-      "Sticker:",
-      {
-        type,
-        emoji,
-        fileId:
-          sticker.file_id,
-        thumbnail:
-          getStickerThumbnailFileId(
-            sticker
-          ),
-      }
-    );
-
-
-    // ==================================================
-    // STATIC STICKER
-    // ==================================================
-
-    if (
-      !sticker.is_animated &&
-      !sticker.is_video
-    ) {
-      const image =
-        await getTelegramImageData(
-          sticker.file_id
-        );
-
-      if (image) {
-        const answer =
-          await askVisionAI({
-            userId,
-
-            images: [image],
-
-            caption: `
-Пользователь отправил обычный статический Telegram-стикер.
-
-Связанный Telegram emoji:
-${emoji || "(нет)"}
-
-ВАЖНО:
-emoji является только дополнительной метаданной.
-
-Смотри прежде всего на реально переданное изображение стикера.
-
-Коротко и естественно отреагируй на стикер с учётом истории разговора.
-
-Если пользователь до этого что-то обсуждал, можешь учитывать контекст.
-`,
-
-            language,
-          });
-
-        await saveExchange(
-          userId,
-          `[Статический стикер${emoji ? ` ${emoji}` : ""}]`,
-          answer
-        );
-
-        await sendMessage(
-          chatId,
-          answer
-        );
-
+    if (image) {
+      const answer = await askStickerVisionAI({ image, language, kind });
+      if (answer) {
+        await saveExchange(userId, `[${kind}${emoji ? ` ${emoji}` : ""}]`, answer);
+        await sendMessage(chatId, answer);
         return;
       }
     }
 
-
-    // ==================================================
-    // ANIMATED / VIDEO STICKER
-    // V7.4.1:
-    // Telegram даёт thumbnail — отправляем
-    // реальное превью в Vision.
-    // ==================================================
-
-    if (
-      sticker.is_animated ||
-      sticker.is_video
-    ) {
-      const thumbnailFileId =
-        getStickerThumbnailFileId(
-          sticker
-        );
-
-      if (thumbnailFileId) {
-        console.log(
-          "Sticker preview found:",
-          thumbnailFileId
-        );
-
-        const preview =
-          await getTelegramImageData(
-            thumbnailFileId
-          );
-
-        if (preview) {
-          const humanType =
-            type === "video"
-              ? "видео-стикер"
-              : "анимированный стикер";
-
-          const answer =
-            await askVisionAI({
-              userId,
-
-              images: [preview],
-
-              caption: `
-Пользователь отправил Telegram ${humanType}.
-
-Тебе передано РЕАЛЬНОЕ СТАТИЧЕСКОЕ ПРЕВЬЮ этого стикера.
-
-Связанный Telegram emoji:
-${emoji || "(нет)"}
-
-КРИТИЧЕСКИ ВАЖНО:
-
-1. Анализируй прежде всего то, что РЕАЛЬНО ВИДНО на изображении-превью.
-
-2. Emoji — только техническая метаданная Telegram.
-
-3. НЕ считай, что emoji описывает содержимое стикера.
-
-4. Если emoji и изображение отличаются — полностью доверяй изображению.
-
-5. Не говори пользователю, что на стикере изображён emoji, если этого реально не видно.
-
-6. Это только один статический кадр из ${
-  type === "video"
-    ? "видео-стикера"
-    : "анимации"
-}. Не придумывай движение, которого нельзя определить по этому кадру.
-
-7. Если пользователь просто отправил стикер без вопроса — коротко и естественно отреагируй на то, что действительно видно.
-
-8. Учитывай предыдущий контекст разговора, если он нужен.
-`,
-
-              language,
-            });
-
-          await saveExchange(
-            userId,
-            `[${
-              type === "video"
-                ? "Видео-стикер"
-                : "Анимированный стикер"
-            }${emoji ? ` ${emoji}` : ""}; Vision preview]`,
-            answer
-          );
-
-          await sendMessage(
-            chatId,
-            answer
-          );
-
-          return;
-        }
-      }
-
-
-      // ==================================================
-      // SAFE FALLBACK
-      //
-      // Если Telegram не дал thumbnail,
-      // НЕ притворяемся, что реально видели стикер.
-      // ==================================================
-
-      console.log(
-        "Sticker has no usable preview. Safe fallback."
-      );
-
-      const history =
-        await getHistory(userId);
-
-      const context =
-        history
-          .slice(-4)
-          .map(item => {
-            const role =
-              item.role ===
-              "assistant"
-                ? "AI"
-                : "Пользователь";
-
-            return (
-              `${role}: ` +
-              String(
-                item.content || ""
-              ).slice(0, 500)
-            );
-          })
-          .join("\n");
-
-      const fallbackPrompt = `
-Пользователь отправил ${
-  type === "video"
-    ? "Telegram видео-стикер"
-    : "Telegram анимированный стикер"
-}.
-
-Telegram связал с ним emoji:
-${emoji || "(emoji отсутствует)"}
-
-Однако визуальное превью стикера сейчас получить не удалось.
-
-ВАЖНО:
-Ты НЕ видел реальное содержимое этого стикера.
-
-Поэтому:
-- не утверждай, что знаешь, что именно нарисовано;
-- не описывай персонажа, предмет или действие только на основании emoji;
-- emoji можно использовать лишь как слабую эмоциональную подсказку;
-- если контекст разговора позволяет, коротко и естественно отреагируй;
-- не пиши техническое объяснение без необходимости.
-
-Контекст:
-${context || "(контекста нет)"}
-`;
-
-      const answer =
-        await askTextAI({
-          userId,
-          text: fallbackPrompt,
-          language,
-        });
-
-      await saveExchange(
-        userId,
-        `[${
-          type === "video"
-            ? "Видео-стикер"
-            : "Анимированный стикер"
-        }${emoji ? ` ${emoji}` : ""}; preview unavailable]`,
-        answer
-      );
-
-      await sendMessage(
-        chatId,
-        answer
-      );
-
-      return;
-    }
-
-
-    // ==================================================
-    // LAST FALLBACK
-    // ==================================================
-
-    await sendMessage(
-      chatId,
-      "Получил стикер 👍"
-    );
-
-  } catch (error) {
-    console.error(
-      "Sticker handler:",
-      error
-    );
-
-    await sendMessage(
-      chatId,
-      "Не удалось обработать стикер."
-    );
-
+    // Если Vision словил 429 или Telegram не дал preview — не шлём пользователю
+    // унылое «Vision перегружен». Реагируем по контексту, не выдумывая картинку.
+    const fallback = await askTextAI({
+      userId,
+      language,
+      webContext: null,
+      text: `Пользователь отправил ${kind}${emoji ? `, связанный emoji: ${emoji}` : ""}. Реального изображения сейчас нет. Не придумывай, что нарисовано. Просто коротко и весело отреагируй как собеседник на текущий контекст: 2–8 слов, можно emoji. Не объясняй технические ограничения.`
+    });
+    await saveExchange(userId, `[${kind}${emoji ? ` ${emoji}` : ""}]`, fallback);
+    await sendMessage(chatId, fallback);
   } finally {
-    stopThinking();
+    stop();
   }
 }
 
 
 // ======================================================
-// CUSTOM EMOJI HELPERS
+// CUSTOM EMOJI
 // ======================================================
 
 function getCustomEmojiIds(
   message
 ) {
-  const ids = [];
-
   const entities = [
-    ...(Array.isArray(
-      message.entities
-    )
-      ? message.entities
-      : []),
-
-    ...(Array.isArray(
-      message.caption_entities
-    )
-      ? message.caption_entities
-      : []),
+    ...(message.entities || []),
+    ...(message.caption_entities || []),
   ];
 
-  for (
-    const entity of entities
-  ) {
-    if (
-      entity?.type ===
-        "custom_emoji" &&
-      entity.custom_emoji_id
-    ) {
-      ids.push(
-        entity.custom_emoji_id
-      );
-    }
-  }
-
   return [
-    ...new Set(ids),
+    ...new Set(
+      entities
+        .filter(
+          entity =>
+            entity.type ===
+              "custom_emoji" &&
+            entity.custom_emoji_id
+        )
+        .map(
+          entity =>
+            entity.custom_emoji_id
+        )
+    ),
   ];
 }
 
 
 async function getCustomEmojiStickers(
-  customEmojiIds
+  ids
 ) {
-  if (
-    !Array.isArray(
-      customEmojiIds
-    ) ||
-    !customEmojiIds.length
-  ) {
-    return [];
-  }
+  if (!ids.length) return [];
 
   const result =
     await telegramRequest(
       "getCustomEmojiStickers",
       {
-        custom_emoji_ids:
-          customEmojiIds.slice(
-            0,
-            MAX_VISION_IMAGES
-          ),
+        custom_emoji_ids: ids,
       }
     );
 
   if (
     !result?.ok ||
-    !Array.isArray(
-      result.result
-    )
+    !Array.isArray(result.result)
   ) {
     return [];
   }
@@ -2531,191 +2005,140 @@ async function getCustomEmojiStickers(
 }
 
 
-// ======================================================
-// CUSTOM EMOJI V7.4.1
-//
-// Теперь animated/video custom emoji
-// тоже пытаемся увидеть через thumbnail.
-// ======================================================
-
 async function handleCustomEmoji({
-  message,
   chatId,
   userId,
-  customEmojiIds,
+  message,
 }) {
-  const stopThinking =
+  const ids =
+    getCustomEmojiIds(message);
+
+  if (!ids.length) {
+    return false;
+  }
+
+  const stop =
     startThinking(chatId);
 
   try {
     const stickers =
       await getCustomEmojiStickers(
-        customEmojiIds
+        ids.slice(0, 3)
       );
 
     if (!stickers.length) {
       return false;
     }
 
+    const history =
+      await getHistory(userId);
+
+    const lastUser =
+      history
+        .slice()
+        .reverse()
+        .find(
+          x => x.role === "user"
+        )
+        ?.content ||
+      "";
+
+    const visibleText =
+      message.text ||
+      message.caption ||
+      "";
+
+    const language =
+      await getConversationLanguage(
+        userId,
+        visibleText || lastUser
+      );
+
+    // If custom emoji has a static WebP representation,
+    // Vision can actually inspect it.
     const images = [];
 
-    const descriptions = [];
-
     for (
-      const sticker of stickers.slice(
-        0,
-        MAX_VISION_IMAGES
-      )
+      const sticker of stickers
     ) {
-      const type =
-        stickerType(sticker);
-
-      const emoji =
-        String(
-          sticker.emoji || ""
-        ).trim();
-
-      let image = null;
-
-
-      // Static custom emoji:
-      // используем сам файл.
       if (
         !sticker.is_animated &&
-        !sticker.is_video
+        !sticker.is_video &&
+        sticker.file_id
       ) {
-        image =
+        const image =
           await getTelegramImageData(
             sticker.file_id
           );
-      }
 
-
-      // Animated / video custom emoji:
-      // используем Telegram thumbnail.
-      if (
-        !image &&
-        (
-          sticker.is_animated ||
-          sticker.is_video
-        )
-      ) {
-        const previewFileId =
-          getStickerThumbnailFileId(
-            sticker
-          );
-
-        if (previewFileId) {
-          image =
-            await getTelegramImageData(
-              previewFileId
-            );
+        if (image) {
+          images.push(image);
         }
       }
 
-
-      if (image) {
-        images.push(image);
-
-        descriptions.push(
-          `${
-            type === "static"
-              ? "Статический"
-              : type === "video"
-                ? "Видео"
-                : "Анимированный"
-          } custom emoji; связанный emoji: ${
-            emoji || "(нет)"
-          }.`
-        );
+      if (
+        images.length >=
+        MAX_VISION_IMAGES
+      ) {
+        break;
       }
     }
 
 
-    const originalText =
-      String(
-        message.text ||
-        message.caption ||
-        ""
-      ).trim();
+    let answer;
 
-    const language =
-      detectLanguage(
-        originalText || "ru"
-      );
-
-
-    // Есть реальное изображение / preview
     if (images.length) {
-      const answer =
+      answer =
         await askVisionAI({
-          userId,
-
           images,
 
           caption: `
-Пользователь отправил сообщение с Telegram custom emoji.
+Пользователь отправил Telegram custom emoji.
 
 Текст сообщения:
-${originalText || "(текста нет)"}
+${visibleText || "(только emoji)"}
 
-Данные Telegram:
-${descriptions.join("\n")}
+Пойми эмоциональный смысл emoji
+и естественно отреагируй.
 
-Тебе переданы реальные изображения либо реальные статические превью custom emoji.
-
-ВАЖНО:
-- анализируй то, что реально видно;
-- обычный связанный emoji является только метаданными;
-- не определяй внешний вид custom emoji только по обычному emoji;
-- для animated/video custom emoji передан статический preview, поэтому не придумывай невидимое движение;
-- ответь естественно с учётом контекста разговора.
+Ответь коротко.
+Не описывай API Telegram.
 `,
 
+          userId,
           language,
         });
 
-      await saveExchange(
-        userId,
-        originalText ||
-          "[Custom emoji]",
-        answer
-      );
+    } else {
+      const emojis =
+        stickers
+          .map(x => x.emoji)
+          .filter(Boolean)
+          .join(" ");
 
-      await sendMessage(
-        chatId,
-        answer
-      );
-
-      return true;
-    }
-
-
-    // Если ни одного preview получить нельзя
-    const fallbackText = `
+      answer =
+        await askTextAI({
+          text: `
 Пользователь отправил Telegram custom emoji.
 
-Текст:
-${originalText || "(текста нет)"}
+Связанные обычные emoji:
+${emojis || "неизвестны"}
 
-Визуальные изображения custom emoji получить не удалось.
+Текст сообщения:
+${visibleText || "(только emoji)"}
 
-Не придумывай их внешний вид.
-
-Коротко и естественно ответь с учётом текста и истории разговора.
-`;
-
-    const answer =
-      await askTextAI({
-        userId,
-        text: fallbackText,
-        language,
-      });
+Естественно и коротко отреагируй
+на сообщение пользователя.
+`,
+          userId,
+          language,
+          webContext: null,
+        });
+    }
 
     await saveExchange(
       userId,
-      originalText ||
-        "[Custom emoji]",
+      `[Custom emoji] ${visibleText}`,
       answer
     );
 
@@ -2726,57 +2149,42 @@ ${originalText || "(текста нет)"}
 
     return true;
 
-  } catch (error) {
-    console.error(
-      "Custom emoji:",
-      error
-    );
-
-    return false;
-
   } finally {
-    stopThinking();
+    stop();
   }
 }
+
+
 // ======================================================
 // NORMAL TEXT
 // ======================================================
 
 async function handleText({
-  message,
   chatId,
   userId,
+  text,
 }) {
-  const text =
-    String(
-      message.text || ""
-    ).trim();
-
-  if (!text) {
-    return;
-  }
-
-  const stopThinking =
+  const stop =
     startThinking(chatId);
 
   try {
     const language =
       detectLanguage(text);
 
-    let webContext = "";
+    let webContext = null;
 
     if (needsInternet(text)) {
-      const web =
+      const search =
         await searchWeb(text);
 
       webContext =
-        makeWebContext(web);
+        makeWebContext(search);
     }
 
     const answer =
       await askTextAI({
-        userId,
         text,
+        userId,
         language,
         webContext,
       });
@@ -2792,119 +2200,60 @@ async function handleText({
       answer
     );
 
-  } catch (error) {
-    console.error(
-      "Text handler:",
-      error
-    );
-
-    await sendMessage(
-      chatId,
-      "Произошла ошибка при обработке сообщения."
-    );
-
   } finally {
-    stopThinking();
+    stop();
   }
 }
 
 
 // ======================================================
-// POST / TELEGRAM WEBHOOK
+// POST
 // ======================================================
 
-export async function POST(request) {
-  console.log(
-    "AI-GUIDE-V7.4.1"
-  );
-
+export async function POST(
+  request
+) {
   try {
-    // ------------------------------------------
-    // Optional webhook token check
-    // ------------------------------------------
-
-    const url =
-      new URL(request.url);
-
-    const webhookToken =
-      url.searchParams.get(
-        "token"
-      );
-
-    const expectedToken =
-      process.env
-        .TELEGRAM_WEBHOOK_TOKEN;
-
-    if (
-      expectedToken &&
-      webhookToken !==
-        expectedToken
-    ) {
-      console.warn(
-        "Invalid webhook token"
-      );
-
-      return Response.json(
-        {
-          ok: false,
-          error:
-            "Unauthorized",
-        },
-        {
-          status: 401,
-        }
-      );
-    }
-
-
-    // ------------------------------------------
-    // Telegram update
-    // ------------------------------------------
+    console.log(
+      "AI-GUIDE-V7.4.2"
+    );
 
     const update =
       await request.json();
 
     const message =
-      update?.message ||
-      update?.edited_message;
+      update.message;
 
-    // Telegram expects HTTP 200
-    // even if update is irrelevant.
     if (!message) {
       return Response.json({
         ok: true,
       });
     }
 
-
     const chatId =
-      message?.chat?.id;
+      message.chat?.id;
 
     const userId =
-      message?.from?.id;
+      message.from?.id;
 
-    if (
-      !chatId ||
-      !userId
-    ) {
+    if (!chatId || !userId) {
       return Response.json({
         ok: true,
       });
     }
 
 
-    // ------------------------------------------
-    // Private mode
-    // ------------------------------------------
+    // ==================================================
+    // PRIVATE MODE
+    // ==================================================
 
     if (
       ALLOWED_USER_ID &&
-      userId !==
-        ALLOWED_USER_ID
+      userId !== ALLOWED_USER_ID
     ) {
-      console.warn(
-        "Blocked user:",
-        userId
+      await sendMessage(
+        chatId,
+        "⛔ Это приватный бот."
       );
 
       return Response.json({
@@ -2913,34 +2262,26 @@ export async function POST(request) {
     }
 
 
-    // ------------------------------------------
-    // Text used for commands etc.
-    // ------------------------------------------
-
     const text =
-      String(
-        message.text ||
-        message.caption ||
-        ""
-      ).trim();
+      message.text?.trim() ||
+      "";
 
 
-    // ==========================================
-    // COMMAND: /clear /reset
-    // ==========================================
+    // ==================================================
+    // COMMANDS
+    // ==================================================
 
     if (
-      /^\/(clear|reset)(?:@\w+)?(?:\s|$)/i.test(
-        text
-      )
+      text.toLowerCase() ===
+        "/clear" ||
+      text.toLowerCase() ===
+        "/reset"
     ) {
-      await clearHistory(
-        userId
-      );
+      await clearHistory(userId);
 
       await sendMessage(
         chatId,
-        "🧹 Память диалога очищена."
+        "🧹 История разговора очищена."
       );
 
       return Response.json({
@@ -2949,28 +2290,24 @@ export async function POST(request) {
     }
 
 
-    // ==========================================
-    // 1. REPLY TO OLD PHOTO
-    //
-    // ВАЖНО:
-    // проверяем ДО обычного текста.
-    // ==========================================
+    // ==================================================
+    // REPLY TO PHOTO
+    // Must run BEFORE normal text.
+    // ==================================================
 
     if (
-      message.reply_to_message &&
-      Array.isArray(
-        message.reply_to_message
-          .photo
-      ) &&
-      message.reply_to_message
-        .photo.length &&
-      text
+      text &&
+      message
+        .reply_to_message
+        ?.photo
+        ?.length
     ) {
       const handled =
         await handleReplyToPhoto({
-          message,
           chatId,
           userId,
+          message,
+          text,
         });
 
       if (handled) {
@@ -2981,22 +2318,16 @@ export async function POST(request) {
     }
 
 
-    // ==========================================
-    // 2. VOICE
-    // ==========================================
+    // ==================================================
+    // VOICE
+    // ==================================================
 
-    if (
-      message.voice?.file_id
-    ) {
+    if (message.voice?.file_id) {
       await handleVoice({
-        message,
         chatId,
         userId,
-
         fileId:
           message.voice.file_id,
-
-        type: "voice",
       });
 
       return Response.json({
@@ -3005,22 +2336,16 @@ export async function POST(request) {
     }
 
 
-    // ==========================================
-    // 3. AUDIO
-    // ==========================================
+    // ==================================================
+    // AUDIO
+    // ==================================================
 
-    if (
-      message.audio?.file_id
-    ) {
+    if (message.audio?.file_id) {
       await handleVoice({
-        message,
         chatId,
         userId,
-
         fileId:
           message.audio.file_id,
-
-        type: "audio",
       });
 
       return Response.json({
@@ -3029,57 +2354,47 @@ export async function POST(request) {
     }
 
 
-    // ==========================================
-    // 4. PHOTOS
-    // ==========================================
+    // ==================================================
+    // PHOTO
+    // ==================================================
 
     if (
-      Array.isArray(
-        message.photo
-      ) &&
+      Array.isArray(message.photo) &&
       message.photo.length
     ) {
-      // Album / media group
-      if (
-        message.media_group_id
-      ) {
-        await handlePhotoAlbum({
-          message,
+      const largest =
+        message.photo[
+          message.photo.length - 1
+        ];
+
+      const caption =
+        message.caption?.trim() ||
+        "";
+
+      if (message.media_group_id) {
+        await handleAlbum({
           chatId,
           userId,
+          mediaGroupId:
+            message.media_group_id,
+          fileId:
+            largest.file_id,
+          caption,
+          messageId:
+            message.message_id,
+        });
+
+        return Response.json({
+          ok: true,
         });
       }
 
-      // Single photo
-      else {
-        await handleSinglePhoto({
-          message,
-          chatId,
-          userId,
-        });
-      }
-
-      return Response.json({
-        ok: true,
-      });
-    }
-
-
-    // ==========================================
-    // 5. TELEGRAM STICKER
-    //
-    // V7.4.1:
-    // static -> actual sticker image
-    // animated -> thumbnail -> Vision
-    // video -> thumbnail -> Vision
-    // no thumbnail -> safe fallback
-    // ==========================================
-
-    if (message.sticker) {
-      await handleSticker({
-        message,
+      await handleSinglePhoto({
         chatId,
         userId,
+        fileId:
+          largest.file_id,
+        caption,
       });
 
       return Response.json({
@@ -3088,24 +2403,39 @@ export async function POST(request) {
     }
 
 
-    // ==========================================
-    // 6. CUSTOM EMOJI
-    // ==========================================
+    // ==================================================
+    // STICKER
+    // ==================================================
+
+    if (message.sticker?.file_id) {
+      await handleSticker({
+        chatId,
+        userId,
+        sticker:
+          message.sticker,
+      });
+
+      return Response.json({
+        ok: true,
+      });
+    }
+
+
+    // ==================================================
+    // CUSTOM EMOJI
+    //
+    // Check before ordinary text.
+    // ==================================================
 
     const customEmojiIds =
-      getCustomEmojiIds(
-        message
-      );
+      getCustomEmojiIds(message);
 
-    if (
-      customEmojiIds.length
-    ) {
+    if (customEmojiIds.length) {
       const handled =
         await handleCustomEmoji({
-          message,
           chatId,
           userId,
-          customEmojiIds,
+          message,
         });
 
       if (handled) {
@@ -3116,15 +2446,15 @@ export async function POST(request) {
     }
 
 
-    // ==========================================
-    // 7. NORMAL TEXT
-    // ==========================================
+    // ==================================================
+    // NORMAL TEXT
+    // ==================================================
 
-    if (message.text) {
+    if (text) {
       await handleText({
-        message,
         chatId,
         userId,
+        text,
       });
 
       return Response.json({
@@ -3133,12 +2463,47 @@ export async function POST(request) {
     }
 
 
-    // ==========================================
-    // 8. ORDINARY VIDEO
-    //
-    // Пока специально выключено.
-    // Это будет отдельное обновление.
-    // ==========================================
+    // ==================================================
+    // GIF / ANIMATION V7.4.2
+    // ==================================================
+
+    if (message.animation?.file_id) {
+      const stop = startThinking(chatId);
+      try {
+        const language = await getConversationLanguage(userId, message.caption || "");
+        const previewId = message.animation.thumbnail?.file_id || message.animation.thumb?.file_id || null;
+
+        if (previewId) {
+          const image = await getTelegramImageData(previewId);
+          if (image) {
+            const answer = await askStickerVisionAI({ image, language, kind: "GIF-анимация" });
+            if (answer) {
+              await saveExchange(userId, "[GIF-анимация]", answer);
+              await sendMessage(chatId, answer);
+              return Response.json({ ok: true });
+            }
+          }
+        }
+
+        const answer = await askTextAI({
+          userId,
+          language,
+          webContext: null,
+          text: "Пользователь отправил GIF-анимацию, но кадр сейчас недоступен. Коротко и естественно отреагируй по контексту, не выдумывая содержимое GIF."
+        });
+        await saveExchange(userId, "[GIF-анимация]", answer);
+        await sendMessage(chatId, answer);
+        return Response.json({ ok: true });
+      } finally {
+        stop();
+      }
+    }
+
+
+    // ==================================================
+    // ORDINARY VIDEO
+    // intentionally disabled
+    // ==================================================
 
     if (
       message.video ||
@@ -3146,7 +2511,7 @@ export async function POST(request) {
     ) {
       await sendMessage(
         chatId,
-        "🎬 Видео пока не анализирую. Это добавим отдельным обновлением. Фото, несколько фото, Reply на фото, голосовые, аудио и стикеры уже поддерживаются."
+        "🎬 Видео пока не анализирую. Фото, несколько фото, Reply на фото, голосовые, аудио, стикеры и custom emoji уже поддерживаются."
       );
 
       return Response.json({
@@ -3155,13 +2520,13 @@ export async function POST(request) {
     }
 
 
-    // ==========================================
-    // 9. OTHER UNSUPPORTED MESSAGE
-    // ==========================================
+    // ==================================================
+    // OTHER
+    // ==================================================
 
     await sendMessage(
       chatId,
-      "Пока не умею обрабатывать такой тип сообщения."
+      "Пока я понимаю текст, фото, несколько фото, Reply на фото, голосовые, аудио, стикеры и Telegram custom emoji."
     );
 
     return Response.json({
@@ -3170,23 +2535,21 @@ export async function POST(request) {
 
   } catch (error) {
     console.error(
-      "POST fatal error:",
+      "BOT ERROR:",
       error
     );
 
-    // Telegram лучше вернуть 200,
-    // иначе он может повторять update.
+    // Telegram should still get 200
+    // so it doesn't endlessly retry update.
     return Response.json({
       ok: true,
-      error:
-        "Internal handler error",
     });
   }
 }
 
 
 // ======================================================
-// GET / STATUS
+// GET
 // ======================================================
 
 export async function GET() {
@@ -3216,19 +2579,12 @@ export async function GET() {
                 .filter(Boolean)
             : [];
       }
-
-    } catch (error) {
-      console.error(
-        "GET Groq models:",
-        error
-      );
-    }
+    } catch {}
   }
-
 
   return Response.json({
     version:
-      "AI-GUIDE-V7.4.1",
+      "AI-GUIDE-V7.4.2",
 
     status:
       "Bot is running",
@@ -3254,7 +2610,6 @@ export async function GET() {
     privateMode:
       !!ALLOWED_USER_ID,
 
-
     models: {
       text:
         TEXT_MODEL,
@@ -3268,7 +2623,6 @@ export async function GET() {
       whisper:
         WHISPER_MODEL,
     },
-
 
     modelAccess: {
       text:
@@ -3292,7 +2646,6 @@ export async function GET() {
         ),
     },
 
-
     features: {
       text: true,
 
@@ -3309,21 +2662,19 @@ export async function GET() {
 
       audio: true,
 
-      staticStickers:
-        "Vision",
+      staticStickers: true,
 
       animatedStickers:
-        "thumbnail Vision + safe fallback",
+        "thumbnail Vision + safe context fallback",
 
       videoStickers:
-        "thumbnail Vision + safe fallback",
+        "thumbnail Vision + safe context fallback",
 
-      customEmoji:
-        "Vision + thumbnail Vision",
+      customEmoji: true,
 
       ordinaryVideo: false,
 
-      videoNotes: false,
+      gifAnimation: "thumbnail Vision",
 
       typingIndicator: true,
 
@@ -3336,7 +2687,6 @@ export async function GET() {
       telegramSafeMath:
         "V2",
     },
-
 
     availableGroqModels,
   });
