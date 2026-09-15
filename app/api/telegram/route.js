@@ -12,13 +12,13 @@ const ffmpegPath = path.join(process.cwd(), "ffmpeg-bin", "ffmpeg");
 export const runtime = "nodejs";
 
 // ======================================================
-// AI GUIDE V7.6.0
+// AI GUIDE V7.6.1
 //
 // Groq:
 // - Text: openai/gpt-oss-120b
 // - Text fallback: openai/gpt-oss-20b
 // - Vision primary: qwen/qwen3.8-27b
-// - Vision fallback: Google Gemini 2.5 Flash
+// - Vision fallback: Google Gemini 3.5 Flash
 // - Voice: whisper-large-v3-turbo
 //
 // Features:
@@ -94,7 +94,7 @@ const VISION_MODEL =
   "qwen/qwen3.8-27b";
 
 const GEMINI_VISION_MODEL =
-  "gemini-2.5-flash";
+  "gemini-3.5-flash";
 
 const GEMINI_OPENAI_CHAT_API =
   "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions";
