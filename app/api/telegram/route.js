@@ -12,7 +12,7 @@ const ffmpegPath = path.join(process.cwd(), "ffmpeg-bin", "ffmpeg");
 export const runtime = "nodejs";
 
 // ======================================================
-// AI GUIDE V7.6.3
+// AI GUIDE V7.6.4
 //
 // Groq:
 // - Text: openai/gpt-oss-120b
@@ -1261,80 +1261,64 @@ async function requestGeminiVision({
   maxTokens = 1200,
 }) {
   if (!GEMINI_API_KEY) {
+    console.error("Gemini Vision: GEMINI_API_KEY missing");
     return { ok: false, status: 0, error: "GEMINI_API_KEY missing", text: null };
   }
 
-  try {
-    // Use Google's native generateContent endpoint instead of the
-    // OpenAI-compatibility layer. This is the documented multimodal path.
-    const systemParts = [];
-    const contents = [];
+  // Convert our OpenAI-style Vision messages into Gemini native parts.
+  // This deliberately keeps the request compact: text + actual image bytes only.
+  const parts = [];
+  for (const message of messages || []) {
+    const content = message?.content;
+    if (typeof content === "string") {
+      const text = content.trim();
+      if (text) parts.push({ text });
+      continue;
+    }
+    if (!Array.isArray(content)) continue;
 
-    for (const message of messages || []) {
-      if (!message) continue;
-
-      if (message.role === "system") {
-        const text = typeof message.content === "string"
-          ? message.content
-          : "";
-        if (text) systemParts.push({ text });
+    for (const item of content) {
+      if (item?.type === "text" && item.text) {
+        parts.push({ text: String(item.text) });
         continue;
       }
-
-      const parts = [];
-      const content = message.content;
-
-      if (typeof content === "string") {
-        if (content) parts.push({ text: content });
-      } else if (Array.isArray(content)) {
-        for (const item of content) {
-          if (!item) continue;
-          if (item.type === "text" && item.text) {
-            parts.push({ text: String(item.text) });
-            continue;
-          }
-          if (item.type === "image_url") {
-            const dataUrl = item?.image_url?.url || "";
-            const match = String(dataUrl).match(/^data:([^;]+);base64,(.+)$/s);
-            if (match) {
-              parts.push({
-                inlineData: {
-                  mimeType: match[1],
-                  data: match[2],
-                },
-              });
-            }
-          }
+      if (item?.type === "image_url") {
+        const url = String(item?.image_url?.url || "");
+        const match = url.match(/^data:([^;,]+);base64,(.+)$/s);
+        if (match) {
+          parts.push({
+            inline_data: {
+              mime_type: match[1] || "image/jpeg",
+              data: match[2],
+            },
+          });
         }
       }
-
-      if (parts.length) {
-        contents.push({
-          role: message.role === "assistant" ? "model" : "user",
-          parts,
-        });
-      }
     }
+  }
 
-    const body = {
-      contents,
-      generationConfig: {
-        temperature,
-        maxOutputTokens: maxTokens,
-      },
-    };
+  const imageCount = parts.filter(x => x.inline_data).length;
+  console.log(`Gemini Vision START ${GEMINI_VISION_MODEL}: ${imageCount} image(s)`);
 
-    if (systemParts.length) {
-      body.systemInstruction = { parts: systemParts };
-    }
+  if (!imageCount) {
+    console.error("Gemini Vision: no image parts found");
+    return { ok: false, status: 0, error: "No image parts for Gemini", text: null };
+  }
 
+  try {
     const response = await fetch(GEMINI_GENERATE_API, {
       method: "POST",
       headers: {
         "x-goog-api-key": GEMINI_API_KEY,
         "Content-Type": "application/json",
       },
-      body: JSON.stringify(body),
+      body: JSON.stringify({
+        contents: [{ role: "user", parts }],
+        generationConfig: {
+          temperature,
+          maxOutputTokens: maxTokens,
+        },
+      }),
     });
 
     const raw = await response.text();
@@ -1348,15 +1332,15 @@ async function requestGeminiVision({
     const data = JSON.parse(raw);
     const text = (data?.candidates?.[0]?.content?.parts || [])
       .map(part => part?.text || "")
-      .join("")
+      .join("\n")
       .trim();
 
-    return {
-      ok: !!text,
-      status: 200,
-      error: text ? null : "Gemini returned no text",
-      text: text || null,
-    };
+    if (!text) {
+      console.error("Gemini Vision: 200 but empty text response");
+      return { ok: false, status: 200, error: "Gemini returned empty text", text: null };
+    }
+
+    return { ok: true, status: 200, error: null, text };
   } catch (error) {
     console.error("Gemini Vision exception:", error);
     return { ok: false, status: 0, error: String(error), text: null };
@@ -1364,13 +1348,13 @@ async function requestGeminiVision({
 }
 
 async function requestVision({ messages, temperature = 0.1, maxTokens = 1200, preferGemini = false }) {
-  // First analysis: Groq -> Gemini fallback.
-  // Follow-up re-analysis of saved media: Gemini -> Groq fallback.
+  // Follow-up re-analysis: Gemini first, then Groq.
   if (preferGemini) {
+    console.log("Vision route: Gemini -> Groq (media follow-up)");
     const gemini = await requestGeminiVision({ messages, temperature, maxTokens });
     if (gemini.ok && gemini.text) return { ...gemini, provider: "gemini" };
 
-    console.log(`Gemini Vision failed (${gemini.status || "network"}) -> Groq fallback`);
+    console.log(`Gemini Vision failed (${gemini.status || "network/config"}) -> Groq`);
     const groq = await requestGroq({
       model: VISION_MODEL,
       messages,
@@ -1380,27 +1364,38 @@ async function requestVision({ messages, temperature = 0.1, maxTokens = 1200, pr
     if (groq.ok && groq.text) return { ...groq, provider: "groq" };
 
     return {
-      ...groq,
+      ok: false,
+      status: groq.status || gemini.status || 0,
+      error: groq.error || gemini.error || "Both Vision providers failed",
+      text: null,
+      groqStatus: groq.status,
+      groqError: groq.error,
       geminiStatus: gemini.status,
       geminiError: gemini.error,
     };
   }
 
-  let result = await requestGroq({
+  // First analysis: Groq first. ANY Groq failure immediately invokes Gemini.
+  console.log("Vision route: Groq -> Gemini");
+  const groq = await requestGroq({
     model: VISION_MODEL,
     messages,
     temperature,
     maxTokens,
   });
+  if (groq.ok && groq.text) return { ...groq, provider: "groq" };
 
-  if (result.ok && result.text) return { ...result, provider: "groq" };
-
-  console.log(`Groq Vision failed (${result.status || "network"}) -> Gemini fallback`);
+  console.log(`Groq Vision failed (${groq.status || "network/config"}) -> Gemini NOW`);
   const gemini = await requestGeminiVision({ messages, temperature, maxTokens });
   if (gemini.ok && gemini.text) return { ...gemini, provider: "gemini" };
 
   return {
-    ...result,
+    ok: false,
+    status: gemini.status || groq.status || 0,
+    error: gemini.error || groq.error || "Both Vision providers failed",
+    text: null,
+    groqStatus: groq.status,
+    groqError: groq.error,
     geminiStatus: gemini.status,
     geminiError: gemini.error,
   };
