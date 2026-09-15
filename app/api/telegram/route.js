@@ -1,21 +1,25 @@
 export const runtime = "nodejs";
 
 // ======================================================
-// AI GUIDE V7.1
-// Groq + automatic model detection
-// Tavily + Upstash + Telegram
+// AI GUIDE V7.2
 //
-// TEXT:
-//   GPT-OSS 120B -> GPT-OSS 20B -> available model
+// Groq:
+// - Text: openai/gpt-oss-120b
+// - Text fallback: openai/gpt-oss-20b
+// - Vision: qwen/qwen3.8-27b
+// - Voice: whisper-large-v3-turbo
 //
-// VISION:
-//   Qwen 3.8 -> Qwen 3.6
-//   ONLY if actually available to current Groq key
+// + Tavily
+// + Upstash memory
+// + Telegram typing
+// + single photo
+// + albums
+// + REPLY TO PHOTO
+// + voice/audio
+// + static stickers
+// + Telegram-safe math
 //
-// VOICE:
-//   Whisper Large V3 Turbo
-//
-// OpenRouter: DISABLED
+// OpenRouter DISABLED
 // ======================================================
 
 
@@ -58,39 +62,22 @@ const GROQ_MODELS_API =
 const GROQ_TRANSCRIBE_API =
   `${GROQ_API}/audio/transcriptions`;
 
+const TEXT_MODEL =
+  "openai/gpt-oss-120b";
+
+const TEXT_FALLBACK_MODEL =
+  "openai/gpt-oss-20b";
+
+const VISION_MODEL =
+  "qwen/qwen3.8-27b";
+
 const WHISPER_MODEL =
   "whisper-large-v3-turbo";
 
 const MAX_HISTORY_MESSAGES = 20;
-const MAX_IMAGES = 3;
 
-
-// ======================================================
-// MODEL PRIORITY
-// ======================================================
-
-const TEXT_MODEL_PRIORITY = [
-  "openai/gpt-oss-120b",
-  "openai/gpt-oss-20b",
-];
-
-const VISION_MODEL_PRIORITY = [
-  "qwen/qwen3.8-27b",
-  "qwen/qwen3.6-27b",
-];
-
-
-// ======================================================
-// MODEL CACHE
-// ======================================================
-
-let modelCache = {
-  models: [],
-  loadedAt: 0,
-};
-
-const MODEL_CACHE_TIME =
-  5 * 60 * 1000;
+// Qwen 3.8 — максимум 3 изображения
+const MAX_VISION_IMAGES = 3;
 
 
 // ======================================================
@@ -99,7 +86,7 @@ const MODEL_CACHE_TIME =
 
 function sleep(ms) {
   return new Promise(
-    (resolve) => setTimeout(resolve, ms)
+    resolve => setTimeout(resolve, ms)
   );
 }
 
@@ -130,31 +117,30 @@ async function redisCommand(command) {
   }
 
   try {
-    const response =
-      await fetch(
-        UPSTASH_REDIS_REST_URL,
-        {
-          method: "POST",
+    const response = await fetch(
+      UPSTASH_REDIS_REST_URL,
+      {
+        method: "POST",
 
-          headers: {
-            Authorization:
-              `Bearer ${UPSTASH_REDIS_REST_TOKEN}`,
+        headers: {
+          Authorization:
+            `Bearer ${UPSTASH_REDIS_REST_TOKEN}`,
 
-            "Content-Type":
-              "application/json",
-          },
+          "Content-Type":
+            "application/json",
+        },
 
-          body:
-            JSON.stringify(command),
-        }
-      );
+        body:
+          JSON.stringify(command),
+      }
+    );
 
     const raw =
       await response.text();
 
     if (!response.ok) {
       console.error(
-        "Redis error:",
+        "Redis:",
         raw
       );
 
@@ -229,7 +215,6 @@ async function saveExchange(
 
   history.push({
     role: "user",
-
     content:
       String(userText)
         .slice(0, 5000),
@@ -237,7 +222,6 @@ async function saveExchange(
 
   history.push({
     role: "assistant",
-
     content:
       String(assistantText)
         .slice(0, 5000),
@@ -259,7 +243,7 @@ async function clearHistory(userId) {
 
 
 // ======================================================
-// TELEGRAM MESSAGE
+// TELEGRAM SEND MESSAGE
 // ======================================================
 
 async function sendMessage(
@@ -303,7 +287,7 @@ async function sendMessage(
 
     if (!response.ok) {
       console.error(
-        "Telegram:",
+        "Telegram sendMessage:",
         await response.text()
       );
     }
@@ -312,7 +296,7 @@ async function sendMessage(
 
 
 // ======================================================
-// TYPING...
+// TYPING
 // ======================================================
 
 async function sendChatAction(
@@ -337,9 +321,10 @@ async function sendChatAction(
           }),
       }
     );
+
   } catch (error) {
     console.error(
-      "Chat action:",
+      "ChatAction:",
       error
     );
   }
@@ -347,8 +332,7 @@ async function sendChatAction(
 
 
 function startThinking(
-  chatId,
-  action = "typing"
+  chatId
 ) {
   let stopped = false;
 
@@ -356,7 +340,7 @@ function startThinking(
     while (!stopped) {
       await sendChatAction(
         chatId,
-        action
+        "typing"
       );
 
       await sleep(4000);
@@ -372,26 +356,12 @@ function startThinking(
 
 
 // ======================================================
-// GROQ AVAILABLE MODELS
+// GROQ MODELS
 // ======================================================
 
-async function getGroqModels(
-  forceRefresh = false
-) {
+async function getGroqModels() {
   if (!GROQ_API_KEY) {
     return [];
-  }
-
-  const now =
-    Date.now();
-
-  if (
-    !forceRefresh &&
-    modelCache.models.length &&
-    now - modelCache.loadedAt <
-      MODEL_CACHE_TIME
-  ) {
-    return modelCache.models;
   }
 
   try {
@@ -399,56 +369,30 @@ async function getGroqModels(
       await fetch(
         GROQ_MODELS_API,
         {
-          method: "GET",
-
           headers: {
             Authorization:
               `Bearer ${GROQ_API_KEY}`,
-
-            "Content-Type":
-              "application/json",
           },
         }
       );
 
-    const raw =
-      await response.text();
-
-    console.log(
-      "Groq models:",
-      response.status
-    );
-
     if (!response.ok) {
       console.error(
-        "Groq models error:",
-        raw
+        "Groq models:",
+        await response.text()
       );
 
       return [];
     }
 
     const data =
-      JSON.parse(raw);
+      await response.json();
 
-    const models =
-      Array.isArray(data.data)
-        ? data.data
-            .map((item) => item.id)
-            .filter(Boolean)
-        : [];
-
-    modelCache = {
-      models,
-      loadedAt: now,
-    };
-
-    console.log(
-      "Available Groq models:",
-      models
-    );
-
-    return models;
+    return Array.isArray(data.data)
+      ? data.data
+          .map(x => x.id)
+          .filter(Boolean)
+      : [];
 
   } catch (error) {
     console.error(
@@ -462,61 +406,7 @@ async function getGroqModels(
 
 
 // ======================================================
-// CHOOSE MODEL
-// ======================================================
-
-function findAvailableModel(
-  available,
-  priority
-) {
-  for (const model of priority) {
-    if (available.includes(model)) {
-      return model;
-    }
-  }
-
-  return null;
-}
-
-
-async function chooseTextModel() {
-  const available =
-    await getGroqModels();
-
-  const preferred =
-    findAvailableModel(
-      available,
-      TEXT_MODEL_PRIORITY
-    );
-
-  if (preferred) {
-    return preferred;
-  }
-
-  // Если /models по какой-то причине
-  // не сработал, пробуем production
-  // модель напрямую.
-  if (!available.length) {
-    return "openai/gpt-oss-120b";
-  }
-
-  return null;
-}
-
-
-async function chooseVisionModel() {
-  const available =
-    await getGroqModels();
-
-  return findAvailableModel(
-    available,
-    VISION_MODEL_PRIORITY
-  );
-}
-
-
-// ======================================================
-// TELEGRAM FILE DOWNLOAD
+// TELEGRAM FILE
 // ======================================================
 
 async function getTelegramFile(fileId) {
@@ -551,7 +441,7 @@ async function getTelegramFile(fileId) {
 
     if (!fileResponse.ok) {
       console.error(
-        "Telegram download:",
+        "Telegram file:",
         fileResponse.status
       );
 
@@ -570,7 +460,7 @@ async function getTelegramFile(fileId) {
 
   } catch (error) {
     console.error(
-      "Telegram file:",
+      "Telegram file exception:",
       error
     );
 
@@ -583,29 +473,17 @@ async function getTelegramFile(fileId) {
 // IMAGE
 // ======================================================
 
-function getImageMimeType(
-  filePath
-) {
+function imageMimeType(filePath) {
   const lower =
     String(filePath)
       .toLowerCase();
 
-  if (
-    lower.endsWith(".png")
-  ) {
+  if (lower.endsWith(".png")) {
     return "image/png";
   }
 
-  if (
-    lower.endsWith(".webp")
-  ) {
+  if (lower.endsWith(".webp")) {
     return "image/webp";
-  }
-
-  if (
-    lower.endsWith(".gif")
-  ) {
-    return "image/gif";
   }
 
   return "image/jpeg";
@@ -623,7 +501,7 @@ async function getTelegramImageData(
   }
 
   const mimeType =
-    getImageMimeType(
+    imageMimeType(
       file.filePath
     );
 
@@ -631,9 +509,20 @@ async function getTelegramImageData(
     file.buffer
       .toString("base64");
 
-  return (
-    `data:${mimeType};base64,${base64}`
+  console.log(
+    "Image:",
+    file.filePath,
+    "bytes:",
+    file.buffer.length
   );
+
+  return {
+    dataUrl:
+      `data:${mimeType};base64,${base64}`,
+
+    bytes:
+      file.buffer.length,
+  };
 }
 
 
@@ -655,17 +544,12 @@ function detectLanguage(text) {
 
   if (
     /[іїєґ]/i.test(source) ||
-
-    /\b(що|цей|ця|зараз|сьогодні|поясни|виконай|зроби|скороти|новини|свіжі|останні)\b/i.test(
-      lower
-    )
+    /\b(що|цей|ця|зараз|сьогодні|поясни|виконай|зроби|скороти|новини|свіжі|останні|вправу)\b/i.test(lower)
   ) {
     return "uk";
   }
 
-  if (
-    /[а-яё]/i.test(source)
-  ) {
+  if (/[а-яё]/i.test(source)) {
     return "ru";
   }
 
@@ -673,9 +557,7 @@ function detectLanguage(text) {
 }
 
 
-function languageInstruction(
-  language
-) {
+function languageInstruction(language) {
   if (language === "uk") {
     return (
       "Відповідай українською мовою."
@@ -695,17 +577,18 @@ function languageInstruction(
 
 
 // ======================================================
-// TELEGRAM MATH RULES
+// TELEGRAM MATH
 // ======================================================
 
-function telegramFormattingRules() {
+function telegramMathRules() {
   return `
-ВАЖНО ДЛЯ TELEGRAM:
+ВАЖНО:
 
 Telegram показывает обычный текст.
 
-НЕ используй LaTeX:
+НЕ используй LaTeX.
 
+Не используй:
 \\[
 \\]
 \\(
@@ -718,36 +601,32 @@ Telegram показывает обычный текст.
 \\begin
 \\end
 \\boxed
+$...$
+$$...$$
 
-Не используй $...$.
-
-Пиши формулы обычным текстом.
-
-Примеры:
+Пиши так:
 
 5,4 · 10⁴
-
 1,02 · 10⁻²
-
 R = U / I
-
 Q = I² · R · t
-
 h = √(m · n)
-
 x = (-b ± √D) / (2a)
 
-Используй:
-· или × для умножения
-/ или : для деления
-√ для корня
-Unicode-степени, когда возможно.
+Используй Unicode:
+² ³ ⁴
+₀ ₁ ₂
+√
+·
+×
+±
+≈
 `;
 }
 
 
 // ======================================================
-// CLEAN OUTPUT
+// CLEAN AI OUTPUT
 // ======================================================
 
 function superscriptNumber(value) {
@@ -769,7 +648,7 @@ function superscriptNumber(value) {
   return String(value)
     .split("")
     .map(
-      (char) =>
+      char =>
         map[char] || char
     )
     .join("");
@@ -795,7 +674,7 @@ function subscriptNumber(value) {
   return String(value)
     .split("")
     .map(
-      (char) =>
+      char =>
         map[char] || char
     )
     .join("");
@@ -926,7 +805,7 @@ function cleanAIResponse(text) {
 
 
 // ======================================================
-// INTERNET
+// INTERNET DETECTION
 // ======================================================
 
 function needsInternet(text) {
@@ -949,16 +828,10 @@ function needsInternet(text) {
     "что нового",
     "погода",
     "температура",
-    "дождь",
-    "снег",
     "курс",
     "доллар",
-    "долара",
     "евро",
     "гривн",
-    "usd",
-    "uah",
-    "eur",
     "цена",
     "сколько стоит",
     "обновление",
@@ -966,7 +839,6 @@ function needsInternet(text) {
     "релиз",
     "утечк",
     "слив",
-    "инсайд",
 
     "зараз",
     "сьогодні",
@@ -976,7 +848,6 @@ function needsInternet(text) {
     "ціна",
     "скільки коштує",
     "оновлення",
-    "витік",
 
     "today",
     "current",
@@ -987,130 +858,12 @@ function needsInternet(text) {
     "price",
     "update",
     "release",
-    "leak",
   ];
 
   return triggers.some(
-    (trigger) =>
+    trigger =>
       t.includes(trigger)
   );
-}
-
-
-function isContextFollowUp(text) {
-  if (!text) {
-    return false;
-  }
-
-  const t =
-    text.toLowerCase().trim();
-
-  const patterns = [
-    "по этому",
-    "про это",
-    "об этом",
-    "про него",
-    "про неё",
-    "про них",
-    "а сейчас",
-    "а сегодня",
-    "а что нового",
-    "дай свеж",
-    "подробнее",
-    "что с ним",
-    "что с ней",
-
-    "про це",
-    "по цьому",
-    "про нього",
-    "що нового",
-    "свіжі новини",
-
-    "about it",
-    "about this",
-    "latest on this",
-  ];
-
-  return patterns.some(
-    (pattern) =>
-      t.includes(pattern)
-  );
-}
-
-
-async function getConversationContext(
-  userId
-) {
-  const history =
-    await getHistory(userId);
-
-  return history
-    .slice(-8)
-    .map((item) => {
-      const speaker =
-        item.role === "user"
-          ? "User"
-          : "Assistant";
-
-      return (
-        `${speaker}: ` +
-        String(item.content)
-          .slice(0, 1200)
-      );
-    })
-    .join("\n");
-}
-
-
-async function buildSearchQuery(
-  text,
-  userId,
-  language
-) {
-  const t =
-    text.toLowerCase();
-
-  const genericDollar =
-    t.includes("курс доллара") ||
-    t.includes("курс долара");
-
-  if (genericDollar) {
-    if (language === "uk") {
-      return (
-        "актуальний курс долара США " +
-        "до української гривні USD UAH сьогодні Україна"
-      );
-    }
-
-    return (
-      "актуальный курс доллара США " +
-      "к украинской гривне USD UAH сегодня Украина"
-    );
-  }
-
-  if (
-    isContextFollowUp(text)
-  ) {
-    const context =
-      await getConversationContext(
-        userId
-      );
-
-    if (context) {
-      return `
-Найди свежую информацию
-по теме разговора.
-
-КОНТЕКСТ:
-${context}
-
-ВОПРОС:
-${text}
-`.trim();
-    }
-  }
-
-  return text;
 }
 
 
@@ -1167,7 +920,7 @@ async function searchWeb(query) {
 
   } catch (error) {
     console.error(
-      "Tavily exception:",
+      "Tavily:",
       error
     );
 
@@ -1185,8 +938,7 @@ function makeWebContext(data) {
 
   if (data.answer) {
     result +=
-      `SEARCH SUMMARY:\n` +
-      `${data.answer}\n\n`;
+      `SEARCH SUMMARY:\n${data.answer}\n\n`;
   }
 
   if (
@@ -1203,9 +955,6 @@ ${item.title || "Unknown"}
 
 CONTENT:
 ${item.content || "Unknown"}
-
-URL:
-${item.url || "Unknown"}
 `
       )
       .join("\n");
@@ -1243,91 +992,106 @@ ${currentTime}
 
 ${languageInstruction(language)}
 
-Учитывай историю разговора.
-
-Понимай продолжения:
-"сократи"
-"подробнее"
-"продолжи"
-"а почему?"
-"сделай №3"
-
-Не проси повторять информацию,
-если она уже есть в истории.
+Учитывай предыдущую историю разговора.
 
 Не придумывай факты.
 
-Если не уверен —
-честно скажи об этом.
+Если пользователь просит:
+"сделай короче"
+"подробнее"
+"продолжи"
+"почему?"
+"сделай 3"
+учитывай предыдущий контекст.
 
 Для школьных заданий:
-1. Внимательно прочитай условие.
-2. Не меняй числа.
-3. Не придумывай условие.
-4. Решай именно тот номер,
-   который попросил пользователь.
-5. Проверяй вычисления.
+- внимательно прочитай условие;
+- не меняй числа;
+- не придумывай текст;
+- выполняй именно тот пункт,
+  который попросил пользователь;
+- проверяй вычисления;
+- отвечай на уровне школьника,
+  если вопрос школьный.
 
-Если написано "Вправа №1",
-внутри есть пункты 1, 2, 3...
-и пользователь пишет
-"виконай вправу 3",
-обычно имеется в виду пункт 3.
+Если на странице написано:
+"ВПРАВА №1"
+
+и ниже есть пункты:
+1.
+2.
+3.
+4.
+
+а пользователь пишет:
+"3 вправу виконай"
+
+это означает:
+выполни ПУНКТ 3
+этой упражнения.
 
 Не решай всю страницу,
 если этого не просили.
 
-Не показывай внутреннюю
-цепочку рассуждений модели.
+Не показывай скрытую
+цепочку рассуждений.
 
-${telegramFormattingRules()}
+${telegramMathRules()}
 `;
 
   if (vision) {
     prompt += `
 
-Пользователь прислал изображение
-или несколько изображений.
+Ты получил реальное изображение.
 
-Реально изучи изображения.
+ВНИМАТЕЛЬНО его изучи.
 
-Если это школьная работа:
-прочитай точное условие.
+Если пользователь ответил
+на старое фото через Reply,
+это изображение является тем фото,
+на которое он отвечает.
 
-Если это скриншот:
-прочитай интерфейс и ошибки.
+Текст текущего сообщения —
+это инструкция к изображению.
 
-Если это текст:
-прочитай его.
+Например:
 
-Если это обычное фото:
-ответь на вопрос пользователя.
+изображение содержит
+"ВПРАВА №1"
+и пункты 1-8.
+
+Пользователь пишет:
+"3 вправу виконай"
+
+Нужно выполнить ТОЛЬКО пункт 3.
+
+Не говори:
+"я не вижу изображение",
+если изображение реально передано
+в этом запросе.
+
+Если текст мелкий:
+постарайся прочитать его,
+но не выдумывай нечитаемые слова.
+
+Если критически важную часть
+прочитать невозможно —
+скажи конкретно какую.
 
 Если изображений несколько,
 рассматривай их вместе.
-
-Не придумывай нечитаемые детали.
-
-Если часть изображения
-действительно невозможно прочитать,
-скажи об этом.
 `;
   }
 
   if (webContext) {
     prompt += `
 
-WEB DATA:
+СВЕЖИЕ ДАННЫЕ TAVILY:
 
 ${webContext}
 
-Это результаты Tavily.
-
-Используй их для свежей информации.
-Проверяй даты.
-
-Не показывай URL,
-если пользователь не попросил ссылки.
+Используй их для ответа
+на актуальный вопрос.
 `;
   }
 
@@ -1336,12 +1100,12 @@ ${webContext}
 
 
 // ======================================================
-// GROQ CHAT REQUEST
+// GROQ REQUEST
 // ======================================================
 
 async function requestGroq({
-  messages,
   model,
+  messages,
   temperature = 0.4,
   maxTokens = 1800,
 }) {
@@ -1349,9 +1113,9 @@ async function requestGroq({
     return {
       ok: false,
       status: 0,
-      text: null,
       error:
         "GROQ_API_KEY missing",
+      text: null,
     };
   }
 
@@ -1399,44 +1163,30 @@ async function requestGroq({
         raw
       );
 
-      // Если модель пропала/недоступна,
-      // обновим cache при следующем запросе.
-      if (
-        response.status === 400 ||
-        response.status === 404
-      ) {
-        modelCache = {
-          models: [],
-          loadedAt: 0,
-        };
-      }
-
       return {
         ok: false,
         status:
           response.status,
-        text: null,
         error: raw,
+        text: null,
       };
     }
 
     const data =
       JSON.parse(raw);
 
-    const content =
-      data
-        ?.choices
-        ?.[0]
-        ?.message
-        ?.content;
-
     return {
       ok: true,
-      status:
-        response.status,
-      text:
-        content || null,
+      status: 200,
       error: null,
+
+      text:
+        data
+          ?.choices
+          ?.[0]
+          ?.message
+          ?.content ||
+        null,
     };
 
   } catch (error) {
@@ -1448,11 +1198,35 @@ async function requestGroq({
     return {
       ok: false,
       status: 0,
-      text: null,
       error:
         String(error),
+      text: null,
     };
   }
+}
+
+
+// ======================================================
+// DETECT GROQ ERROR
+// ======================================================
+
+function isRequestTooLarge(result) {
+  const error =
+    String(
+      result?.error || ""
+    ).toLowerCase();
+
+  return (
+    error.includes(
+      "request too large"
+    ) ||
+    error.includes(
+      "request_too_large"
+    ) ||
+    error.includes(
+      "too large for model"
+    )
+  );
 }
 
 
@@ -1468,16 +1242,6 @@ async function askTextAI({
 }) {
   const history =
     await getHistory(userId);
-
-  const model =
-    await chooseTextModel();
-
-  if (!model) {
-    return (
-      "⚠️ Groq сейчас не показывает " +
-      "ни одной подходящей текстовой модели для этого API-ключа."
-    );
-  }
 
   const messages = [
     {
@@ -1500,38 +1264,22 @@ async function askTextAI({
 
   let result =
     await requestGroq({
+      model: TEXT_MODEL,
       messages,
-      model,
       temperature: 0.4,
       maxTokens: 1800,
     });
 
-  // Если GPT-OSS 120B внезапно
-  // недоступна, пробуем 20B.
-  if (
-    !result.ok &&
-    model ===
-      "openai/gpt-oss-120b"
-  ) {
-    const available =
-      await getGroqModels(true);
+  if (!result.ok) {
+    result =
+      await requestGroq({
+        model:
+          TEXT_FALLBACK_MODEL,
 
-    if (
-      available.includes(
-        "openai/gpt-oss-20b"
-      )
-    ) {
-      result =
-        await requestGroq({
-          messages,
-
-          model:
-            "openai/gpt-oss-20b",
-
-          temperature: 0.4,
-          maxTokens: 1800,
-        });
-    }
+        messages,
+        temperature: 0.4,
+        maxTokens: 1800,
+      });
   }
 
   const cleaned =
@@ -1543,7 +1291,9 @@ async function askTextAI({
     return cleaned;
   }
 
-  if (result.status === 429) {
+  if (
+    result.status === 429
+  ) {
     return (
       "⚠️ Сейчас достигнут лимит Groq. " +
       "Попробуй немного позже."
@@ -1551,14 +1301,14 @@ async function askTextAI({
   }
 
   return (
-    "⚠️ Groq не смог получить ответ. " +
-    "Посмотри логи Vercel — там будет точная ошибка."
+    "⚠️ Не удалось получить ответ от Groq. " +
+    "Попробуй ещё раз."
   );
 }
 
 
 // ======================================================
-// VISION AI
+// VISION
 // ======================================================
 
 async function askVisionAI({
@@ -1567,20 +1317,26 @@ async function askVisionAI({
   userId,
   language,
 }) {
-  const model =
-    await chooseVisionModel();
-
-  if (!model) {
-    return (
-      "⚠️ Твой Groq API-ключ сейчас не показывает " +
-      "доступную Vision-модель. " +
-      "Текст и голос продолжат работать, " +
-      "но фото пока недоступны для этого ключа."
-    );
-  }
+  // Для Vision специально НЕ отправляем
+  // всю 20-сообщений историю.
+  //
+  // Фото само по себе уже занимает
+  // существенный объём запроса.
 
   const history =
     await getHistory(userId);
+
+  // Только последние 2 текстовых сообщения.
+  const tinyHistory =
+    history
+      .slice(-2)
+      .map(item => ({
+        role: item.role,
+
+        content:
+          String(item.content)
+            .slice(0, 700),
+      }));
 
   const userContent = [
     {
@@ -1590,34 +1346,29 @@ async function askVisionAI({
         caption ||
         (
           images.length > 1
-            ? "Проанализируй все изображения вместе."
-            : "Внимательно проанализируй изображение."
+            ? "Внимательно проанализируй эти изображения вместе."
+            : "Внимательно проанализируй это изображение."
         ),
     },
   ];
 
-  const imageLimit =
-    model === "qwen/qwen3.8-27b"
-      ? 3
-      : 5;
-
   for (
-    const imageData of
+    const image of
     images.slice(
       0,
-      imageLimit
+      MAX_VISION_IMAGES
     )
   ) {
     userContent.push({
       type: "image_url",
 
       image_url: {
-        url: imageData,
+        url: image.dataUrl,
       },
     });
   }
 
-  const messages = [
+  let messages = [
     {
       role: "system",
 
@@ -1628,7 +1379,7 @@ async function askVisionAI({
         }),
     },
 
-    ...history.slice(-10),
+    ...tinyHistory,
 
     {
       role: "user",
@@ -1638,35 +1389,89 @@ async function askVisionAI({
 
   let result =
     await requestGroq({
+      model:
+        VISION_MODEL,
+
       messages,
-      model,
-      temperature: 0.2,
-      maxTokens: 2400,
+
+      temperature: 0.15,
+
+      // Уменьшили максимум ответа.
+      // Для школьного фото этого
+      // более чем достаточно.
+      maxTokens: 1200,
     });
 
-  // Если одна Qwen исчезла,
-  // обновляем список и пробуем вторую.
-  if (!result.ok) {
-    const available =
-      await getGroqModels(true);
 
-    const fallback =
-      VISION_MODEL_PRIORITY.find(
-        (candidate) =>
-          candidate !== model &&
-          available.includes(candidate)
-      );
+  // ====================================================
+  // RETRY IF REQUEST TOO LARGE
+  // ====================================================
 
-    if (fallback) {
-      result =
-        await requestGroq({
-          messages,
-          model: fallback,
-          temperature: 0.2,
-          maxTokens: 2400,
-        });
-    }
+  if (
+    !result.ok &&
+    isRequestTooLarge(result)
+  ) {
+    console.log(
+      "Vision request too large. Retrying without history..."
+    );
+
+    // Вторая попытка:
+    // вообще без истории,
+    // только короткий system prompt +
+    // изображение + инструкция.
+
+    messages = [
+      {
+        role: "system",
+
+        content: `
+Ты анализируешь изображение
+для пользователя Telegram.
+
+${languageInstruction(language)}
+
+Внимательно прочитай изображение.
+
+Если это школьное задание,
+выполни только тот пункт,
+который попросил пользователь.
+
+Не придумывай нечитаемый текст.
+
+Не используй LaTeX.
+
+Формулы пиши обычным текстом:
+R = U / I
+Q = I² · R · t
+√
+·
+×
+²
+³
+`.trim(),
+      },
+
+      {
+        role: "user",
+        content: userContent,
+      },
+    ];
+
+    result =
+      await requestGroq({
+        model:
+          VISION_MODEL,
+
+        messages,
+
+        temperature:
+          0.1,
+
+        maxTokens:
+          800,
+      });
   }
+
 
   const cleaned =
     cleanAIResponse(
@@ -1677,15 +1482,32 @@ async function askVisionAI({
     return cleaned;
   }
 
-  if (result.status === 429) {
+
+  // ====================================================
+  // CORRECT ERROR MESSAGE
+  // ====================================================
+
+  if (
+    isRequestTooLarge(result)
+  ) {
     return (
-      "⚠️ Сейчас достигнут лимит Groq Vision. " +
+      "⚠️ Это изображение оказалось слишком большим " +
+      "для Groq Vision. Попробуй отправить его как скриншот " +
+      "или обрезать только нужную часть страницы."
+    );
+  }
+
+  if (
+    result.status === 429
+  ) {
+    return (
+      "⚠️ Сейчас достигнут лимит запросов Groq Vision. " +
       "Попробуй немного позже."
     );
   }
 
   return (
-    "⚠️ Groq не смог проанализировать изображение."
+    "⚠️ Groq Vision не смог обработать изображение."
   );
 }
 
@@ -1698,16 +1520,15 @@ async function transcribeTelegramAudio(
   fileId
 ) {
   const file =
-    await getTelegramFile(fileId);
+    await getTelegramFile(
+      fileId
+    );
 
   if (!file) {
     return null;
   }
 
   try {
-    const form =
-      new FormData();
-
     const lower =
       String(file.filePath)
         .toLowerCase();
@@ -1742,6 +1563,9 @@ async function transcribeTelegramAudio(
       extension = "webm";
       mime = "audio/webm";
     }
+
+    const form =
+      new FormData();
 
     const blob =
       new Blob(
@@ -1833,10 +1657,7 @@ async function handleVoice({
   fileId,
 }) {
   const stopThinking =
-    startThinking(
-      chatId,
-      "typing"
-    );
+    startThinking(chatId);
 
   try {
     const transcription =
@@ -1854,7 +1675,7 @@ async function handleVoice({
     }
 
     console.log(
-      "VOICE:",
+      "Voice transcription:",
       transcription
     );
 
@@ -1870,23 +1691,22 @@ async function handleVoice({
         transcription
       )
     ) {
-      const query =
-        await buildSearchQuery(
-          transcription,
-          userId,
-          language
+      const webData =
+        await searchWeb(
+          transcription
         );
 
-      const webData =
-        await searchWeb(query);
-
       webContext =
-        makeWebContext(webData);
+        makeWebContext(
+          webData
+        );
     }
 
     const answer =
       await askTextAI({
-        text: transcription,
+        text:
+          transcription,
+
         userId,
         language,
         webContext,
@@ -1922,10 +1742,7 @@ async function handleSinglePhoto({
   caption,
 }) {
   const stopThinking =
-    startThinking(
-      chatId,
-      "typing"
-    );
+    startThinking(chatId);
 
   try {
     const image =
@@ -1936,14 +1753,16 @@ async function handleSinglePhoto({
     if (!image) {
       await sendMessage(
         chatId,
-        "⚠️ Не удалось скачать фото."
+        "⚠️ Не удалось скачать изображение."
       );
 
       return;
     }
 
     const language =
-      detectLanguage(caption);
+      detectLanguage(
+        caption
+      );
 
     const answer =
       await askVisionAI({
@@ -1975,7 +1794,108 @@ async function handleSinglePhoto({
 
 
 // ======================================================
-// ALBUM
+// REPLY TO PHOTO
+// ======================================================
+
+async function handleReplyToPhoto({
+  chatId,
+  userId,
+  message,
+  text,
+}) {
+  const reply =
+    message.reply_to_message;
+
+  if (
+    !reply ||
+    !Array.isArray(reply.photo) ||
+    !reply.photo.length
+  ) {
+    return false;
+  }
+
+  console.log(
+    "Reply to photo detected"
+  );
+
+  const largestPhoto =
+    reply.photo[
+      reply.photo.length - 1
+    ];
+
+  const fileId =
+    largestPhoto.file_id;
+
+  const stopThinking =
+    startThinking(chatId);
+
+  try {
+    const image =
+      await getTelegramImageData(
+        fileId
+      );
+
+    if (!image) {
+      await sendMessage(
+        chatId,
+        "⚠️ Не удалось загрузить фото, на которое ты ответил."
+      );
+
+      return true;
+    }
+
+    const originalCaption =
+      reply.caption?.trim() ||
+      "";
+
+    let instruction =
+      text?.trim() ||
+      "Проанализируй это изображение.";
+
+    if (originalCaption) {
+      instruction +=
+        `\n\nПодпись исходного фото: ${originalCaption}`;
+    }
+
+    const language =
+      detectLanguage(
+        instruction
+      );
+
+    const answer =
+      await askVisionAI({
+        images: [image],
+
+        caption:
+          instruction,
+
+        userId,
+        language,
+      });
+
+    await saveExchange(
+      userId,
+
+      `[Ответ на ранее отправленное фото]\n${instruction}`,
+
+      answer
+    );
+
+    await sendMessage(
+      chatId,
+      answer
+    );
+
+    return true;
+
+  } finally {
+    stopThinking();
+  }
+}
+
+
+// ======================================================
+// ALBUM REDIS
 // ======================================================
 
 async function addAlbumPhoto({
@@ -1983,6 +1903,7 @@ async function addAlbumPhoto({
   mediaGroupId,
   fileId,
   caption,
+  messageId,
 }) {
   const key =
     albumKey(
@@ -1990,47 +1911,25 @@ async function addAlbumPhoto({
       mediaGroupId
     );
 
-  const raw =
-    await redisCommand([
-      "GET",
-      key,
-    ]);
+  // RPUSH вместо GET + SET.
+  // Так надёжнее при нескольких
+  // одновременных webhook.
+  await redisCommand([
+    "RPUSH",
+    key,
 
-  let album = {
-    photos: [],
-    caption: "",
-  };
-
-  if (raw) {
-    try {
-      album =
-        JSON.parse(raw);
-    } catch {
-      // ignore
-    }
-  }
-
-  if (
-    !album.photos.includes(fileId)
-  ) {
-    album.photos.push(fileId);
-  }
-
-  if (caption) {
-    album.caption = caption;
-  }
-
-  album.photos =
-    album.photos.slice(
-      0,
-      MAX_IMAGES
-    );
+    JSON.stringify({
+      fileId,
+      caption:
+        caption || "",
+      messageId:
+        messageId || 0,
+    }),
+  ]);
 
   await redisCommand([
-    "SET",
+    "EXPIRE",
     key,
-    JSON.stringify(album),
-    "EX",
     "60",
   ]);
 }
@@ -2040,38 +1939,45 @@ async function getAlbum(
   userId,
   mediaGroupId
 ) {
-  const raw =
+  const result =
     await redisCommand([
-      "GET",
+      "LRANGE",
+
       albumKey(
         userId,
         mediaGroupId
       ),
+
+      "0",
+      "-1",
     ]);
 
-  if (!raw) {
-    return null;
+  if (
+    !Array.isArray(result)
+  ) {
+    return [];
   }
 
-  try {
-    return JSON.parse(raw);
-  } catch {
-    return null;
+  const items = [];
+
+  for (const raw of result) {
+    try {
+      const item =
+        JSON.parse(raw);
+
+      items.push(item);
+    } catch {
+      // ignore broken item
+    }
   }
-}
 
+  items.sort(
+    (a, b) =>
+      (a.messageId || 0) -
+      (b.messageId || 0)
+  );
 
-async function deleteAlbum(
-  userId,
-  mediaGroupId
-) {
-  await redisCommand([
-    "DEL",
-    albumKey(
-      userId,
-      mediaGroupId
-    ),
-  ]);
+  return items;
 }
 
 
@@ -2098,33 +2004,56 @@ async function tryAlbumLock(
 }
 
 
+async function deleteAlbum(
+  userId,
+  mediaGroupId
+) {
+  await redisCommand([
+    "DEL",
+
+    albumKey(
+      userId,
+      mediaGroupId
+    ),
+  ]);
+}
+
+
+// ======================================================
+// HANDLE ALBUM
+// ======================================================
+
 async function handleAlbum({
   chatId,
   userId,
   mediaGroupId,
   fileId,
   caption,
+  messageId,
 }) {
   await addAlbumPhoto({
     userId,
     mediaGroupId,
     fileId,
     caption,
+    messageId,
   });
 
-  await sleep(1800);
+  // Ждём остальные части альбома
+  await sleep(1500);
 
-  const locked =
+  const gotLock =
     await tryAlbumLock(
       userId,
       mediaGroupId
     );
 
-  if (!locked) {
+  if (!gotLock) {
     return;
   }
 
-  await sleep(700);
+  // Последний шанс для позднего update
+  await sleep(500);
 
   const album =
     await getAlbum(
@@ -2132,32 +2061,28 @@ async function handleAlbum({
       mediaGroupId
     );
 
-  if (
-    !album ||
-    !album.photos?.length
-  ) {
+  if (!album.length) {
     return;
   }
 
   const stopThinking =
-    startThinking(
-      chatId,
-      "typing"
-    );
+    startThinking(chatId);
 
   try {
+    const selected =
+      album.slice(
+        0,
+        MAX_VISION_IMAGES
+      );
+
     const images = [];
 
     for (
-      const photoId of
-      album.photos.slice(
-        0,
-        MAX_IMAGES
-      )
+      const item of selected
     ) {
       const image =
         await getTelegramImageData(
-          photoId
+          item.fileId
         );
 
       if (image) {
@@ -2168,22 +2093,27 @@ async function handleAlbum({
     if (!images.length) {
       await sendMessage(
         chatId,
-        "⚠️ Не удалось загрузить фотографии."
+        "⚠️ Не удалось скачать фотографии."
       );
 
       return;
     }
 
+    const caption =
+      album
+        .map(x => x.caption)
+        .find(Boolean) ||
+      "";
+
     const language =
       detectLanguage(
-        album.caption
+        caption
       );
 
     const answer =
       await askVisionAI({
         images,
-        caption:
-          album.caption,
+        caption,
         userId,
         language,
       });
@@ -2193,8 +2123,8 @@ async function handleAlbum({
 
       `[Альбом: ${images.length} фото]` +
       (
-        album.caption
-          ? `\n${album.caption}`
+        caption
+          ? `\n${caption}`
           : ""
       ),
 
@@ -2232,17 +2162,14 @@ async function handleSticker({
   ) {
     await sendMessage(
       chatId,
-      "😀 Пока я анализирую только обычные статичные стикеры."
+      "😀 Пока я понимаю только обычные статичные стикеры."
     );
 
     return;
   }
 
   const stopThinking =
-    startThinking(
-      chatId,
-      "typing"
-    );
+    startThinking(chatId);
 
   try {
     const image =
@@ -2264,7 +2191,7 @@ async function handleSticker({
         images: [image],
 
         caption:
-          "Посмотри на стикер и коротко, естественно отреагируй как собеседник. Если на нём есть текст, учти его.",
+          "Пользователь отправил стикер. Коротко и естественно отреагируй на него как собеседник. Если на нём есть текст, учти его.",
 
         userId,
         language: "ru",
@@ -2296,7 +2223,7 @@ export async function POST(
 ) {
   try {
     console.log(
-      "AI-GUIDE-V7.1"
+      "AI-GUIDE-V7.2"
     );
 
     const update =
@@ -2328,7 +2255,7 @@ export async function POST(
 
 
     // ==================================================
-    // PRIVATE
+    // PRIVATE MODE
     // ==================================================
 
     if (
@@ -2347,23 +2274,21 @@ export async function POST(
     }
 
 
-    // ==================================================
-    // TEXT / COMMAND
-    // ==================================================
-
     const text =
-      message.text?.trim();
+      message.text?.trim() ||
+      "";
 
+
+    // ==================================================
+    // CLEAR
+    // ==================================================
 
     if (
-      text &&
-      (
-        text.toLowerCase() ===
-          "/clear" ||
+      text.toLowerCase() ===
+        "/clear" ||
 
-        text.toLowerCase() ===
-          "/reset"
-      )
+      text.toLowerCase() ===
+        "/reset"
     ) {
       await clearHistory(
         userId
@@ -2377,6 +2302,36 @@ export async function POST(
       return Response.json({
         ok: true,
       });
+    }
+
+
+    // ==================================================
+    // REPLY TO PHOTO
+    //
+    // ВАЖНО:
+    // проверяем ДО обычного текста.
+    // ==================================================
+
+    if (
+      text &&
+      message
+        .reply_to_message
+        ?.photo
+        ?.length
+    ) {
+      const handled =
+        await handleReplyToPhoto({
+          chatId,
+          userId,
+          message,
+          text,
+        });
+
+      if (handled) {
+        return Response.json({
+          ok: true,
+        });
+      }
     }
 
 
@@ -2451,20 +2406,21 @@ export async function POST(
       Array.isArray(
         message.photo
       ) &&
-      message.photo.length
+      message.photo.length > 0
     ) {
-      const photo =
+      const biggestPhoto =
         message.photo[
           message.photo.length - 1
         ];
 
       const fileId =
-        photo.file_id;
+        biggestPhoto.file_id;
 
       const caption =
         message.caption?.trim() ||
         "";
 
+      // Album
       if (
         message.media_group_id
       ) {
@@ -2477,6 +2433,9 @@ export async function POST(
 
           fileId,
           caption,
+
+          messageId:
+            message.message_id,
         });
 
         return Response.json({
@@ -2484,6 +2443,7 @@ export async function POST(
         });
       }
 
+      // Single photo
       await handleSinglePhoto({
         chatId,
         userId,
@@ -2503,29 +2463,20 @@ export async function POST(
 
     if (text) {
       const stopThinking =
-        startThinking(
-          chatId,
-          "typing"
-        );
+        startThinking(chatId);
 
       try {
         const language =
           detectLanguage(text);
 
-        let webContext = null;
+        let webContext =
+          null;
 
         if (
           needsInternet(text)
         ) {
-          const query =
-            await buildSearchQuery(
-              text,
-              userId,
-              language
-            );
-
           const webData =
-            await searchWeb(query);
+            await searchWeb(text);
 
           webContext =
             makeWebContext(
@@ -2563,12 +2514,12 @@ export async function POST(
 
 
     // ==================================================
-    // UNKNOWN
+    // OTHER
     // ==================================================
 
     await sendMessage(
       chatId,
-      "Сейчас я понимаю текст, фото, несколько фото, голосовые, аудио и статичные стикеры."
+      "Сейчас я понимаю текст, фото, несколько фото, Reply на фото, голосовые, аудио и статичные стикеры."
     );
 
     return Response.json({
@@ -2596,21 +2547,9 @@ export async function GET() {
   const models =
     await getGroqModels();
 
-  const textModel =
-    findAvailableModel(
-      models,
-      TEXT_MODEL_PRIORITY
-    );
-
-  const visionModel =
-    findAvailableModel(
-      models,
-      VISION_MODEL_PRIORITY
-    );
-
   return Response.json({
     version:
-      "AI-GUIDE-V7.1",
+      "AI-GUIDE-V7.2",
 
     status:
       "Bot is running",
@@ -2636,36 +2575,68 @@ export async function GET() {
     privateMode:
       !!ALLOWED_USER_ID,
 
-    textModel:
-      textModel ||
-      "NO SUPPORTED TEXT MODEL",
+    models: {
+      text:
+        TEXT_MODEL,
 
-    visionModel:
-      visionModel ||
-      "NO VISION MODEL AVAILABLE",
+      textFallback:
+        TEXT_FALLBACK_MODEL,
 
-    whisperModel:
-      WHISPER_MODEL,
+      vision:
+        VISION_MODEL,
 
-    availableGroqModels:
-      models,
+      whisper:
+        WHISPER_MODEL,
+    },
+
+    modelAccess: {
+      text:
+        models.includes(
+          TEXT_MODEL
+        ),
+
+      textFallback:
+        models.includes(
+          TEXT_FALLBACK_MODEL
+        ),
+
+      vision:
+        models.includes(
+          VISION_MODEL
+        ),
+
+      whisper:
+        models.includes(
+          WHISPER_MODEL
+        ),
+    },
 
     features: {
       text: true,
-      photos:
-        !!visionModel,
-      multiPhoto:
-        !!visionModel,
+
+      singlePhoto: true,
+
+      multiPhoto: true,
+
+      maxVisionImages:
+        MAX_VISION_IMAGES,
+
+      replyToPhoto: true,
+
       voice: true,
+
       audio: true,
-      staticStickers:
-        !!visionModel,
-      typingIndicator:
-        true,
+
+      staticStickers: true,
+
+      typingIndicator: true,
+
       memory:
         "Upstash Redis",
-      webSearch:
+
+      search:
         "Tavily",
+
       telegramSafeMath:
         true,
     },
