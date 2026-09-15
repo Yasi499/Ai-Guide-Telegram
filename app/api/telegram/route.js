@@ -12,7 +12,7 @@ const ffmpegPath = path.join(process.cwd(), "ffmpeg-bin", "ffmpeg");
 export const runtime = "nodejs";
 
 // ======================================================
-// AI GUIDE V7.5.3
+// AI GUIDE V7.5.4
 //
 // Groq:
 // - Text: openai/gpt-oss-120b
@@ -2288,7 +2288,7 @@ ${visibleText || "(только emoji)"}
 
 
 // ======================================================
-// VIDEO V7.5.3
+// VIDEO V7.5.4
 // ======================================================
 
 function videoMimeType(filePath) {
@@ -2299,29 +2299,64 @@ function videoMimeType(filePath) {
 }
 
 async function transcribeVideoFile(file) {
-  if (!file || !GROQ_API_KEY) return null;
+  if (!file || !GROQ_API_KEY) return { text: null, reliable: false, meta: null };
   try {
     const { mime, extension } = videoMimeType(file.filePath);
     const form = new FormData();
     form.append("file", new Blob([file.buffer], { type: mime }), `video.${extension}`);
     form.append("model", WHISPER_MODEL);
-    form.append("response_format", "json");
+    // verbose_json gives us confidence/no-speech metadata when Groq exposes it.
+    form.append("response_format", "verbose_json");
     form.append("temperature", "0");
+
     const response = await fetch(GROQ_TRANSCRIBE_API, {
       method: "POST",
       headers: { Authorization: `Bearer ${GROQ_API_KEY}` },
       body: form,
     });
+
     const raw = await response.text();
     if (!response.ok) {
       console.error("Video Whisper:", response.status, raw);
-      return null;
+      return { text: null, reliable: false, meta: null };
     }
+
     const data = JSON.parse(raw);
-    return String(data?.text || "").trim() || null;
+    const text = String(data?.text || "").trim() || null;
+    const segments = Array.isArray(data?.segments) ? data.segments : [];
+
+    // Prefer real confidence metadata when available.
+    const noSpeechValues = segments
+      .map(x => Number(x?.no_speech_prob))
+      .filter(Number.isFinite);
+    const avgLogprobs = segments
+      .map(x => Number(x?.avg_logprob))
+      .filter(Number.isFinite);
+
+    const maxNoSpeech = noSpeechValues.length ? Math.max(...noSpeechValues) : null;
+    const avgLogprob = avgLogprobs.length
+      ? avgLogprobs.reduce((a, b) => a + b, 0) / avgLogprobs.length
+      : null;
+
+    let reliable = !!text;
+
+    if (maxNoSpeech != null && maxNoSpeech >= 0.75) reliable = false;
+    if (avgLogprob != null && avgLogprob < -1.2) reliable = false;
+
+    // Common hallucinations on silence/noise. Keep this conservative so a real
+    // short phrase such as "что это?" is NOT discarded just because it is short.
+    if (text && /^(?:thank you|thanks for watching|subscribe|you|hvað er það|adehi apalagi)[.!? ]*$/i.test(text)) {
+      reliable = false;
+    }
+
+    return {
+      text: reliable ? text : null,
+      reliable,
+      meta: { maxNoSpeech, avgLogprob, language: data?.language || null },
+    };
   } catch (error) {
     console.error("Video Whisper exception:", error);
-    return null;
+    return { text: null, reliable: false, meta: null };
   }
 }
 
@@ -2333,18 +2368,25 @@ async function extractVideoFrames(file, durationSeconds = 0) {
     console.error("FFmpeg binary missing:", ffmpegPath);
     return [];
   }
+
   const dir = await mkdtemp(path.join(os.tmpdir(), "ai-guide-video-"));
   try {
     const ext = path.extname(file.filePath || "") || ".mp4";
     const input = path.join(dir, `input${ext}`);
     await writeFile(input, file.buffer);
 
-    const duration = Number(durationSeconds) || 0;
+    const duration = Math.max(0, Number(durationSeconds) || 0);
     let times;
-    if (duration >= 3) {
-      times = [Math.max(0.2, duration * 0.15), duration * 0.5, Math.max(0.3, duration * 0.85)];
+
+    if (duration > 0) {
+      // Never request a frame at/after EOF. This was the source of the noisy
+      // ENOENT logs on very short Telegram circles.
+      const endSafe = Math.max(0.05, duration - 0.08);
+      times = [duration * 0.12, duration * 0.50, duration * 0.86]
+        .map(t => Math.min(endSafe, Math.max(0.03, t)));
+      times = [...new Set(times.map(t => t.toFixed(3)))].map(Number);
     } else {
-      times = [0.1, 0.8, 1.5];
+      times = [0.05, 0.5, 1.0];
     }
 
     const frames = [];
@@ -2353,22 +2395,28 @@ async function extractVideoFrames(file, durationSeconds = 0) {
       try {
         await execFileAsync(ffmpegPath, [
           "-hide_banner", "-loglevel", "error",
-          "-ss", String(times[i]), "-i", input,
+          "-i", input,
+          "-ss", String(times[i]),
           "-frames:v", "1",
           "-vf", "scale='min(720,iw)':-2",
           "-q:v", "4", "-y", output,
         ], { timeout: 15000 });
-        const buffer = await readFile(output);
-        if (buffer.length) {
+
+        // If FFmpeg did not create this particular frame, just skip it.
+        // One missing frame must not break the whole circle.
+        let buffer = null;
+        try { buffer = await readFile(output); } catch { buffer = null; }
+        if (buffer?.length) {
           frames.push({
             bytes: buffer.length,
             dataUrl: `data:image/jpeg;base64,${buffer.toString("base64")}`,
           });
         }
       } catch (e) {
-        console.error("Frame extraction:", i, e?.message || e);
+        console.warn("Frame skipped:", i, e?.message || e);
       }
     }
+
     return frames;
   } finally {
     await rm(dir, { recursive: true, force: true }).catch(() => {});
@@ -2378,13 +2426,15 @@ async function extractVideoFrames(file, durationSeconds = 0) {
 async function handleVideo({ chatId, userId, video, caption = "", kind = "видео" }) {
   const stop = startThinking(chatId);
   let stored = null;
+
   try {
-    // Save file_id BEFORE Vision. Even a 429 must not erase the video from memory.
     stored = await saveLastMedia(userId, {
       type: kind === "Telegram-кружок" ? "video_note" : "video",
       fileId: video.file_id,
       duration: Number(video.duration || 0),
-      description: "", transcript: "", caption: String(caption || "").slice(0, 1200),
+      description: "",
+      transcript: "",
+      caption: String(caption || "").slice(0, 1200),
     });
 
     const file = await getTelegramFile(video.file_id);
@@ -2394,70 +2444,168 @@ async function handleVideo({ chatId, userId, video, caption = "", kind = "вид
     }
 
     const language = await getConversationLanguage(userId, caption);
-    const [frames, rawTranscript] = await Promise.all([
+
+    // Frames + audio are independent. A Vision limit must never erase speech,
+    // and a silent circle must never invent speech from noise.
+    const [frames, speech] = await Promise.all([
       extractVideoFrames(file, video.duration || 0),
       transcribeVideoFile(file),
     ]);
 
-    const transcriptReliable = !isProbablyWhisperHallucination(rawTranscript, video.duration || 0);
-    const transcript = transcriptReliable ? rawTranscript : null;
+    const transcript = speech?.reliable ? speech.text : null;
+
+    await updateStoredMedia(userId, {
+      ...stored,
+      transcript: transcript || "",
+      speechChecked: true,
+      speechReliable: !!transcript,
+      speechMeta: speech?.meta || null,
+    });
 
     if (!frames.length) {
-      console.error("Video has no extracted frames; refusing audio-only visual analysis.");
-      await updateStoredMedia(userId, { ...stored, transcript: transcript || "" });
-      await sendMessage(chatId, "⚠️ Не удалось получить кадры из видео. Видео сохранено в памяти — можно попробовать спросить о нём позже.");
+      await sendMessage(
+        chatId,
+        transcript
+          ? `Не удалось получить кадры, но речь распознана: «${transcript}»`
+          : "⚠️ Не удалось получить кадры из кружка. Сам кружок сохранён — можно попробовать позже."
+      );
       return;
     }
 
     const userInstruction = String(caption || "").trim();
     const visualPrompt = `${languageInstruction(language)}
 Это ${kind}; переданы кадры из разных моментов в хронологическом порядке.
-${userInstruction ? `Вопрос: ${userInstruction}` : "Скажи конкретно, что видно и что происходит."}
-${transcript ? `Надёжно распознанная речь: ${transcript.slice(0, 2500)}` : "Надёжной речи не обнаружено. Не придумывай слова из шума."}
-Ответь кратко и конкретно: обычно 1–3 предложения. Не расписывай очевидные детали и не выдумывай движение, которого нельзя подтвердить кадрами.`;
+${userInstruction ? `Вопрос: ${userInstruction}` : "Коротко скажи, что видно и что происходит."}
+${transcript ? `Надёжно распознанная речь: ${transcript.slice(0, 1000)}` : "Надёжной речи не обнаружено. Не придумывай слова из шума."}
+Ответь кратко и конкретно, обычно 1–2 предложения. Не перечисляй очевидные детали без пользы.`;
 
     const answer = await askVisionAI({ images: frames, caption: visualPrompt, userId, language });
+
     await updateStoredMedia(userId, {
-      ...stored, description: isVisionFailure(answer) ? "" : answer,
-      transcript: transcript || "", caption: userInstruction.slice(0, 1200),
+      ...stored,
+      description: isVisionFailure(answer) ? "" : answer,
+      transcript: transcript || "",
+      speechChecked: true,
+      speechReliable: !!transcript,
+      speechMeta: speech?.meta || null,
+      caption: userInstruction.slice(0, 1200),
     });
 
     await saveExchange(userId, userInstruction || `[${kind}]`, answer);
     await sendMessage(chatId, answer);
   } catch (error) {
     console.error("Video handler:", error);
-    await sendMessage(chatId, "Не удалось обработать видео, но если файл успел сохраниться, я смогу попробовать открыть его позже.");
+    await sendMessage(chatId, "Не удалось обработать кружок, но он сохранён в мультимедиа-памяти.");
   } finally {
     stop();
   }
 }
 
 // ======================================================
-// MULTIMEDIA MEMORY V7.5.3
+// MULTIMEDIA MEMORY V7.5.4
 // Keeps the last photo/video/video-note file_id for 7 days.
 // A follow-up such as "какой бренд мышки?" re-opens the media
 // and asks Vision again instead of answering from general knowledge.
 // ======================================================
 
+function isMediaAudioQuestion(text) {
+  const t = String(text || "").trim().toLowerCase();
+  if (!t) return false;
+  return /(?:что\s*(?:там\s*)?(?:говорят|сказал|сказано)|что\s*(?:я|он|она|они)\s*(?:сказал|сказала|сказали)|что\s*(?:слышно|слышал)|есть\s*(?:ли\s*)?(?:звук|речь|голос)|говорят\s*(?:ли)?|слышно\s*(?:ли)?|аудио|звук|речь|голос)/i.test(t);
+}
+
+function isGeneralMediaDescriptionQuestion(text) {
+  const t = String(text || "").trim().toLowerCase();
+  if (!t) return false;
+  return /^(?:что\s*(?:там|на\s*(?:кружке|видео|фото)|видно)|что\s*на\s*кружке|что\s*на\s*видео|что\s*было\s*на\s*(?:кружке|видео)|опиши\s*(?:кружок|видео|фото))\??$/i.test(t);
+}
+
+async function getOrRefreshMediaTranscript(userId, media) {
+  if (!media || !["video", "video_note"].includes(media.type)) {
+    return { transcript: null, checked: false };
+  }
+
+  if (media.speechChecked) {
+    return { transcript: media.transcript || null, checked: true };
+  }
+
+  const file = await getTelegramFile(media.fileId);
+  if (!file) return { transcript: null, checked: false };
+
+  const speech = await transcribeVideoFile(file);
+  const transcript = speech?.reliable ? speech.text : null;
+
+  await updateStoredMedia(userId, {
+    ...media,
+    transcript: transcript || "",
+    speechChecked: true,
+    speechReliable: !!transcript,
+    speechMeta: speech?.meta || null,
+  });
+
+  return { transcript, checked: true };
+}
+
 async function tryHandleMediaFollowup({ chatId, userId, text }) {
   if (!looksLikeMediaFollowup(text)) return false;
+
   let stack = await getMediaStack(userId);
-  // Migration from V7.5.2: keep the previously saved single media usable.
   if (!stack.length) {
     const legacy = await getLastMedia(userId);
     if (legacy?.fileId) stack = [legacy];
   }
+
   const selected = pickMediaFromStack(stack, text);
   if (!selected.length) return false;
 
   const stop = startThinking(chatId);
   try {
     const language = await getConversationLanguage(userId, text);
+
+    // IMPORTANT: audio questions about circles do NOT call Vision.
+    if (isMediaAudioQuestion(text)) {
+      const answers = [];
+
+      for (let i = 0; i < selected.length; i++) {
+        const media = selected[i];
+        if (!["video", "video_note"].includes(media.type)) {
+          answers.push(selected.length > 1 ? `${i + 1}) У этого файла нет аудиодорожки.` : "У этого файла нет аудиодорожки.");
+          continue;
+        }
+
+        const { transcript, checked } = await getOrRefreshMediaTranscript(userId, media);
+        let answer;
+        if (!checked) answer = "Не удалось проверить звук в кружке.";
+        else if (transcript) answer = `Да: «${transcript}»`;
+        else answer = "Нет, разборчивой речи не слышно.";
+
+        answers.push(selected.length > 1 ? `${i + 1}) ${answer}` : answer);
+      }
+
+      const finalAnswer = answers.join("\n");
+      await saveExchange(userId, text, finalAnswer);
+      await sendMessage(chatId, finalAnswer);
+      return true;
+    }
+
+    // If user only asks what was on the circle and we already have a cached
+    // description, answer from memory and save a Qwen request.
+    if (selected.length === 1 && isGeneralMediaDescriptionQuestion(text)) {
+      const media = selected[0];
+      if (media.description) {
+        const answer = String(media.description).trim();
+        await saveExchange(userId, text, answer);
+        await sendMessage(chatId, answer);
+        return true;
+      }
+    }
+
     const answers = [];
 
     for (let i = 0; i < selected.length; i++) {
       const media = selected[i];
       let images = [];
+
       if (media.type === "photo") {
         const image = await getTelegramImageData(media.fileId);
         if (image) images = [image];
@@ -2467,19 +2615,26 @@ async function tryHandleMediaFollowup({ chatId, userId, text }) {
       }
 
       if (!images.length) {
-        answers.push(`Медиа ${i + 1}: не удалось повторно получить кадры.`);
+        answers.push(selected.length > 1 ? `${i + 1}) Не удалось получить кадры.` : "Не удалось получить кадры.");
         continue;
       }
 
       const prompt = `${languageInstruction(language)}
 Это повторный просмотр ${media.type === "photo" ? "фото" : media.type === "video_note" ? "Telegram-кружка" : "видео"}.
 Вопрос пользователя: ${text}
-${media.description ? `Что было известно раньше: ${String(media.description).slice(0, 1600)}` : "Предыдущий Vision-анализ не удался, поэтому внимательно проанализируй кадры сейчас."}
-${media.transcript ? `Ранее надёжно распознанная речь: ${String(media.transcript).slice(0, 1000)}` : "Надёжной речи нет."}
-Ответь ТОЛЬКО по вопросу. Коротко и конкретно, обычно 1–3 предложения. Если бренд/надпись/деталь не видна — так и скажи; не перечисляй варианты из общих знаний.`;
+${media.description ? `Ранее было известно: ${String(media.description).slice(0, 1200)}` : "Предыдущего описания нет."}
+Ответь только на вопрос, кратко и конкретно. Если нужная деталь (бренд, логотип, надпись) неразличима — прямо скажи это и не перечисляй варианты.`;
 
       const answer = await askVisionAI({ images, caption: prompt, userId, language });
-      if (!isVisionFailure(answer)) await updateStoredMedia(userId, { ...media, description: answer });
+
+      if (!isVisionFailure(answer)) {
+        // Do not overwrite a good general description with a narrow answer like
+        // "логотип не видно". Keep narrow details in dialogue only.
+        if (!media.description) {
+          await updateStoredMedia(userId, { ...media, description: answer });
+        }
+      }
+
       answers.push(selected.length > 1 ? `${i + 1}) ${answer}` : answer);
     }
 
@@ -2496,7 +2651,7 @@ ${media.transcript ? `Ранее надёжно распознанная реч�
 }
 
 // ======================================================
-// PLAIN EMOJI REACTIONS V7.5.3
+// PLAIN EMOJI REACTIONS V7.5.4
 // ======================================================
 
 function isEmojiOnlyText(text) {
@@ -2576,7 +2731,7 @@ export async function POST(
 ) {
   try {
     console.log(
-      "AI-GUIDE-V7.5.3"
+      "AI-GUIDE-V7.5.4"
     );
 
     const update =
@@ -2868,7 +3023,7 @@ export async function POST(
 
 
     // ==================================================
-    // VIDEO / VIDEO NOTE V7.5.2
+    // VIDEO / VIDEO NOTE V7.5.4
     // ==================================================
 
     if (message.video?.file_id) {
@@ -2952,7 +3107,7 @@ export async function GET() {
 
   return Response.json({
     version:
-      "AI-GUIDE-V7.5.3",
+      "AI-GUIDE-V7.5.4",
 
     status:
       "Bot is running",
