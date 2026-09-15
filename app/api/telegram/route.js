@@ -6,13 +6,13 @@ import path from "node:path";
 
 const execFileAsync = promisify(execFile);
 
-// V7.5.1: FFmpeg is copied during postinstall so Vercel always traces it.
+// V7.5.2: FFmpeg is copied during postinstall so Vercel always traces it.
 const ffmpegPath = path.join(process.cwd(), "ffmpeg-bin", "ffmpeg");
 
 export const runtime = "nodejs";
 
 // ======================================================
-// AI GUIDE V7.5.1
+// AI GUIDE V7.5.2
 //
 // Groq:
 // - Text: openai/gpt-oss-120b
@@ -113,6 +113,10 @@ function memoryKey(userId) {
 
 function memorySummaryKey(userId) {
   return `ai-guide:memory-summary:${userId}`;
+}
+
+function lastMediaKey(userId) {
+  return `ai-guide:last-media:${userId}`;
 }
 
 function albumKey(userId, mediaGroupId) {
@@ -227,6 +231,28 @@ async function updateLongMemory(userId, messages) {
 }
 
 
+async function saveLastMedia(userId, media) {
+  if (!media?.fileId || !media?.type) return;
+  const value = {
+    ...media,
+    savedAt: Date.now(),
+    description: String(media.description || "").slice(0, 6000),
+  };
+  await redisCommand(["SET", lastMediaKey(userId), JSON.stringify(value), "EX", "604800"]);
+}
+
+async function getLastMedia(userId) {
+  const raw = await redisCommand(["GET", lastMediaKey(userId)]);
+  if (!raw) return null;
+  try { return JSON.parse(raw); } catch { return null; }
+}
+
+function looksLikeMediaFollowup(text) {
+  const t = String(text || "").trim().toLowerCase();
+  if (!t) return false;
+  return /(?:видео|круж|фото|картин|изображ|кадр|там|тут|на н[её]м|на этом|мыш|клавиат|бренд|марка|логотип|модель|предмет|человек|что это|что за|кто это|покажи|посмотри|рассмотри|увелич|прочитай|надпис|цвет|слева|справа|фон|video|photo|brand|logo)/i.test(t);
+}
+
 function isTechnicalMemoryEntry(text) {
   const t = String(text || "").trim();
   return /^\[(?:стикер|анимированный стикер|видеостикер|custom emoji|gif-анимация|обычное видео|telegram-кружок)/i.test(t);
@@ -256,6 +282,7 @@ async function saveExchange(userId, userText, assistantText) {
 async function clearHistory(userId) {
   await redisCommand(["DEL", memoryKey(userId)]);
   await redisCommand(["DEL", memorySummaryKey(userId)]);
+  await redisCommand(["DEL", lastMediaKey(userId)]);
 }
 
 
@@ -1615,6 +1642,13 @@ async function handleSinglePhoto({
         language,
       });
 
+    await saveLastMedia(userId, {
+      type: "photo",
+      fileId,
+      description: answer,
+      caption: String(caption || "").slice(0, 1200),
+    });
+
     await saveExchange(
       userId,
       caption
@@ -2189,7 +2223,7 @@ ${visibleText || "(только emoji)"}
 
 
 // ======================================================
-// VIDEO V7.5.1
+// VIDEO V7.5.2
 // ======================================================
 
 function videoMimeType(filePath) {
@@ -2310,6 +2344,15 @@ async function handleVideo({ chatId, userId, video, caption = "", kind = "вид
       });
     }
 
+    await saveLastMedia(userId, {
+      type: kind === "Telegram-кружок" ? "video_note" : "video",
+      fileId: video.file_id,
+      duration: Number(video.duration || 0),
+      description: answer,
+      transcript: String(transcript || "").slice(0, 3000),
+      caption: userInstruction.slice(0, 1200),
+    });
+
     await saveExchange(
       userId,
       userInstruction || `[${kind}${transcript ? `; речь: ${transcript.slice(0, 1200)}` : ""}]`,
@@ -2325,7 +2368,49 @@ async function handleVideo({ chatId, userId, video, caption = "", kind = "вид
 }
 
 // ======================================================
-// PLAIN EMOJI REACTIONS V7.5.1
+// MULTIMEDIA MEMORY V7.5.2
+// Keeps the last photo/video/video-note file_id for 7 days.
+// A follow-up such as "какой бренд мышки?" re-opens the media
+// and asks Vision again instead of answering from general knowledge.
+// ======================================================
+
+async function tryHandleMediaFollowup({ chatId, userId, text }) {
+  if (!looksLikeMediaFollowup(text)) return false;
+  const media = await getLastMedia(userId);
+  if (!media?.fileId) return false;
+
+  const stop = startThinking(chatId);
+  try {
+    const language = await getConversationLanguage(userId, text);
+    let images = [];
+
+    if (media.type === "photo") {
+      const image = await getTelegramImageData(media.fileId);
+      if (image) images = [image];
+    } else if (media.type === "video" || media.type === "video_note") {
+      const file = await getTelegramFile(media.fileId);
+      if (file) images = await extractVideoFrames(file, Number(media.duration || 0));
+    }
+
+    if (!images.length) return false;
+
+    const prompt = `${languageInstruction(language)}\nПользователь задаёт уточняющий вопрос к НЕДАВНО присланному ${media.type === "photo" ? "фото" : media.type === "video_note" ? "Telegram-кружку" : "видео"}.\n\nВопрос: ${text}\n\nПредыдущий анализ этого медиа:\n${String(media.description || "(нет)").slice(0, 3500)}\n${media.transcript ? `\nРанее распознанная речь (может содержать ошибки):\n${String(media.transcript).slice(0, 1800)}` : ""}\n\nСейчас тебе снова переданы реальные кадры/изображение. Ответь ИМЕННО на новый вопрос по ним. Если пользователь спрашивает бренд, модель, логотип или мелкую деталь — внимательно рассмотри кадры. Не перечисляй популярные варианты из общих знаний. Если точную деталь нельзя уверенно прочитать/увидеть, прямо скажи, что определить её по этим кадрам нельзя.`;
+
+    const answer = await askVisionAI({ images, caption: prompt, userId, language });
+    await saveExchange(userId, text, answer);
+    await redisCommand(["SET", lastMediaKey(userId), JSON.stringify({ ...media, description: answer, savedAt: Date.now() }), "EX", "604800"]);
+    await sendMessage(chatId, answer);
+    return true;
+  } catch (error) {
+    console.error("Media followup:", error);
+    return false;
+  } finally {
+    stop();
+  }
+}
+
+// ======================================================
+// PLAIN EMOJI REACTIONS V7.5.2
 // ======================================================
 
 function isEmojiOnlyText(text) {
@@ -2356,6 +2441,8 @@ async function handleText({
     startThinking(chatId);
 
   try {
+    if (await tryHandleMediaFollowup({ chatId, userId, text })) return;
+
     const language =
       await getConversationLanguage(userId, text);
 
@@ -2403,7 +2490,7 @@ export async function POST(
 ) {
   try {
     console.log(
-      "AI-GUIDE-V7.5.1"
+      "AI-GUIDE-V7.5.2"
     );
 
     const update =
@@ -2695,7 +2782,7 @@ export async function POST(
 
 
     // ==================================================
-    // VIDEO / VIDEO NOTE V7.5.1
+    // VIDEO / VIDEO NOTE V7.5.2
     // ==================================================
 
     if (message.video?.file_id) {
@@ -2779,7 +2866,7 @@ export async function GET() {
 
   return Response.json({
     version:
-      "AI-GUIDE-V7.5.1",
+      "AI-GUIDE-V7.5.2",
 
     status:
       "Bot is running",
