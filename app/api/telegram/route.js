@@ -1,7 +1,7 @@
 export const runtime = "nodejs";
 
 // ======================================================
-// AI GUIDE V7
+// AI GUIDE V7.
 // Telegram + Groq + Tavily + Upstash
 //
 // Поддержка:
