@@ -12,7 +12,7 @@ const ffmpegPath = path.join(process.cwd(), "ffmpeg-bin", "ffmpeg");
 export const runtime = "nodejs";
 
 // ======================================================
-// AI GUIDE V7.6.2
+// AI GUIDE V7.6.3
 //
 // Groq:
 // - Text: openai/gpt-oss-120b
@@ -96,8 +96,8 @@ const VISION_MODEL =
 const GEMINI_VISION_MODEL =
   "gemini-3.8-flash";
 
-const GEMINI_OPENAI_CHAT_API =
-  "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions";
+const GEMINI_GENERATE_API =
+  `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_VISION_MODEL}:generateContent`;
 
 const WHISPER_MODEL =
   "whisper-large-v3-turbo";
@@ -1265,18 +1265,76 @@ async function requestGeminiVision({
   }
 
   try {
-    const response = await fetch(GEMINI_OPENAI_CHAT_API, {
+    // Use Google's native generateContent endpoint instead of the
+    // OpenAI-compatibility layer. This is the documented multimodal path.
+    const systemParts = [];
+    const contents = [];
+
+    for (const message of messages || []) {
+      if (!message) continue;
+
+      if (message.role === "system") {
+        const text = typeof message.content === "string"
+          ? message.content
+          : "";
+        if (text) systemParts.push({ text });
+        continue;
+      }
+
+      const parts = [];
+      const content = message.content;
+
+      if (typeof content === "string") {
+        if (content) parts.push({ text: content });
+      } else if (Array.isArray(content)) {
+        for (const item of content) {
+          if (!item) continue;
+          if (item.type === "text" && item.text) {
+            parts.push({ text: String(item.text) });
+            continue;
+          }
+          if (item.type === "image_url") {
+            const dataUrl = item?.image_url?.url || "";
+            const match = String(dataUrl).match(/^data:([^;]+);base64,(.+)$/s);
+            if (match) {
+              parts.push({
+                inlineData: {
+                  mimeType: match[1],
+                  data: match[2],
+                },
+              });
+            }
+          }
+        }
+      }
+
+      if (parts.length) {
+        contents.push({
+          role: message.role === "assistant" ? "model" : "user",
+          parts,
+        });
+      }
+    }
+
+    const body = {
+      contents,
+      generationConfig: {
+        temperature,
+        maxOutputTokens: maxTokens,
+      },
+    };
+
+    if (systemParts.length) {
+      body.systemInstruction = { parts: systemParts };
+    }
+
+    const response = await fetch(GEMINI_GENERATE_API, {
       method: "POST",
       headers: {
-        Authorization: `Bearer ${GEMINI_API_KEY}`,
+        "x-goog-api-key": GEMINI_API_KEY,
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({
-        model: GEMINI_VISION_MODEL,
-        messages,
-        temperature,
-        max_tokens: maxTokens,
-      }),
+      body: JSON.stringify(body),
     });
 
     const raw = await response.text();
@@ -1288,11 +1346,16 @@ async function requestGeminiVision({
     }
 
     const data = JSON.parse(raw);
+    const text = (data?.candidates?.[0]?.content?.parts || [])
+      .map(part => part?.text || "")
+      .join("")
+      .trim();
+
     return {
-      ok: true,
+      ok: !!text,
       status: 200,
-      error: null,
-      text: data?.choices?.[0]?.message?.content || null,
+      error: text ? null : "Gemini returned no text",
+      text: text || null,
     };
   } catch (error) {
     console.error("Gemini Vision exception:", error);
