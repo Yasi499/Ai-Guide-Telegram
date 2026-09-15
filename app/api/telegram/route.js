@@ -1,4 +1,3 @@
-import ffmpegPath from "ffmpeg-static";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
@@ -7,10 +6,13 @@ import path from "node:path";
 
 const execFileAsync = promisify(execFile);
 
+// V7.5.1: FFmpeg is copied during postinstall so Vercel always traces it.
+const ffmpegPath = path.join(process.cwd(), "ffmpeg-bin", "ffmpeg");
+
 export const runtime = "nodejs";
 
 // ======================================================
-// AI GUIDE V7.5
+// AI GUIDE V7.5.1
 //
 // Groq:
 // - Text: openai/gpt-oss-120b
@@ -225,8 +227,16 @@ async function updateLongMemory(userId, messages) {
 }
 
 
+function isTechnicalMemoryEntry(text) {
+  const t = String(text || "").trim();
+  return /^\[(?:стикер|анимированный стикер|видеостикер|custom emoji|gif-анимация|обычное видео|telegram-кружок)/i.test(t);
+}
+
 async function saveExchange(userId, userText, assistantText) {
   const history = await getHistory(userId);
+
+  // Media reactions should not pollute conversational/long-term memory.
+  if (isTechnicalMemoryEntry(userText)) return;
 
   history.push({ role: "user", content: String(userText).slice(0, 5000) });
   history.push({ role: "assistant", content: String(assistantText).slice(0, 5000) });
@@ -1553,6 +1563,21 @@ async function handleVoice({
 
 
 // ======================================================
+// VISION PHOTO SIZE V7.5.1
+// Prefer a Telegram-compressed size to reduce Groq request-too-large errors.
+// ======================================================
+
+function selectVisionPhoto(photos) {
+  if (!Array.isArray(photos) || !photos.length) return null;
+  const suitable = photos.filter(p => {
+    const pixels = Number(p.width || 0) * Number(p.height || 0);
+    const size = Number(p.file_size || 0);
+    return (!pixels || pixels <= 1600000) && (!size || size <= 700000);
+  });
+  return (suitable.length ? suitable[suitable.length - 1] : photos[Math.max(0, photos.length - 2)]) || photos[photos.length - 1];
+}
+
+// ======================================================
 // PHOTO
 // ======================================================
 
@@ -1628,10 +1653,7 @@ async function handleReplyToPhoto({
     return false;
   }
 
-  const photo =
-    reply.photo[
-      reply.photo.length - 1
-    ];
+  const photo = selectVisionPhoto(reply.photo);
 
   const stop =
     startThinking(chatId);
@@ -1916,7 +1938,7 @@ async function getConversationLanguage(userId, currentText = "") {
   if (/[а-яёіїєґ]/i.test(now)) return detectLanguage(now);
   const history = await getHistory(userId);
   const last = history.slice().reverse().find(x =>
-    x.role === "user" && /[а-яёіїєґ]/i.test(String(x.content || ""))
+    x.role === "user" && !String(x.content || "").startsWith("[") && /[а-яёіїєґ]/i.test(String(x.content || ""))
   );
   return last ? detectLanguage(last.content) : "ru";
 }
@@ -2119,26 +2141,11 @@ async function handleCustomEmoji({
     let answer;
 
     if (images.length) {
-      answer =
-        await askVisionAI({
-          images,
-
-          caption: `
-Пользователь отправил Telegram custom emoji.
-
-Текст сообщения:
-${visibleText || "(только emoji)"}
-
-Пойми эмоциональный смысл emoji
-и естественно отреагируй.
-
-Ответь коротко.
-Не описывай API Telegram.
-`,
-
-          userId,
-          language,
-        });
+      answer = await askStickerVisionAI({
+        image: images[0],
+        language,
+        kind: "custom emoji",
+      });
 
     } else {
       const emojis =
@@ -2167,12 +2174,7 @@ ${visibleText || "(только emoji)"}
         });
     }
 
-    await saveExchange(
-      userId,
-      `[Custom emoji] ${visibleText}`,
-      answer
-    );
-
+    // Custom emoji is a reaction, not a memory fact.
     await sendMessage(
       chatId,
       answer
@@ -2187,7 +2189,7 @@ ${visibleText || "(только emoji)"}
 
 
 // ======================================================
-// VIDEO V7.5
+// VIDEO V7.5.1
 // ======================================================
 
 function videoMimeType(filePath) {
@@ -2225,7 +2227,13 @@ async function transcribeVideoFile(file) {
 }
 
 async function extractVideoFrames(file, durationSeconds = 0) {
-  if (!file || !ffmpegPath) return [];
+  if (!file) return [];
+  try {
+    await readFile(ffmpegPath);
+  } catch {
+    console.error("FFmpeg binary missing:", ffmpegPath);
+    return [];
+  }
   const dir = await mkdtemp(path.join(os.tmpdir(), "ai-guide-video-"));
   try {
     const ext = path.extname(file.filePath || "") || ".mp4";
@@ -2248,7 +2256,7 @@ async function extractVideoFrames(file, durationSeconds = 0) {
           "-hide_banner", "-loglevel", "error",
           "-ss", String(times[i]), "-i", input,
           "-frames:v", "1",
-          "-vf", "scale='min(960,iw)':-2",
+          "-vf", "scale='min(720,iw)':-2",
           "-q:v", "4", "-y", output,
         ], { timeout: 15000 });
         const buffer = await readFile(output);
@@ -2283,8 +2291,9 @@ async function handleVideo({ chatId, userId, video, caption = "", kind = "вид
       transcribeVideoFile(file),
     ]);
 
-    if (!frames.length && !transcript) {
-      await sendMessage(chatId, "Не удалось разобрать это видео: не получилось получить ни кадры, ни речь.");
+    if (!frames.length) {
+      console.error("Video has no extracted frames; refusing audio-only visual analysis.");
+      await sendMessage(chatId, "⚠️ Не удалось получить кадры из видео. Я не буду угадывать содержание только по аудио. Проверь FFmpeg в логах Vercel.");
       return;
     }
 
@@ -2316,6 +2325,25 @@ async function handleVideo({ chatId, userId, video, caption = "", kind = "вид
 }
 
 // ======================================================
+// PLAIN EMOJI REACTIONS V7.5.1
+// ======================================================
+
+function isEmojiOnlyText(text) {
+  const t = String(text || "").trim();
+  if (!t || /[A-Za-zА-Яа-яЁёІіЇїЄєҐґ0-9]/.test(t)) return false;
+  return /[\p{Extended_Pictographic}]/u.test(t);
+}
+
+async function handlePlainEmoji({ chatId, userId, text }) {
+  const language = await getConversationLanguage(userId);
+  const answer = await askTextAI({
+    userId, language, webContext: null,
+    text: `${languageInstruction(language)}\nПользователь отправил только emoji: ${text}\nОтветь как живой собеседник очень коротко и уместно по контексту: обычно 1–6 слов или несколько emoji. Не начинай новый диалог, не пиши «Чем могу помочь?», «Let me know», «How can I help».`,
+  });
+  await sendMessage(chatId, answer);
+}
+
+// ======================================================
 // NORMAL TEXT
 // ======================================================
 
@@ -2329,7 +2357,7 @@ async function handleText({
 
   try {
     const language =
-      detectLanguage(text);
+      await getConversationLanguage(userId, text);
 
     let webContext = null;
 
@@ -2375,7 +2403,7 @@ export async function POST(
 ) {
   try {
     console.log(
-      "AI-GUIDE-V7.5"
+      "AI-GUIDE-V7.5.1"
     );
 
     const update =
@@ -2522,10 +2550,7 @@ export async function POST(
       Array.isArray(message.photo) &&
       message.photo.length
     ) {
-      const largest =
-        message.photo[
-          message.photo.length - 1
-        ];
+      const largest = selectVisionPhoto(message.photo);
 
       const caption =
         message.caption?.trim() ||
@@ -2607,6 +2632,15 @@ export async function POST(
 
 
     // ==================================================
+    // PLAIN EMOJI
+    // ==================================================
+
+    if (text && isEmojiOnlyText(text)) {
+      await handlePlainEmoji({ chatId, userId, text });
+      return Response.json({ ok: true });
+    }
+
+    // ==================================================
     // NORMAL TEXT
     // ==================================================
 
@@ -2661,7 +2695,7 @@ export async function POST(
 
 
     // ==================================================
-    // VIDEO / VIDEO NOTE V7.5
+    // VIDEO / VIDEO NOTE V7.5.1
     // ==================================================
 
     if (message.video?.file_id) {
@@ -2745,7 +2779,7 @@ export async function GET() {
 
   return Response.json({
     version:
-      "AI-GUIDE-V7.5",
+      "AI-GUIDE-V7.5.1",
 
     status:
       "Bot is running",
