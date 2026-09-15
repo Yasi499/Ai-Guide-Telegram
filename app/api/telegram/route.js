@@ -1,8 +1,22 @@
 export const runtime = "nodejs";
 
 // ======================================================
-// AI GUIDE V6.1
-// Telegram + OpenRouter + Tavily + Upstash Redis + Vision
+// AI GUIDE V7
+// Telegram + Groq + Tavily + Upstash
+//
+// Поддержка:
+// - текст
+// - 1 фото
+// - альбом до 5 фото
+// - голосовые
+// - audio
+// - статичные WEBP-стикеры
+// - "печатает..." во время ожидания
+// - постоянная память
+// - интернет через Tavily
+// - Telegram-safe математика
+//
+// OpenRouter НЕ используется.
 // ======================================================
 
 
@@ -10,14 +24,9 @@ export const runtime = "nodejs";
 // CONFIG
 // ======================================================
 
-const TELEGRAM_BOT_TOKEN =
-  process.env.TELEGRAM_BOT_TOKEN;
-
-const OPENROUTER_API_KEY =
-  process.env.OPENROUTER_API_KEY;
-
-const TAVILY_API_KEY =
-  process.env.TAVILY_API_KEY;
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+const GROQ_API_KEY = process.env.GROQ_API_KEY;
+const TAVILY_API_KEY = process.env.TAVILY_API_KEY;
 
 const UPSTASH_REDIS_REST_URL =
   process.env.UPSTASH_REDIS_REST_URL;
@@ -30,416 +39,284 @@ const ALLOWED_USER_ID =
     ? Number(process.env.TELEGRAM_ALLOWED_USER_ID)
     : null;
 
-
 const TELEGRAM_API =
   `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}`;
 
-const OPENROUTER_API =
-  "https://openrouter.ai/api/v1/chat/completions";
+const GROQ_CHAT_API =
+  "https://api.groq.com/openai/v1/chat/completions";
 
-const AI_MODEL =
-  "openrouter/free";
+const GROQ_TRANSCRIBE_API =
+  "https://api.groq.com/openai/v1/audio/transcriptions";
+
+const AI_MODEL = "qwen/qwen3.6-27b";
+const WHISPER_MODEL = "whisper-large-v3-turbo";
 
 const MAX_HISTORY_MESSAGES = 20;
+const MAX_IMAGES = 5;
+
+
+// ======================================================
+// SMALL HELPERS
+// ======================================================
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function memoryKey(userId) {
+  return `ai-guide:history:${userId}`;
+}
+
+function albumKey(userId, mediaGroupId) {
+  return `ai-guide:album:${userId}:${mediaGroupId}`;
+}
 
 
 // ======================================================
 // REDIS
 // ======================================================
 
-function memoryKey(userId) {
-  return `ai-guide:history:${userId}`;
-}
-
-
 async function redisCommand(command) {
-
-  if (
-    !UPSTASH_REDIS_REST_URL ||
-    !UPSTASH_REDIS_REST_TOKEN
-  ) {
-
-    console.error(
-      "❌ Redis not configured"
-    );
-
+  if (!UPSTASH_REDIS_REST_URL || !UPSTASH_REDIS_REST_TOKEN) {
+    console.error("Redis not configured");
     return null;
   }
 
-
   try {
+    const response = await fetch(UPSTASH_REDIS_REST_URL, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${UPSTASH_REDIS_REST_TOKEN}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(command),
+    });
 
-    const response =
-      await fetch(
-        UPSTASH_REDIS_REST_URL,
-        {
-          method: "POST",
-
-          headers: {
-
-            Authorization:
-              `Bearer ${UPSTASH_REDIS_REST_TOKEN}`,
-
-            "Content-Type":
-              "application/json",
-
-          },
-
-          body:
-            JSON.stringify(command),
-        }
-      );
-
-
-    const raw =
-      await response.text();
-
+    const raw = await response.text();
 
     if (!response.ok) {
-
-      console.error(
-        "❌ Redis:",
-        raw
-      );
-
+      console.error("Redis error:", raw);
       return null;
     }
 
-
-    const data =
-      JSON.parse(raw);
-
-
+    const data = JSON.parse(raw);
     return data.result;
-
   } catch (error) {
-
-    console.error(
-      "❌ Redis exception:",
-      error
-    );
-
+    console.error("Redis exception:", error);
     return null;
   }
 }
-
 
 async function getHistory(userId) {
+  const result = await redisCommand([
+    "GET",
+    memoryKey(userId),
+  ]);
 
-  const result =
-    await redisCommand([
-      "GET",
-      memoryKey(userId),
-    ]);
-
-
-  if (!result) {
-    return [];
-  }
-
+  if (!result) return [];
 
   try {
-
-    const history =
-      JSON.parse(result);
-
-
-    return Array.isArray(history)
-      ? history
-      : [];
-
+    const history = JSON.parse(result);
+    return Array.isArray(history) ? history : [];
   } catch {
-
     return [];
   }
 }
 
-
-async function saveHistory(
-  userId,
-  history
-) {
-
-  const trimmed =
-    history.slice(
-      -MAX_HISTORY_MESSAGES
-    );
-
+async function saveHistory(userId, history) {
+  const trimmed = history.slice(-MAX_HISTORY_MESSAGES);
 
   await redisCommand([
-
     "SET",
-
     memoryKey(userId),
-
     JSON.stringify(trimmed),
-
   ]);
 }
 
-
-async function addHistory(
-  userId,
-  role,
-  content
-) {
-
-  const history =
-    await getHistory(userId);
-
+async function saveExchange(userId, userText, assistantText) {
+  const history = await getHistory(userId);
 
   history.push({
-
-    role,
-
-    content:
-      String(content)
-        .slice(0, 5000),
-
-  });
-
-
-  await saveHistory(
-    userId,
-    history
-  );
-}
-
-
-async function saveExchange(
-  userId,
-  userText,
-  assistantText
-) {
-
-  const history =
-    await getHistory(userId);
-
-
-  history.push({
-
     role: "user",
-
-    content:
-      String(userText)
-        .slice(0, 5000),
-
+    content: String(userText).slice(0, 5000),
   });
-
 
   history.push({
-
     role: "assistant",
-
-    content:
-      String(assistantText)
-        .slice(0, 5000),
-
+    content: String(assistantText).slice(0, 5000),
   });
 
-
-  await saveHistory(
-    userId,
-    history
-  );
+  await saveHistory(userId, history);
 }
-
 
 async function clearHistory(userId) {
-
   await redisCommand([
-
     "DEL",
-
     memoryKey(userId),
-
   ]);
 }
 
 
 // ======================================================
-// TELEGRAM
+// TELEGRAM SEND MESSAGE
 // ======================================================
 
-async function sendMessage(
-  chatId,
-  text
-) {
-
+async function sendMessage(chatId, text) {
   if (!text) {
-
-    text =
-      "Не удалось получить ответ.";
-
+    text = "Не удалось получить ответ.";
   }
 
+  for (let i = 0; i < text.length; i += 4000) {
+    const part = text.slice(i, i + 4000);
 
-  for (
-    let i = 0;
-    i < text.length;
-    i += 4000
-  ) {
-
-    const part =
-      text.slice(
-        i,
-        i + 4000
-      );
-
-
-    const response =
-      await fetch(
-        `${TELEGRAM_API}/sendMessage`,
-        {
-
-          method: "POST",
-
-          headers: {
-
-            "Content-Type":
-              "application/json",
-
-          },
-
-          body:
-            JSON.stringify({
-
-              chat_id:
-                chatId,
-
-              text:
-                part,
-
-            }),
-
-        }
-      );
-
+    const response = await fetch(
+      `${TELEGRAM_API}/sendMessage`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          chat_id: chatId,
+          text: part,
+        }),
+      }
+    );
 
     if (!response.ok) {
-
       console.error(
-        "❌ Telegram:",
+        "Telegram sendMessage:",
         await response.text()
       );
-
     }
   }
 }
 
 
 // ======================================================
-// TELEGRAM PHOTO
+// "ПЕЧАТАЕТ..."
 // ======================================================
 
-async function getTelegramPhotoBase64(
-  fileId
-) {
-
+async function sendChatAction(chatId, action = "typing") {
   try {
+    await fetch(`${TELEGRAM_API}/sendChatAction`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        chat_id: chatId,
+        action,
+      }),
+    });
+  } catch (error) {
+    console.error("ChatAction:", error);
+  }
+}
 
-    // Получаем путь к фото
+function startThinking(chatId, action = "typing") {
+  let stopped = false;
 
-    const infoResponse =
-      await fetch(
-        `${TELEGRAM_API}/getFile?file_id=${encodeURIComponent(fileId)}`
-      );
+  const run = async () => {
+    while (!stopped) {
+      await sendChatAction(chatId, action);
+
+      // Telegram chat action живёт недолго,
+      // поэтому обновляем её.
+      await sleep(4000);
+    }
+  };
+
+  run().catch(console.error);
+
+  return () => {
+    stopped = true;
+  };
+}
 
 
-    const info =
-      await infoResponse.json();
+// ======================================================
+// TELEGRAM FILE
+// ======================================================
 
+async function getTelegramFile(fileId) {
+  try {
+    const response = await fetch(
+      `${TELEGRAM_API}/getFile?file_id=${encodeURIComponent(fileId)}`
+    );
 
-    if (
-      !info.ok ||
-      !info.result?.file_path
-    ) {
+    const data = await response.json();
 
+    if (!data.ok || !data.result?.file_path) {
+      console.error("Telegram getFile:", data);
+      return null;
+    }
+
+    const filePath = data.result.file_path;
+
+    const fileResponse = await fetch(
+      `https://api.telegram.org/file/bot${TELEGRAM_BOT_TOKEN}/${filePath}`
+    );
+
+    if (!fileResponse.ok) {
       console.error(
-        "❌ Telegram getFile:",
-        info
+        "Telegram file download:",
+        fileResponse.status
       );
 
       return null;
     }
-
-
-    const filePath =
-      info.result.file_path;
-
-
-    // Скачиваем фото
-
-    const imageResponse =
-      await fetch(
-
-        `https://api.telegram.org/file/bot${TELEGRAM_BOT_TOKEN}/${filePath}`
-
-      );
-
-
-    if (!imageResponse.ok) {
-
-      console.error(
-        "❌ Photo download:",
-        imageResponse.status
-      );
-
-      return null;
-    }
-
 
     const arrayBuffer =
-      await imageResponse.arrayBuffer();
+      await fileResponse.arrayBuffer();
 
-
-    const base64 =
-      Buffer
-        .from(arrayBuffer)
-        .toString("base64");
-
-
-    let mimeType =
-      "image/jpeg";
-
-
-    if (
-      filePath
-        .toLowerCase()
-        .endsWith(".png")
-    ) {
-
-      mimeType =
-        "image/png";
-
-    }
-
-
-    if (
-      filePath
-        .toLowerCase()
-        .endsWith(".webp")
-    ) {
-
-      mimeType =
-        "image/webp";
-
-    }
-
-
-    return (
-      `data:${mimeType};base64,${base64}`
-    );
-
+    return {
+      buffer: Buffer.from(arrayBuffer),
+      filePath,
+    };
   } catch (error) {
-
-    console.error(
-      "❌ Photo exception:",
-      error
-    );
-
+    console.error("Telegram file exception:", error);
     return null;
   }
+}
+
+
+// ======================================================
+// IMAGE -> DATA URL
+// ======================================================
+
+function imageMimeType(filePath) {
+  const lower = String(filePath).toLowerCase();
+
+  if (lower.endsWith(".png")) {
+    return "image/png";
+  }
+
+  if (lower.endsWith(".webp")) {
+    return "image/webp";
+  }
+
+  if (lower.endsWith(".gif")) {
+    return "image/gif";
+  }
+
+  return "image/jpeg";
+}
+
+async function getTelegramImageData(fileId) {
+  const file = await getTelegramFile(fileId);
+
+  if (!file) return null;
+
+  const mimeType =
+    imageMimeType(file.filePath);
+
+  const base64 =
+    file.buffer.toString("base64");
+
+  return (
+    `data:${mimeType};base64,${base64}`
+  );
 }
 
 
@@ -448,236 +325,97 @@ async function getTelegramPhotoBase64(
 // ======================================================
 
 function detectLanguage(text) {
-
   const source =
-    text || "";
+    String(text || "").trim();
 
-  const t =
+  const lower =
     source.toLowerCase();
 
+  if (!source) {
+    return "ru";
+  }
 
   if (
     /[іїєґ]/i.test(source) ||
-
-    /\b(що|цей|ця|зараз|сьогодні|поясни|виконай|зроби|скороти|новини|свіжі|останні)\b/i.test(t)
+    /\b(що|цей|ця|зараз|сьогодні|поясни|виконай|зроби|скороти|новини|свіжі|останні)\b/i.test(lower)
   ) {
-
     return "uk";
-
   }
 
-
-  if (
-    /[а-яё]/i.test(source)
-  ) {
-
+  if (/[а-яё]/i.test(source)) {
     return "ru";
-
   }
 
-
-  if (source.trim()) {
-
-    return "en";
-
-  }
-
-
-  // Фото без подписи
-
-  return "ru";
+  return "en";
 }
 
-
 function languageInstruction(language) {
-
   if (language === "uk") {
-
-    return `
-Відповідай українською мовою.
-Пиши природно та зрозуміло.
-`;
-
+    return "Відповідай українською мовою.";
   }
-
 
   if (language === "en") {
-
-    return `
-Answer in English.
-Write naturally and clearly.
-`;
-
+    return "Answer in English.";
   }
 
-
-  return `
-Отвечай на русском языке.
-Пиши естественно и понятно.
-`;
+  return "Отвечай на русском языке.";
 }
 
 
 // ======================================================
-// TELEGRAM FORMAT RULES
+// TELEGRAM MATH
 // ======================================================
 
 function telegramFormattingRules() {
-
   return `
+ВАЖНО ДЛЯ TELEGRAM:
 
-========================================
-ВАЖНО: ФОРМАТ TELEGRAM
-========================================
+Telegram здесь показывает обычный текст.
+Не используй LaTeX.
 
-Ответ будет показан как обычный текст
-в Telegram.
-
-Telegram в этом боте НЕ рендерит LaTeX.
-
-НИКОГДА не используй LaTeX-команды:
-
+НИКОГДА не используй:
 \\[
 \\]
-
 \\(
 \\)
-
 \\frac
-
 \\cdot
-
 \\times
-
 \\text
-
 \\mathrm
-
-\\sqrt
-
 \\begin
-
 \\end
-
 \\boxed
 
-^{}
+Не используй $...$ или $$...$$.
 
-_{}
-
-Не оборачивай формулы в $ или $$.
-
-Не пиши математические формулы
-в формате LaTeX.
-
-Пиши их обычными читаемыми символами.
-
-
-ПРАВИЛЬНО:
+Пиши:
 
 5,4 · 10⁴
-
-5 · 10⁶
-
 1,02 · 10⁻²
-
 R = U / I
-
-S = a²
-
 Q = I² · R · t
-
 h = √(m · n)
-
 x = (-b ± √D) / (2a)
 
+Используй:
+· или × для умножения
+/ или : для деления
+√ для корня
+² ³ ⁴ и Unicode-степени, когда возможно.
 
-НЕПРАВИЛЬНО:
-
-5{,}4\\cdot10^4
-
-\\frac{U}{I}
-
-I^2R
-
-\\sqrt{mn}
-
-\\text{Ом}
-
-
-Для умножения используй:
-
-·
-
-или
-
-×
-
-Для деления:
-
-/
-
-или
-
-:
-
-Для корня:
-
-√
-
-Для степеней по возможности используй:
-
-²
-³
-⁴
-⁵
-⁶
-⁷
-⁸
-⁹
-
-Для степени 10 используй:
-
-10⁻⁵
-10⁻³
-10²
-10⁴
-10⁸
-10⁹
-
-Если Unicode-степень неудобна,
-можно написать:
-
-10^12
-
-Но НЕ используй LaTeX.
-
-Единицы измерения пиши нормально:
-
-Ом
-В
-А
-Вт
-Дж
-Кл
-м
-см
-кг
-°C
-
+Ответ должен нормально читаться
+прямо в Telegram.
 `;
 }
 
 
 // ======================================================
-// CLEAN TELEGRAM OUTPUT
-// Дополнительная защита от LaTeX
+// CLEAN RESPONSE
 // ======================================================
 
 function superscriptNumber(value) {
-
   const map = {
-
     "0": "⁰",
     "1": "¹",
     "2": "²",
@@ -688,394 +426,199 @@ function superscriptNumber(value) {
     "7": "⁷",
     "8": "⁸",
     "9": "⁹",
-
     "-": "⁻",
     "+": "⁺",
-
   };
-
 
   return String(value)
     .split("")
-    .map(
-      (char) =>
-        map[char] || char
-    )
+    .map((char) => map[char] || char)
     .join("");
 }
 
+function subscriptNumber(value) {
+  const map = {
+    "0": "₀",
+    "1": "₁",
+    "2": "₂",
+    "3": "₃",
+    "4": "₄",
+    "5": "₅",
+    "6": "₆",
+    "7": "₇",
+    "8": "₈",
+    "9": "₉",
+    "-": "₋",
+    "+": "₊",
+  };
 
-function cleanTelegramMath(text) {
+  return String(value)
+    .split("")
+    .map((char) => map[char] || char)
+    .join("");
+}
 
-  if (!text) {
-    return "";
+function cleanAIResponse(text) {
+  if (!text) return "";
+
+  let result = String(text);
+
+  result = result.replace(
+    /<\|tool_call_start\|>[\s\S]*?<\|tool_call_end\|>/gi,
+    ""
+  );
+
+  result = result.replace(
+    /<\|tool_call_start\|>[\s\S]*$/gi,
+    ""
+  );
+
+  result = result.replace(
+    /<\|tool_call_end\|>/gi,
+    ""
+  );
+
+  result = result.replace(
+    /<\|tool_call[^>]*\|>/gi,
+    ""
+  );
+
+  result = result.replace(
+    /^\s*User Safety\s*:\s*safe\s*$/gim,
+    ""
+  );
+
+  result = result.replace(
+    /^\s*Response Safety\s*:\s*safe\s*$/gim,
+    ""
+  );
+
+  result = result.replace(
+    /^\s*Safety\s*:\s*safe\s*$/gim,
+    ""
+  );
+
+  // LaTeX wrappers
+
+  result = result
+    .replace(/\\\[/g, "")
+    .replace(/\\\]/g, "")
+    .replace(/\\\(/g, "")
+    .replace(/\\\)/g, "")
+    .replace(/\$\$/g, "");
+
+  // LaTeX operators
+
+  result = result
+    .replace(/\\cdot/g, "·")
+    .replace(/\\times/g, "×")
+    .replace(/\\div/g, "÷")
+    .replace(/\\pm/g, "±")
+    .replace(/\\approx/g, "≈")
+    .replace(/\\neq/g, "≠")
+    .replace(/\\leq/g, "≤")
+    .replace(/\\geq/g, "≥")
+    .replace(/\\alpha/g, "α")
+    .replace(/\\beta/g, "β")
+    .replace(/\\gamma/g, "γ")
+    .replace(/\\Delta/g, "Δ")
+    .replace(/\\pi/g, "π")
+    .replace(/\\Omega/g, "Ω");
+
+  // Text commands
+
+  result = result.replace(
+    /\\text\{([^{}]*)\}/g,
+    "$1"
+  );
+
+  result = result.replace(
+    /\\mathrm\{([^{}]*)\}/g,
+    "$1"
+  );
+
+  // Square roots
+
+  result = result.replace(
+    /\\sqrt\{([^{}]*)\}/g,
+    "√($1)"
+  );
+
+  // Simple fractions
+
+  for (let i = 0; i < 5; i++) {
+    result = result.replace(
+      /\\frac\{([^{}]+)\}\{([^{}]+)\}/g,
+      "($1) / ($2)"
+    );
   }
 
-
-  let result =
-    String(text);
-
-
-  // ==========================================
-  // МУСОР OPENROUTER
-  // ==========================================
-
-  result =
-    result.replace(
-      /<\|tool_call_start\|>[\s\S]*?<\|tool_call_end\|>/gi,
-      ""
-    );
-
-
-  result =
-    result.replace(
-      /<\|tool_call_start\|>[\s\S]*$/gi,
-      ""
-    );
-
-
-  result =
-    result.replace(
-      /<\|tool_call_end\|>/gi,
-      ""
-    );
-
-
-  result =
-    result.replace(
-      /<\|tool_call[^>]*\|>/gi,
-      ""
-    );
-
-
-  result =
-    result.replace(
-      /^\s*User Safety\s*:\s*safe\s*$/gim,
-      ""
-    );
-
-
-  result =
-    result.replace(
-      /^\s*Response Safety\s*:\s*safe\s*$/gim,
-      ""
-    );
-
-
-  result =
-    result.replace(
-      /^\s*Safety\s*:\s*safe\s*$/gim,
-      ""
-    );
-
-
-  result =
-    result.replace(
-      /^\s*google\s*\([^\n]*\)\s*$/gim,
-      ""
-    );
-
-
-  // ==========================================
-  // LATEX WRAPPERS
-  // ==========================================
-
-  result =
-    result.replace(
-      /\\\[/g,
-      ""
-    );
-
-
-  result =
-    result.replace(
-      /\\\]/g,
-      ""
-    );
-
-
-  result =
-    result.replace(
-      /\\\(/g,
-      ""
-    );
-
-
-  result =
-    result.replace(
-      /\\\)/g,
-      ""
-    );
-
-
-  result =
-    result.replace(
-      /\$\$/g,
-      ""
-    );
-
-
-  // ==========================================
-  // ПРОСТЫЕ LATEX-КОМАНДЫ
-  // ==========================================
-
-  result =
-    result.replace(
-      /\\cdot/g,
-      "·"
-    );
-
-
-  result =
-    result.replace(
-      /\\times/g,
-      "×"
-    );
-
-
-  result =
-    result.replace(
-      /\\div/g,
-      "÷"
-    );
-
-
-  result =
-    result.replace(
-      /\\pm/g,
-      "±"
-    );
-
-
-  result =
-    result.replace(
-      /\\approx/g,
-      "≈"
-    );
-
-
-  result =
-    result.replace(
-      /\\neq/g,
-      "≠"
-    );
-
-
-  result =
-    result.replace(
-      /\\leq/g,
-      "≤"
-    );
-
-
-  result =
-    result.replace(
-      /\\geq/g,
-      "≥"
-    );
-
-
-  result =
-    result.replace(
-      /\\alpha/g,
-      "α"
-    );
-
-
-  result =
-    result.replace(
-      /\\beta/g,
-      "β"
-    );
-
-
-  result =
-    result.replace(
-      /\\gamma/g,
-      "γ"
-    );
-
-
-  result =
-    result.replace(
-      /\\Delta/g,
-      "Δ"
-    );
-
-
-  result =
-    result.replace(
-      /\\pi/g,
-      "π"
-    );
-
-
-  // ==========================================
-  // \text{...}
-  // ==========================================
-
-  result =
-    result.replace(
-      /\\text\{([^{}]*)\}/g,
-      "$1"
-    );
-
-
-  result =
-    result.replace(
-      /\\mathrm\{([^{}]*)\}/g,
-      "$1"
-    );
-
-
-  // ==========================================
-  // \sqrt{...}
-  // ==========================================
-
-  result =
-    result.replace(
-      /\\sqrt\{([^{}]*)\}/g,
-      "√($1)"
-    );
-
-
-  // ==========================================
-  // \frac{a}{b}
-  // Простые дроби
-  // ==========================================
-
-  for (
-    let i = 0;
-    i < 5;
-    i++
-  ) {
-
-    result =
-      result.replace(
-        /\\frac\{([^{}]+)\}\{([^{}]+)\}/g,
-        "($1) / ($2)"
-      );
-
-  }
-
-
-  // ==========================================
-  // 10^{4} -> 10⁴
-  // ==========================================
-
-  result =
-    result.replace(
-      /10\^\{([+\-]?\d+)\}/g,
-      (_, power) =>
-        "10" +
-        superscriptNumber(power)
-    );
-
-
-  result =
-    result.replace(
-      /10\^([+\-]?\d+)/g,
-      (_, power) =>
-        "10" +
-        superscriptNumber(power)
-    );
-
-
-  // ==========================================
-  // x^{2} -> x²
-  // ==========================================
-
-  result =
-    result.replace(
-      /([A-Za-zА-Яа-яІіЇїЄєҐґ0-9)])\^\{([+\-]?\d+)\}/g,
-      (_, base, power) =>
-        base +
-        superscriptNumber(power)
-    );
-
-
-  // ==========================================
-  // Убираем {,} из LaTeX
-  // 5{,}4 -> 5,4
-  // ==========================================
-
-  result =
-    result.replace(
-      /\{,\}/g,
-      ","
-    );
-
-
-  // ==========================================
-  // Простые нижние индексы:
-  // R_{0} -> R₀
-  // ==========================================
-
-  result =
-    result.replace(
-      /_\{(\d+)\}/g,
-      (_, number) =>
-        superscriptNumber(number)
-    );
-
-
-  // ==========================================
-  // Остатки команд
-  // ==========================================
-
-  result =
-    result.replace(
-      /\\,/g,
-      " "
-    );
-
-
-  result =
-    result.replace(
-      /\\;/g,
-      " "
-    );
-
-
-  result =
-    result.replace(
-      /\\!/g,
-      ""
-    );
-
-
-  // ==========================================
-  // Пустые строки
-  // ==========================================
-
-  result =
-    result.replace(
-      /\n{3,}/g,
-      "\n\n"
-    );
-
+  // Decimal comma from LaTeX
+
+  result = result.replace(
+    /\{,\}/g,
+    ","
+  );
+
+  // Powers
+
+  result = result.replace(
+    /10\^\{([+\-]?\d+)\}/g,
+    (_, power) =>
+      "10" + superscriptNumber(power)
+  );
+
+  result = result.replace(
+    /10\^([+\-]?\d+)/g,
+    (_, power) =>
+      "10" + superscriptNumber(power)
+  );
+
+  result = result.replace(
+    /([A-Za-zА-Яа-яІіЇїЄєҐґ0-9])\^\{([+\-]?\d+)\}/g,
+    (_, base, power) =>
+      base + superscriptNumber(power)
+  );
+
+  // Subscripts
+
+  result = result.replace(
+    /_\{([+\-]?\d+)\}/g,
+    (_, number) =>
+      subscriptNumber(number)
+  );
+
+  result = result.replace(
+    /_([0-9])/g,
+    (_, number) =>
+      subscriptNumber(number)
+  );
+
+  result = result
+    .replace(/\\,/g, " ")
+    .replace(/\\;/g, " ")
+    .replace(/\\!/g, "");
+
+  result = result.replace(
+    /\n{3,}/g,
+    "\n\n"
+  );
 
   return result.trim();
 }
 
 
 // ======================================================
-// INTERNET
+// INTERNET DETECTION
 // ======================================================
 
 function needsInternet(text) {
-
-  if (!text) {
-    return false;
-  }
-
+  if (!text) return false;
 
   const t =
     text.toLowerCase();
 
-
   const triggers = [
-
     "сейчас",
     "сегодня",
     "вчера",
@@ -1084,20 +627,14 @@ function needsInternet(text) {
     "актуаль",
     "последн",
     "недавно",
-
     "новости",
     "что нового",
-    "что там с",
-    "что там по",
     "что произошло",
     "что случилось",
-
     "погода",
     "температура",
     "дождь",
     "снег",
-    "ветер",
-
     "курс",
     "доллар",
     "долара",
@@ -1106,32 +643,21 @@ function needsInternet(text) {
     "usd",
     "uah",
     "eur",
-
     "цена",
     "сколько стоит",
-
     "обновление",
     "обнова",
     "патч",
-    "вышел",
-    "вышла",
-    "вышло",
-    "выйдет",
     "релиз",
-
     "утечк",
     "слив",
-    "сливал",
-    "слили",
     "инсайдер",
-    "инсайд",
 
     "зараз",
     "сьогодні",
     "свіж",
     "останні",
     "новини",
-    "що нового",
     "ціна",
     "скільки коштує",
     "оновлення",
@@ -1139,7 +665,6 @@ function needsInternet(text) {
 
     "today",
     "current",
-    "currently",
     "latest",
     "recent",
     "news",
@@ -1148,9 +673,7 @@ function needsInternet(text) {
     "update",
     "release",
     "leak",
-
   ];
-
 
   return triggers.some(
     (trigger) =>
@@ -1160,61 +683,40 @@ function needsInternet(text) {
 
 
 // ======================================================
-// FOLLOW UP
+// CONTEXT FOLLOW-UP
 // ======================================================
 
 function isContextFollowUp(text) {
-
-  if (!text) {
-    return false;
-  }
-
+  if (!text) return false;
 
   const t =
-    text
-      .toLowerCase()
-      .trim();
-
+    text.toLowerCase().trim();
 
   const patterns = [
-
     "по этому",
     "про это",
     "об этом",
-    "по этому делу",
-
     "про него",
     "про неё",
     "про них",
-
     "а сейчас",
     "а сегодня",
-
-    "а что сейчас",
     "а что нового",
-
     "дай свеж",
-    "свежие новости",
-
     "подробнее",
-    "поподробнее",
-
     "что с ним",
     "что с ней",
 
     "про це",
     "по цьому",
     "про нього",
-
     "що нового",
     "свіжі новини",
 
     "about it",
     "about this",
     "latest on this",
-
   ];
-
 
   return patterns.some(
     (pattern) =>
@@ -1222,37 +724,23 @@ function isContextFollowUp(text) {
   );
 }
 
-
-// ======================================================
-// CONVERSATION CONTEXT
-// ======================================================
-
-async function getConversationContext(
-  userId
-) {
-
+async function getConversationContext(userId) {
   const history =
     await getHistory(userId);
 
-
   return history
     .slice(-8)
-    .map(
-      (item) => {
+    .map((item) => {
+      const speaker =
+        item.role === "user"
+          ? "User"
+          : "Assistant";
 
-        const speaker =
-          item.role === "user"
-            ? "User"
-            : "Assistant";
-
-
-        return (
-          `${speaker}: ` +
-          `${String(item.content).slice(0, 1200)}`
-        );
-
-      }
-    )
+      return (
+        `${speaker}: ` +
+        String(item.content).slice(0, 1200)
+      );
+    })
     .join("\n");
 }
 
@@ -1266,110 +754,56 @@ async function buildSearchQuery(
   userId,
   language
 ) {
-
   const t =
     text.toLowerCase();
 
-
   const genericDollar =
-
-    t.includes(
-      "курс доллара"
-    ) ||
-
-    t.includes(
-      "курс долара"
-    );
-
+    t.includes("курс доллара") ||
+    t.includes("курс долара");
 
   const anotherCurrency =
-
     t.includes("руб") ||
-
     t.includes("rub") ||
-
     t.includes("евро") ||
-
     t.includes("eur") ||
-
     t.includes("злот") ||
-
-    t.includes("pln") ||
-
-    t.includes("тенге");
-
+    t.includes("pln");
 
   if (
     genericDollar &&
     !anotherCurrency
   ) {
-
     if (language === "uk") {
-
       return (
         "актуальний курс долара США " +
-        "до української гривні " +
-        "USD UAH сьогодні Україна"
+        "до української гривні USD UAH сьогодні Україна"
       );
-
     }
-
 
     return (
       "актуальный курс доллара США " +
-      "к украинской гривне " +
-      "USD UAH сегодня Украина"
+      "к украинской гривне USD UAH сегодня Украина"
     );
   }
 
-
-  if (
-    isContextFollowUp(text)
-  ) {
-
+  if (isContextFollowUp(text)) {
     const context =
-      await getConversationContext(
-        userId
-      );
-
+      await getConversationContext(userId);
 
     if (context) {
-
       return `
-
-Найди самую свежую информацию
-по теме разговора.
+Найди свежую информацию по теме разговора.
 
 КОНТЕКСТ:
-
 ${context}
 
-ТЕКУЩИЙ ВОПРОС:
-
+ВОПРОС:
 ${text}
 
-Определи конкретную тему
-из предыдущих сообщений.
-
-Особенно учитывай:
-
-имена,
-названия,
-игры,
-компании,
-события,
-даты,
-утечки,
-новости.
-
-Не ищи только короткую фразу
-из текущего сообщения.
-
+Определи конкретную тему из контекста.
 `.trim();
-
     }
   }
-
 
   return text;
 }
@@ -1380,86 +814,46 @@ ${text}
 // ======================================================
 
 async function searchWeb(query) {
-
   if (!TAVILY_API_KEY) {
-
-    console.error(
-      "❌ Tavily not configured"
-    );
-
+    console.error("Tavily not configured");
     return null;
   }
 
-
   try {
+    const response = await fetch(
+      "https://api.tavily.com/search",
+      {
+        method: "POST",
+        headers: {
+          "Content-Type":
+            "application/json",
 
-    console.log(
-      "🌐 Tavily:",
-      query.slice(0, 1500)
+          Authorization:
+            `Bearer ${TAVILY_API_KEY}`,
+        },
+
+        body: JSON.stringify({
+          query,
+          search_depth: "basic",
+          max_results: 7,
+          include_answer: true,
+          include_raw_content: false,
+        }),
+      }
     );
-
-
-    const response =
-      await fetch(
-        "https://api.tavily.com/search",
-        {
-
-          method: "POST",
-
-          headers: {
-
-            "Content-Type":
-              "application/json",
-
-            Authorization:
-              `Bearer ${TAVILY_API_KEY}`,
-
-          },
-
-          body:
-            JSON.stringify({
-
-              query,
-
-              search_depth:
-                "basic",
-
-              max_results:
-                7,
-
-              include_answer:
-                true,
-
-              include_raw_content:
-                false,
-
-            }),
-
-        }
-      );
-
 
     const raw =
       await response.text();
 
-
     if (!response.ok) {
-
-      console.error(
-        "❌ Tavily:",
-        raw
-      );
-
+      console.error("Tavily:", raw);
       return null;
     }
 
-
     return JSON.parse(raw);
-
   } catch (error) {
-
     console.error(
-      "❌ Tavily exception:",
+      "Tavily exception:",
       error
     );
 
@@ -1467,49 +861,21 @@ async function searchWeb(query) {
   }
 }
 
-
-// ======================================================
-// WEB CONTEXT
-// ======================================================
-
 function makeWebContext(data) {
-
-  if (!data) {
-    return null;
-  }
-
+  if (!data) return null;
 
   let result = "";
 
-
   if (data.answer) {
-
-    result += `
-
-SEARCH SUMMARY:
-
-${data.answer}
-
-`;
-
+    result +=
+      `SEARCH SUMMARY:\n${data.answer}\n\n`;
   }
 
-
-  if (
-    Array.isArray(
-      data.results
-    )
-  ) {
-
-    result +=
-      data.results
-        .slice(0, 7)
-        .map(
-          (
-            item,
-            index
-          ) => `
-
+  if (Array.isArray(data.results)) {
+    result += data.results
+      .slice(0, 7)
+      .map(
+        (item, index) => `
 RESULT ${index + 1}
 
 TITLE:
@@ -1520,115 +886,86 @@ ${item.content || "Unknown"}
 
 URL:
 ${item.url || "Unknown"}
-
 `
-        )
-        .join("\n");
-
+      )
+      .join("\n");
   }
 
-
-  return (
-    result.trim() ||
-    null
-  );
+  return result.trim() || null;
 }
 
 
 // ======================================================
-// OPENROUTER
+// GROQ CHAT / VISION
 // ======================================================
 
-async function requestOpenRouter(
+async function requestGroq(
   messages,
   options = {}
 ) {
-
-  if (!OPENROUTER_API_KEY) {
+  if (!GROQ_API_KEY) {
+    console.error("GROQ_API_KEY missing");
     return null;
   }
 
-
   try {
+    const response = await fetch(
+      GROQ_CHAT_API,
+      {
+        method: "POST",
 
-    const response =
-      await fetch(
-        OPENROUTER_API,
-        {
+        headers: {
+          "Content-Type":
+            "application/json",
 
-          method: "POST",
+          Authorization:
+            `Bearer ${GROQ_API_KEY}`,
+        },
 
-          headers: {
+        body: JSON.stringify({
+          model: AI_MODEL,
+          messages,
 
-            "Content-Type":
-              "application/json",
+          temperature:
+            options.temperature ?? 0.4,
 
-            Authorization:
-              `Bearer ${OPENROUTER_API_KEY}`,
+          max_completion_tokens:
+            options.maxTokens ?? 1800,
 
-            "X-Title":
-              "AI Guide Telegram Bot",
-
-          },
-
-          body:
-            JSON.stringify({
-
-              model:
-                AI_MODEL,
-
-              messages,
-
-              temperature:
-                options.temperature ?? 0.45,
-
-              max_tokens:
-                options.maxTokens ?? 1800,
-
-            }),
-
-        }
-      );
-
+          // Не позволяем модели самой
+          // вызывать инструменты.
+          tool_choice: "none",
+        }),
+      }
+    );
 
     const raw =
       await response.text();
 
-
     console.log(
-      "🤖 OpenRouter:",
+      "Groq:",
       response.status
     );
 
-
     if (!response.ok) {
-
       console.error(
-        "❌ OpenRouter:",
+        "Groq error:",
         raw
       );
 
       return null;
     }
 
-
     const data =
       JSON.parse(raw);
 
-
     return (
-      data
-        ?.choices
-        ?.[0]
-        ?.message
-        ?.content ||
+      data?.choices?.[0]?.message?.content ||
       null
     );
-
   } catch (error) {
-
     console.error(
-      "❌ OpenRouter exception:",
+      "Groq exception:",
       error
     );
 
@@ -1638,582 +975,851 @@ async function requestOpenRouter(
 
 
 // ======================================================
-// NORMAL AI
+// SYSTEM PROMPT
 // ======================================================
 
-async function askAI({
-
-  text,
-
-  userId,
-
+function makeSystemPrompt({
   language,
-
   webContext,
-
+  vision = false,
 }) {
-
   const currentTime =
-    new Date()
-      .toLocaleString(
-        "ru-RU",
-        {
-          timeZone:
-            "Europe/Kyiv",
-        }
-      );
+    new Date().toLocaleString(
+      "ru-RU",
+      {
+        timeZone:
+          "Europe/Kyiv",
+      }
+    );
 
-
-  let systemPrompt = `
-
-Ты AI Guide —
-персональный AI-ассистент
-пользователя в Telegram.
+  let prompt = `
+Ты AI Guide — персональный Telegram AI-ассистент.
 
 Текущая дата и время:
-
 ${currentTime}
 
 ${languageInstruction(language)}
 
-Учитывай предыдущую историю
-разговора.
+Учитывай историю разговора.
 
-Понимай продолжения:
-
-"сократи"
-"сделай короче"
-"подробнее"
-"объясни проще"
-"а почему?"
-"про него"
-"по этому делу"
-"твой прошлый ответ"
-"позапрошлый ответ"
-
-Если нужная информация
-уже есть в истории,
-не проси пользователя
-отправлять её снова.
-
-
-========================================
-ТОЧНОСТЬ
-========================================
+Если пользователь пишет:
+"сделай короче",
+"подробнее",
+"а почему?",
+"продолжи",
+"сделай №3",
+то учитывай предыдущие сообщения.
 
 Не придумывай факты.
 
-Если не уверен —
-так и скажи.
+Если не уверен — скажи об этом.
 
-Если это школьная задача,
-сначала правильно пойми условие,
-потом решай.
+Для школьных заданий:
+- внимательно читай условие;
+- не меняй числа;
+- не придумывай текст;
+- проверяй вычисления;
+- если попросили конкретный пункт, выполняй только его.
 
-Если пользователь просит
-конкретный номер задания,
-выполняй именно этот номер,
-а не все задания подряд.
+Если на странице написано "Вправа №1",
+а внутри есть пункты 1, 2, 3...
+и пользователь пишет "виконай вправу 3",
+обычно имеется в виду пункт 3.
+Не решай всю страницу без просьбы.
 
+Не показывай внутренние рассуждения модели.
+Давай только полезный итог и нужное объяснение.
 
-========================================
-ИНТЕРНЕТ
-========================================
-
-Ты не управляешь поиском.
-
-Не вызывай самостоятельно:
-
-Google
-google(...)
-search(...)
-browser(...)
-tools
-functions
-
-Если WEB DATA есть,
-поиск уже выполнен сервером.
-
-Для свежей информации
-используй WEB DATA.
-
-Следи за датами.
-
-Не заменяй событие 2026 года
-похожим событием 2022 года.
-
-Не показывай сырые URL,
-если пользователь сам
-не попросил ссылки.
-
-
-========================================
-ВАЛЮТА
-========================================
-
-Если пользователь просто спрашивает
-"курс доллара",
-подразумевай USD -> UAH.
+Не вызывай самостоятельно Google,
+browser, search или другие инструменты.
 
 ${telegramFormattingRules()}
-
 `;
 
+  if (vision) {
+    prompt += `
 
-  if (webContext) {
+Пользователь прислал одно или несколько изображений.
 
-    systemPrompt += `
+Реально изучи каждое изображение.
 
-========================================
-WEB DATA
-========================================
+Если это:
+- школьное задание — прочитай и выполни просьбу;
+- скриншот ошибки — прочитай ошибку и объясни решение;
+- интерфейс — объясни, что видно;
+- текст — прочитай его;
+- обычное фото — ответь на вопрос об изображении.
 
-${webContext}
+Если изображений несколько,
+учитывай их как части одного запроса.
 
-========================================
-
-Это результаты свежего поиска.
-
-Используй только информацию,
-относящуюся к вопросу.
-
-Проверяй даты.
-
-Если поиск не подтверждает
-какое-либо утверждение,
-не придумывай подтверждение.
-
-Если точных данных нет —
-честно скажи об этом.
-
+Не придумывай мелкие или нечитаемые детали.
+Если важный текст не читается,
+скажи, что именно не удалось прочитать.
 `;
-
   }
 
+  if (webContext) {
+    prompt += `
 
+WEB DATA:
+${webContext}
+
+Это свежие результаты поиска Tavily.
+
+Используй их для актуального вопроса.
+Проверяй даты.
+Не показывай сырые URL,
+если пользователь не попросил ссылки.
+`;
+  }
+
+  return prompt;
+}
+
+
+// ======================================================
+// ASK TEXT
+// ======================================================
+
+async function askTextAI({
+  text,
+  userId,
+  language,
+  webContext,
+}) {
   const history =
     await getHistory(userId);
 
-
   const messages = [
-
     {
-
-      role:
-        "system",
-
-      content:
-        systemPrompt,
-
+      role: "system",
+      content: makeSystemPrompt({
+        language,
+        webContext,
+      }),
     },
 
     ...history,
 
     {
-
-      role:
-        "user",
-
-      content:
-        text,
-
+      role: "user",
+      content: text,
     },
-
   ];
 
+  const answer =
+    await requestGroq(messages);
 
-  let answer =
-    await requestOpenRouter(
-      messages
-    );
-
-
-  answer =
-    cleanTelegramMath(
-      answer
-    );
-
+  const cleaned =
+    cleanAIResponse(answer);
 
   return (
-    answer ||
-    "⚠️ Не удалось получить нормальный ответ. Попробуй ещё раз."
+    cleaned ||
+    "⚠️ Не удалось получить ответ от Groq. Попробуй ещё раз."
   );
 }
 
 
 // ======================================================
-// VISION
-// ======================================================
-
-async function visionRequest({
-
-  imageData,
-
-  caption,
-
-  history,
-
-  language,
-
-  attempt,
-
-}) {
-
-  const systemPrompt = `
-
-Ты AI Guide —
-AI-ассистент в Telegram.
-
-Пользователь отправил изображение.
-
-${languageInstruction(language)}
-
-ВНИМАТЕЛЬНО изучи изображение.
-
-
-========================================
-ВАЖНО: ЧТО ИМЕННО ПРОСИТ ПОЛЬЗОВАТЕЛЬ
-========================================
-
-Сначала прочитай подпись пользователя.
-
-Подпись:
-
-"${caption || "Подписи нет"}"
-
-
-Если пользователь пишет:
-
-"виконай вправу 3"
-"зроби вправу 3"
-"реши упражнение 3"
-"зроби №3"
-"виконай 3"
-"реши пункт 3"
-
-и на изображении находится
-"ВПРАВА №1",
-внутри которой есть пункты
-1, 2, 3, 4...
-
-то пользователь, скорее всего,
-просит выполнить ПУНКТ 3.
-
-В таком случае выполняй
-ТОЛЬКО пункт 3.
-
-Не решай автоматически
-все пункты 1-8.
-
-
-Если на изображении действительно
-есть отдельное задание или упражнение
-с номером 3,
-тогда выполняй именно его.
-
-
-Всегда сопоставляй просьбу
-с реальной структурой изображения.
-
-
-========================================
-НЕ ГАЛЛЮЦИНИРУЙ
-========================================
-
-Не придумывай текст,
-которого нет на изображении.
-
-Не придумывай числа.
-
-Не придумывай условия задачи.
-
-Не заменяй плохо читаемый текст
-похожим заданием из памяти.
-
-Если важная часть изображения
-реально не читается,
-скажи конкретно,
-какая часть не читается.
-
-
-========================================
-ШКОЛЬНЫЕ ЗАДАНИЯ
-========================================
-
-Если это школьное задание:
-
-1. Определи предмет.
-
-2. Прочитай точное условие.
-
-3. Определи,
-   какой номер попросил пользователь.
-
-4. Выполни именно его.
-
-5. Проверь вычисления.
-
-6. Дай понятный ответ.
-
-Не добавляй решения других заданий,
-если пользователь их не просил.
-
-
-========================================
-ФИЗИКА И МАТЕМАТИКА
-========================================
-
-Проверяй:
-
-знаки,
-степени,
-единицы измерения,
-формулы,
-арифметику.
-
-Не меняй вопрос задачи.
-
-Например:
-
-если спрашивают сопротивление,
-не начинай вычислять мощность,
-если это не требуется.
-
-
-========================================
-СКРИНШОТЫ
-========================================
-
-Если это скриншот ошибки программы:
-
-прочитай ошибку,
-объясни причину,
-дай конкретное решение.
-
-
-========================================
-ОБЫЧНЫЕ ФОТО
-========================================
-
-Если это обычная фотография,
-ответь на вопрос пользователя
-о том, что видно.
-
-Если подписи нет,
-кратко опиши главное
-и спроси/предложи,
-чем помочь.
-
-
-${telegramFormattingRules()}
-
-
-========================================
-ПОПЫТКА
-========================================
-
-Это попытка анализа №${attempt}.
-
-Если изображение доступно,
-обязательно постарайся
-реально его проанализировать.
-
-`;
-
-
-  const userPrompt =
-    caption ||
-    "Внимательно проанализируй изображение. Опиши главное и помоги с заданием, текстом или проблемой, если они есть.";
-
-
-  const messages = [
-
-    {
-
-      role:
-        "system",
-
-      content:
-        systemPrompt,
-
-    },
-
-    ...history,
-
-    {
-
-      role:
-        "user",
-
-      content: [
-
-        {
-
-          type:
-            "text",
-
-          text:
-            userPrompt,
-
-        },
-
-        {
-
-          type:
-            "image_url",
-
-          image_url: {
-
-            url:
-              imageData,
-
-          },
-
-        },
-
-      ],
-
-    },
-
-  ];
-
-
-  return await requestOpenRouter(
-    messages,
-    {
-      temperature: 0.25,
-      maxTokens: 2200,
-    }
-  );
-}
-
-
-// ======================================================
-// VISION WITH RETRY
+// ASK VISION
 // ======================================================
 
 async function askVisionAI({
-
-  imageData,
-
+  images,
   caption,
-
   userId,
-
   language,
-
 }) {
-
   const history =
     await getHistory(userId);
-
 
   const safeHistory =
     history.slice(-10);
 
+  const userContent = [
+    {
+      type: "text",
+      text:
+        caption ||
+        (
+          images.length > 1
+            ? "Проанализируй все эти изображения вместе. Если на них есть задания или текст, помоги с ними."
+            : "Внимательно проанализируй изображение и помоги с тем, что на нём."
+        ),
+    },
+  ];
 
-  // ==================================================
-  // TRY 1
-  // ==================================================
-
-  console.log(
-    "📷 Vision attempt 1"
-  );
-
-
-  let answer =
-    await visionRequest({
-
-      imageData,
-
-      caption,
-
-      history:
-        safeHistory,
-
-      language,
-
-      attempt: 1,
-
+  for (
+    const imageData of images.slice(0, MAX_IMAGES)
+  ) {
+    userContent.push({
+      type: "image_url",
+      image_url: {
+        url: imageData,
+      },
     });
+  }
+
+  const messages = [
+    {
+      role: "system",
+      content: makeSystemPrompt({
+        language,
+        vision: true,
+      }),
+    },
+
+    ...safeHistory,
+
+    {
+      role: "user",
+      content: userContent,
+    },
+  ];
+
+  const answer =
+    await requestGroq(
+      messages,
+      {
+        temperature: 0.2,
+        maxTokens: 2400,
+      }
+    );
+
+  const cleaned =
+    cleanAIResponse(answer);
+
+  return (
+    cleaned ||
+    "⚠️ Не удалось проанализировать изображение. Попробуй ещё раз."
+  );
+}
 
 
-  answer =
-    cleanTelegramMath(
+// ======================================================
+// GROQ WHISPER
+// ======================================================
+
+async function transcribeTelegramAudio(fileId) {
+  if (!GROQ_API_KEY) {
+    return null;
+  }
+
+  const file =
+    await getTelegramFile(fileId);
+
+  if (!file) {
+    return null;
+  }
+
+  try {
+    const form =
+      new FormData();
+
+    let extension = "ogg";
+
+    const lower =
+      String(file.filePath).toLowerCase();
+
+    if (lower.endsWith(".mp3")) {
+      extension = "mp3";
+    } else if (lower.endsWith(".wav")) {
+      extension = "wav";
+    } else if (lower.endsWith(".m4a")) {
+      extension = "m4a";
+    } else if (lower.endsWith(".webm")) {
+      extension = "webm";
+    } else if (lower.endsWith(".mp4")) {
+      extension = "mp4";
+    }
+
+    const blob =
+      new Blob(
+        [file.buffer],
+        {
+          type:
+            extension === "ogg"
+              ? "audio/ogg"
+              : `audio/${extension}`,
+        }
+      );
+
+    form.append(
+      "file",
+      blob,
+      `voice.${extension}`
+    );
+
+    form.append(
+      "model",
+      WHISPER_MODEL
+    );
+
+    form.append(
+      "response_format",
+      "json"
+    );
+
+    form.append(
+      "temperature",
+      "0"
+    );
+
+    const response =
+      await fetch(
+        GROQ_TRANSCRIBE_API,
+        {
+          method: "POST",
+
+          headers: {
+            Authorization:
+              `Bearer ${GROQ_API_KEY}`,
+          },
+
+          body: form,
+        }
+      );
+
+    const raw =
+      await response.text();
+
+    console.log(
+      "Whisper:",
+      response.status
+    );
+
+    if (!response.ok) {
+      console.error(
+        "Whisper error:",
+        raw
+      );
+
+      return null;
+    }
+
+    const data =
+      JSON.parse(raw);
+
+    return (
+      data?.text?.trim() ||
+      null
+    );
+  } catch (error) {
+    console.error(
+      "Whisper exception:",
+      error
+    );
+
+    return null;
+  }
+}
+
+
+// ======================================================
+// HANDLE VOICE
+// ======================================================
+
+async function handleVoice({
+  chatId,
+  userId,
+  fileId,
+}) {
+  const stopThinking =
+    startThinking(
+      chatId,
+      "typing"
+    );
+
+  try {
+    const transcription =
+      await transcribeTelegramAudio(
+        fileId
+      );
+
+    if (!transcription) {
+      await sendMessage(
+        chatId,
+        "⚠️ Не удалось распознать голосовое сообщение."
+      );
+
+      return;
+    }
+
+    console.log(
+      "Voice transcription:",
+      transcription
+    );
+
+    const language =
+      detectLanguage(
+        transcription
+      );
+
+    let webContext = null;
+
+    if (
+      needsInternet(
+        transcription
+      )
+    ) {
+      const query =
+        await buildSearchQuery(
+          transcription,
+          userId,
+          language
+        );
+
+      const webData =
+        await searchWeb(query);
+
+      webContext =
+        makeWebContext(
+          webData
+        );
+    }
+
+    const answer =
+      await askTextAI({
+        text: transcription,
+        userId,
+        language,
+        webContext,
+      });
+
+    await saveExchange(
+      userId,
+      `[Голосовое сообщение]\n${transcription}`,
       answer
     );
 
+    await sendMessage(
+      chatId,
+      answer
+    );
+  } finally {
+    stopThinking();
+  }
+}
 
-  // ==================================================
-  // ЕСЛИ ПЕРВАЯ МОДЕЛЬ НЕ ОТВЕТИЛА
-  // ПРОБУЕМ ЕЩЁ РАЗ
-  // ==================================================
+
+// ======================================================
+// ALBUM
+// Telegram отправляет каждое фото отдельно.
+// Собираем file_id в Redis.
+// ======================================================
+
+async function addAlbumPhoto({
+  userId,
+  mediaGroupId,
+  fileId,
+  caption,
+}) {
+  const key =
+    albumKey(
+      userId,
+      mediaGroupId
+    );
+
+  const raw =
+    await redisCommand([
+      "GET",
+      key,
+    ]);
+
+  let album = {
+    photos: [],
+    caption: "",
+  };
+
+  if (raw) {
+    try {
+      album =
+        JSON.parse(raw);
+    } catch {
+      // ignore
+    }
+  }
 
   if (
-    !answer ||
-    answer.length < 10
+    !album.photos.includes(fileId)
   ) {
+    album.photos.push(fileId);
+  }
 
-    console.log(
-      "⚠️ Vision retry..."
+  if (caption) {
+    album.caption = caption;
+  }
+
+  album.photos =
+    album.photos.slice(
+      0,
+      MAX_IMAGES
     );
 
+  await redisCommand([
+    "SET",
+    key,
+    JSON.stringify(album),
+    "EX",
+    "60",
+  ]);
 
-    answer =
-      await visionRequest({
+  return album;
+}
 
-        imageData,
+async function getAlbum(
+  userId,
+  mediaGroupId
+) {
+  const key =
+    albumKey(
+      userId,
+      mediaGroupId
+    );
 
-        caption,
+  const raw =
+    await redisCommand([
+      "GET",
+      key,
+    ]);
 
-        history:
-          safeHistory,
+  if (!raw) {
+    return null;
+  }
 
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
+async function deleteAlbum(
+  userId,
+  mediaGroupId
+) {
+  await redisCommand([
+    "DEL",
+    albumKey(
+      userId,
+      mediaGroupId
+    ),
+  ]);
+}
+
+
+// ======================================================
+// ALBUM LOCK
+// Нужен, чтобы несколько webhook-запросов
+// не ответили на один альбом одновременно.
+// ======================================================
+
+function albumLockKey(
+  userId,
+  mediaGroupId
+) {
+  return (
+    `ai-guide:album-lock:` +
+    `${userId}:${mediaGroupId}`
+  );
+}
+
+async function tryAlbumLock(
+  userId,
+  mediaGroupId
+) {
+  const result =
+    await redisCommand([
+      "SET",
+      albumLockKey(
+        userId,
+        mediaGroupId
+      ),
+      "1",
+      "NX",
+      "EX",
+      "30",
+    ]);
+
+  return result === "OK";
+}
+
+
+// ======================================================
+// HANDLE ALBUM
+// ======================================================
+
+async function handleAlbum({
+  chatId,
+  userId,
+  mediaGroupId,
+  fileId,
+  caption,
+}) {
+  await addAlbumPhoto({
+    userId,
+    mediaGroupId,
+    fileId,
+    caption,
+  });
+
+  // Даём Telegram время прислать
+  // остальные фото альбома.
+  await sleep(1800);
+
+  const gotLock =
+    await tryAlbumLock(
+      userId,
+      mediaGroupId
+    );
+
+  // Другой webhook уже занимается
+  // этим альбомом.
+  if (!gotLock) {
+    return;
+  }
+
+  // Ещё немного ждём поздние фото.
+  await sleep(700);
+
+  const album =
+    await getAlbum(
+      userId,
+      mediaGroupId
+    );
+
+  if (
+    !album ||
+    !Array.isArray(album.photos) ||
+    album.photos.length === 0
+  ) {
+    return;
+  }
+
+  const stopThinking =
+    startThinking(
+      chatId,
+      "typing"
+    );
+
+  try {
+    const images = [];
+
+    for (
+      const albumFileId of
+      album.photos.slice(
+        0,
+        MAX_IMAGES
+      )
+    ) {
+      const imageData =
+        await getTelegramImageData(
+          albumFileId
+        );
+
+      if (imageData) {
+        images.push(
+          imageData
+        );
+      }
+    }
+
+    if (!images.length) {
+      await sendMessage(
+        chatId,
+        "⚠️ Не удалось скачать фотографии."
+      );
+
+      return;
+    }
+
+    const finalCaption =
+      album.caption || "";
+
+    const language =
+      detectLanguage(
+        finalCaption
+      );
+
+    const answer =
+      await askVisionAI({
+        images,
+        caption: finalCaption,
+        userId,
         language,
-
-        attempt: 2,
-
       });
 
+    await saveExchange(
+      userId,
+      (
+        `[Пользователь отправил альбом: ` +
+        `${images.length} фото]` +
+        (
+          finalCaption
+            ? `\nПодпись: ${finalCaption}`
+            : ""
+        )
+      ),
+      answer
+    );
 
-    answer =
-      cleanTelegramMath(
-        answer
-      );
+    await sendMessage(
+      chatId,
+      answer
+    );
+  } finally {
+    stopThinking();
 
-  }
-
-
-  if (!answer) {
-
-    if (language === "uk") {
-
-      return (
-        "⚠️ Не вдалося проаналізувати зображення. " +
-        "Спробуй надіслати його ще раз."
-      );
-
-    }
-
-
-    if (language === "en") {
-
-      return (
-        "⚠️ I couldn't analyze the image. " +
-        "Please try sending it again."
-      );
-
-    }
-
-
-    return (
-      "⚠️ Не удалось проанализировать изображение. " +
-      "Попробуй отправить его ещё раз."
+    await deleteAlbum(
+      userId,
+      mediaGroupId
     );
   }
+}
 
 
-  return answer;
+// ======================================================
+// SINGLE PHOTO
+// ======================================================
+
+async function handleSinglePhoto({
+  chatId,
+  userId,
+  fileId,
+  caption,
+}) {
+  const stopThinking =
+    startThinking(
+      chatId,
+      "typing"
+    );
+
+  try {
+    const imageData =
+      await getTelegramImageData(
+        fileId
+      );
+
+    if (!imageData) {
+      await sendMessage(
+        chatId,
+        "⚠️ Не удалось скачать изображение."
+      );
+
+      return;
+    }
+
+    const language =
+      detectLanguage(
+        caption
+      );
+
+    const answer =
+      await askVisionAI({
+        images: [
+          imageData,
+        ],
+        caption,
+        userId,
+        language,
+      });
+
+    await saveExchange(
+      userId,
+      (
+        "[Пользователь отправил изображение]" +
+        (
+          caption
+            ? `\nПодпись: ${caption}`
+            : ""
+        )
+      ),
+      answer
+    );
+
+    await sendMessage(
+      chatId,
+      answer
+    );
+  } finally {
+    stopThinking();
+  }
+}
+
+
+// ======================================================
+// STATIC STICKER
+// ======================================================
+
+async function handleSticker({
+  chatId,
+  userId,
+  sticker,
+}) {
+  // animated .tgs и video .webm
+  // пока не отправляем в vision.
+  if (
+    sticker.is_animated ||
+    sticker.is_video
+  ) {
+    await sendMessage(
+      chatId,
+      "😀 Этот стикер анимированный. Пока я умею анализировать обычные статичные стикеры."
+    );
+
+    return;
+  }
+
+  const stopThinking =
+    startThinking(
+      chatId,
+      "typing"
+    );
+
+  try {
+    const imageData =
+      await getTelegramImageData(
+        sticker.file_id
+      );
+
+    if (!imageData) {
+      await sendMessage(
+        chatId,
+        "⚠️ Не удалось загрузить стикер."
+      );
+
+      return;
+    }
+
+    const answer =
+      await askVisionAI({
+        images: [
+          imageData,
+        ],
+
+        caption:
+          "Пользователь отправил тебе стикер. Посмотри на него и коротко, естественно отреагируй на него как собеседник. Если на стикере есть важный текст, учти его.",
+
+        userId,
+
+        language:
+          "ru",
+      });
+
+    await saveExchange(
+      userId,
+      "[Пользователь отправил стикер]",
+      answer
+    );
+
+    await sendMessage(
+      chatId,
+      answer
+    );
+  } finally {
+    stopThinking();
+  }
 }
 
 
@@ -2222,38 +1828,34 @@ async function askVisionAI({
 // ======================================================
 
 export async function POST(request) {
-
   try {
-
     console.log(
-      "🚀 AI-GUIDE-V6.1"
+      "AI-GUIDE-V7"
     );
-
 
     const update =
       await request.json();
 
-
     const message =
       update.message;
 
-
     if (!message) {
-
       return Response.json({
         ok: true,
       });
-
     }
-
 
     const chatId =
       message.chat?.id;
 
-
     const userId =
       message.from?.id;
 
+    if (!chatId || !userId) {
+      return Response.json({
+        ok: true,
+      });
+    }
 
     // ==================================================
     // PRIVATE MODE
@@ -2261,20 +1863,97 @@ export async function POST(request) {
 
     if (
       ALLOWED_USER_ID &&
-      userId !==
-        ALLOWED_USER_ID
+      userId !== ALLOWED_USER_ID
     ) {
-
       await sendMessage(
         chatId,
         "⛔ Это приватный бот."
       );
 
+      return Response.json({
+        ok: true,
+      });
+    }
+
+
+    // ==================================================
+    // COMMANDS
+    // ==================================================
+
+    const text =
+      message.text?.trim();
+
+    if (
+      text &&
+      (
+        text.toLowerCase() === "/clear" ||
+        text.toLowerCase() === "/reset"
+      )
+    ) {
+      await clearHistory(userId);
+
+      await sendMessage(
+        chatId,
+        "🧹 История разговора очищена."
+      );
 
       return Response.json({
         ok: true,
       });
+    }
 
+
+    // ==================================================
+    // VOICE
+    // ==================================================
+
+    if (message.voice?.file_id) {
+      await handleVoice({
+        chatId,
+        userId,
+        fileId:
+          message.voice.file_id,
+      });
+
+      return Response.json({
+        ok: true,
+      });
+    }
+
+
+    // ==================================================
+    // AUDIO FILE
+    // ==================================================
+
+    if (message.audio?.file_id) {
+      await handleVoice({
+        chatId,
+        userId,
+        fileId:
+          message.audio.file_id,
+      });
+
+      return Response.json({
+        ok: true,
+      });
+    }
+
+
+    // ==================================================
+    // STICKER
+    // ==================================================
+
+    if (message.sticker?.file_id) {
+      await handleSticker({
+        chatId,
+        userId,
+        sticker:
+          message.sticker,
+      });
+
+      return Response.json({
+        ok: true,
+      });
     }
 
 
@@ -2288,121 +1967,47 @@ export async function POST(request) {
       ) &&
       message.photo.length > 0
     ) {
-
-      console.log(
-        "📷 Photo received"
-      );
-
-
       const biggestPhoto =
         message.photo[
           message.photo.length - 1
         ];
 
-
       const fileId =
         biggestPhoto.file_id;
-
 
       const caption =
         message.caption?.trim() ||
         "";
 
-
-      const language =
-        detectLanguage(
-          caption
-        );
-
-
-      const imageData =
-        await getTelegramPhotoBase64(
-          fileId
-        );
-
-
-      if (!imageData) {
-
-        await sendMessage(
+      // Альбом
+      if (message.media_group_id) {
+        await handleAlbum({
           chatId,
-          "⚠️ Не удалось скачать изображение из Telegram."
-        );
+          userId,
 
+          mediaGroupId:
+            message.media_group_id,
+
+          fileId,
+          caption,
+        });
 
         return Response.json({
           ok: true,
         });
-
       }
 
-
-      console.log(
-        "✅ Photo downloaded"
-      );
-
-
-      const answer =
-        await askVisionAI({
-
-          imageData,
-
-          caption,
-
-          userId,
-
-          language,
-
-        });
-
-
-      // ==================================================
-      // SAVE PHOTO CONTEXT
-      // ==================================================
-
-      const memoryDescription =
-        caption
-
-          ? (
-              "[Пользователь отправил изображение]\n" +
-              "Подпись: " +
-              caption
-            )
-
-          : (
-              "[Пользователь отправил изображение без подписи]"
-            );
-
-
-      await saveExchange(
-
-        userId,
-
-        memoryDescription,
-
-        answer
-
-      );
-
-
-      // ==================================================
-      // SEND
-      // ==================================================
-
-      await sendMessage(
+      // Одиночное фото
+      await handleSinglePhoto({
         chatId,
-        answer
-      );
-
-
-      console.log(
-        "✅ Vision answer sent"
-      );
-
+        userId,
+        fileId,
+        caption,
+      });
 
       return Response.json({
         ok: true,
       });
-
     }
 
 
@@ -2410,192 +2015,93 @@ export async function POST(request) {
     // TEXT
     // ==================================================
 
-    const text =
-      message.text?.trim();
+    if (text) {
+      const stopThinking =
+        startThinking(
+          chatId,
+          "typing"
+        );
 
+      try {
+        const language =
+          detectLanguage(text);
 
-    if (!text) {
+        let webContext =
+          null;
 
-      await sendMessage(
-        chatId,
-        "Пока я поддерживаю текст и фотографии 📷"
-      );
+        if (
+          needsInternet(text)
+        ) {
+          const searchQuery =
+            await buildSearchQuery(
+              text,
+              userId,
+              language
+            );
 
+          const webData =
+            await searchWeb(
+              searchQuery
+            );
 
-      return Response.json({
-        ok: true,
-      });
+          webContext =
+            makeWebContext(
+              webData
+            );
+        }
 
-    }
+        const answer =
+          await askTextAI({
+            text,
+            userId,
+            language,
+            webContext,
+          });
 
-
-    console.log(
-      "💬 User:",
-      text
-    );
-
-
-    // ==================================================
-    // CLEAR
-    // ==================================================
-
-    if (
-      text.toLowerCase() ===
-        "/clear" ||
-
-      text.toLowerCase() ===
-        "/reset"
-    ) {
-
-      await clearHistory(
-        userId
-      );
-
-
-      await sendMessage(
-        chatId,
-        "🧹 История разговора очищена."
-      );
-
-
-      return Response.json({
-        ok: true,
-      });
-
-    }
-
-
-    // ==================================================
-    // LANGUAGE
-    // ==================================================
-
-    const language =
-      detectLanguage(text);
-
-
-    // ==================================================
-    // INTERNET
-    // ==================================================
-
-    let webContext =
-      null;
-
-
-    if (
-      needsInternet(text)
-    ) {
-
-      console.log(
-        "🌐 Internet required"
-      );
-
-
-      const searchQuery =
-        await buildSearchQuery(
-
-          text,
-
+        await saveExchange(
           userId,
-
-          language
-
+          text,
+          answer
         );
 
-
-      const webData =
-        await searchWeb(
-          searchQuery
+        await sendMessage(
+          chatId,
+          answer
         );
-
-
-      webContext =
-        makeWebContext(
-          webData
-        );
-
-
-      if (webContext) {
-
-        console.log(
-          "✅ WEB DATA ready"
-        );
-
-      } else {
-
-        console.log(
-          "⚠️ WEB DATA empty"
-        );
-
+      } finally {
+        stopThinking();
       }
 
+      return Response.json({
+        ok: true,
+      });
     }
 
 
     // ==================================================
-    // AI
-    // ==================================================
-
-    const answer =
-      await askAI({
-
-        text,
-
-        userId,
-
-        language,
-
-        webContext,
-
-      });
-
-
-    // ==================================================
-    // MEMORY
-    // ==================================================
-
-    await saveExchange(
-
-      userId,
-
-      text,
-
-      answer
-
-    );
-
-
-    console.log(
-      "💾 Saved to Redis"
-    );
-
-
-    // ==================================================
-    // SEND
+    // OTHER
     // ==================================================
 
     await sendMessage(
       chatId,
-      answer
+      "Пока я понимаю текст, фото, альбомы фотографий, голосовые, аудио и обычные статичные стикеры."
     );
-
 
     return Response.json({
       ok: true,
     });
 
-
   } catch (error) {
-
     console.error(
-      "🔥 BOT ERROR:",
+      "BOT ERROR:",
       error
     );
 
-
+    // Возвращаем 200, чтобы Telegram
+    // не повторял update снова и снова.
     return Response.json({
       ok: true,
     });
-
   }
 }
 
@@ -2605,11 +2111,9 @@ export async function POST(request) {
 // ======================================================
 
 export async function GET() {
-
   return Response.json({
-
     version:
-      "AI-GUIDE-V6.1",
+      "AI-GUIDE-V7-GROQ",
 
     status:
       "Bot is running",
@@ -2617,8 +2121,11 @@ export async function GET() {
     telegram:
       !!TELEGRAM_BOT_TOKEN,
 
+    groq:
+      !!GROQ_API_KEY,
+
     openrouter:
-      !!OPENROUTER_API_KEY,
+      false,
 
     tavily:
       !!TAVILY_API_KEY,
@@ -2632,31 +2139,27 @@ export async function GET() {
     privateMode:
       !!ALLOWED_USER_ID,
 
-    memory:
-      (
-        UPSTASH_REDIS_REST_URL &&
-        UPSTASH_REDIS_REST_TOKEN
-      )
-        ? "Upstash Redis"
-        : "NOT CONFIGURED",
-
-    vision:
-      true,
-
-    visionRetry:
-      true,
-
-    telegramMath:
-      "Plain text / Unicode",
-
-    latex:
-      false,
-
-    search:
-      "Tavily",
-
     model:
       AI_MODEL,
 
+    speechModel:
+      WHISPER_MODEL,
+
+    memory:
+      "Upstash Redis",
+
+    features: {
+      text: true,
+      photos: true,
+      multiPhoto: true,
+      maxPhotos: MAX_IMAGES,
+      voice: true,
+      audio: true,
+      staticStickers: true,
+      animatedStickers: false,
+      typingIndicator: true,
+      webSearch: "Tavily",
+      telegramSafeMath: true,
+    },
   });
 }
