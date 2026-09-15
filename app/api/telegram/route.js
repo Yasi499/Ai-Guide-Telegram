@@ -12,7 +12,7 @@ const ffmpegPath = path.join(process.cwd(), "ffmpeg-bin", "ffmpeg");
 export const runtime = "nodejs";
 
 // ======================================================
-// AI GUIDE V7.5.6
+// AI GUIDE V7.5.8
 //
 // Groq:
 // - Text: openai/gpt-oss-120b
@@ -259,7 +259,6 @@ async function saveLastMedia(userId, media) {
     id: media.id || `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
     savedAt: Date.now(),
     description: String(media.description || "").slice(0, 6000),
-    deepDescription: String(media.deepDescription || "").slice(0, 12000),
     transcript: String(media.transcript || "").slice(0, 3000),
   };
   await redisCommand(["SET", lastMediaKey(userId), JSON.stringify(value), "EX", "604800"]);
@@ -1331,33 +1330,6 @@ async function askTextAI({
 
 
 // ======================================================
-// VISION MODEL FALLBACK V7.5.6
-// qwen3.8 -> qwen3.6 on rate-limit / temporary provider errors
-// ======================================================
-
-function shouldFallbackVision(result) {
-  if (!result || result.ok) return false;
-  return result.status === 429 || result.status === 0 || result.status >= 500;
-}
-
-async function requestVisionGroq(options) {
-  let result = await requestGroq({
-    ...options,
-    model: VISION_MODEL,
-  });
-
-  if (shouldFallbackVision(result)) {
-    console.log(`Vision fallback: ${VISION_MODEL} -> ${VISION_FALLBACK_MODEL} (status ${result.status})`);
-    result = await requestGroq({
-      ...options,
-      model: VISION_FALLBACK_MODEL,
-    });
-  }
-
-  return result;
-}
-
-// ======================================================
 // VISION
 // ======================================================
 
@@ -1423,11 +1395,36 @@ async function askVisionAI({
   ];
 
   let result =
-    await requestVisionGroq({
+    await requestGroq({
+      model: VISION_MODEL,
       messages,
       temperature: 0.1,
       maxTokens: 1300,
     });
+
+  // Vision fallback: keep the original V7.5.4 Vision/sticker flow,
+  // but if the primary Vision model is rate-limited or temporarily unavailable,
+  // retry the SAME request with the fallback Vision model.
+  if (
+    !result.ok &&
+    (result.status === 429 || result.status >= 500)
+  ) {
+    console.log(
+      `Vision fallback: ${VISION_MODEL} -> ${VISION_FALLBACK_MODEL}`
+    );
+
+    const fallbackResult =
+      await requestGroq({
+        model: VISION_FALLBACK_MODEL,
+        messages,
+        temperature: 0.1,
+        maxTokens: 1300,
+      });
+
+    // Use fallback result if it answered, or preserve its real error
+    // so logs/user message reflect the final Vision attempt.
+    result = fallbackResult;
+  }
 
   // Retry with minimal prompt
   if (
@@ -1476,6 +1473,23 @@ R = U / I
         temperature: 0.1,
         maxTokens: 900,
       });
+
+    if (
+      !result.ok &&
+      (result.status === 429 || result.status >= 500)
+    ) {
+      console.log(
+        `Vision fallback (minimal): ${VISION_MODEL} -> ${VISION_FALLBACK_MODEL}`
+      );
+
+      result =
+        await requestGroq({
+          model: VISION_FALLBACK_MODEL,
+          messages,
+          temperature: 0.1,
+          maxTokens: 900,
+        });
+    }
   }
 
   const cleaned =
@@ -2082,9 +2096,9 @@ async function askStickerVisionAI({ image, language, kind = "стикер" }) {
       { type: "image_url", image_url: { url: image.dataUrl } }
     ]
   }];
-  const result = await requestVisionGroq({ messages, temperature: 0.65, maxCompletionTokens: 120 });
+  const result = await requestGroq({ model: VISION_MODEL, messages, temperature: 0.65, maxCompletionTokens: 120 });
   if (!result.ok) return null;
-  return cleanAIResponse(result.text);
+  return cleanAIResponse(result.content);
 }
 
 // ======================================================
@@ -2453,45 +2467,6 @@ async function extractVideoFrames(file, durationSeconds = 0) {
   }
 }
 
-function parseDeepVisionAnswer(answer) {
-  const raw = String(answer || "").trim();
-  if (!raw || isVisionFailure(raw)) return { shortAnswer: raw, deepDescription: "" };
-
-  const shortMatch = raw.match(/(?:^|\n)SHORT:\s*([\s\S]*?)(?=\nMEMORY:|$)/i);
-  const memoryMatch = raw.match(/(?:^|\n)MEMORY:\s*([\s\S]*)$/i);
-
-  if (!shortMatch || !memoryMatch) {
-    return { shortAnswer: raw, deepDescription: raw };
-  }
-
-  return {
-    shortAnswer: shortMatch[1].trim(),
-    deepDescription: memoryMatch[1].trim(),
-  };
-}
-
-async function answerFromDeepMediaMemory({ text, media, language }) {
-  const memory = String(media?.deepDescription || media?.description || "").trim();
-  if (!memory) return null;
-
-  const messages = [
-    {
-      role: "system",
-      content: `${languageInstruction(language)}\nТы отвечаешь ТОЛЬКО по сохранённому подробному описанию ранее просмотренного медиа. Не используй общие знания, чтобы угадывать визуальные детали. Если в памяти достаточно данных — ответь кратко, 1–2 предложения. Если для точного ответа медиа действительно нужно пересмотреть, ответь ровно: NEED_VISION`,
-    },
-    {
-      role: "user",
-      content: `Сохранённое описание:\n${memory.slice(0, 10000)}\n\nВопрос: ${text}`,
-    },
-  ];
-
-  let result = await requestGroq({ model: TEXT_MODEL, messages, temperature: 0.1, maxTokens: 300 });
-  if (!result.ok) result = await requestGroq({ model: TEXT_FALLBACK_MODEL, messages, temperature: 0.1, maxTokens: 300 });
-  const answer = cleanAIResponse(result.text).trim();
-  if (!answer || /NEED_VISION/i.test(answer) || /^⚠️/.test(answer)) return null;
-  return answer;
-}
-
 async function handleVideo({ chatId, userId, video, caption = "", kind = "видео" }) {
   const stop = startThinking(chatId);
   let stored = null;
@@ -2502,7 +2477,6 @@ async function handleVideo({ chatId, userId, video, caption = "", kind = "вид
       fileId: video.file_id,
       duration: Number(video.duration || 0),
       description: "",
-      deepDescription: "",
       transcript: "",
       caption: String(caption || "").slice(0, 1200),
     });
@@ -2545,21 +2519,15 @@ async function handleVideo({ chatId, userId, video, caption = "", kind = "вид
     const userInstruction = String(caption || "").trim();
     const visualPrompt = `${languageInstruction(language)}
 Это ${kind}; переданы кадры из разных моментов в хронологическом порядке.
-${userInstruction ? `Вопрос пользователя: ${userInstruction}` : "Пользователь просто отправил медиа без вопроса."}
+${userInstruction ? `Вопрос: ${userInstruction}` : "Коротко скажи, что видно и что происходит."}
 ${transcript ? `Надёжно распознанная речь: ${transcript.slice(0, 1000)}` : "Надёжной речи не обнаружено. Не придумывай слова из шума."}
+Ответь кратко и конкретно, обычно 1–2 предложения. Не перечисляй очевидные детали без пользы.`;
 
-Верни ответ СТРОГО в двух блоках:
-SHORT: короткий естественный ответ пользователю, 1–2 предложения.
-MEMORY: подробное фактическое описание всего, что реально видно на всех кадрах: предметы, цвета, расположение, фон, надписи, логотипы, особенности, движение камеры и изменения между кадрами. Это скрытая память для будущих вопросов. Не угадывай бренд/модель/текст, если они неразличимы. MEMORY может быть подробным, но без воды.`;
-
-    const rawAnswer = await askVisionAI({ images: frames, caption: visualPrompt, userId, language });
-    const parsed = parseDeepVisionAnswer(rawAnswer);
-    const answer = parsed.shortAnswer || rawAnswer;
+    const answer = await askVisionAI({ images: frames, caption: visualPrompt, userId, language });
 
     await updateStoredMedia(userId, {
       ...stored,
-      description: isVisionFailure(rawAnswer) ? "" : answer,
-      deepDescription: isVisionFailure(rawAnswer) ? "" : (parsed.deepDescription || answer),
+      description: isVisionFailure(answer) ? "" : answer,
       transcript: transcript || "",
       speechChecked: true,
       speechReliable: !!transcript,
@@ -2578,7 +2546,7 @@ MEMORY: подробное фактическое описание всего, �
 }
 
 // ======================================================
-// MULTIMEDIA MEMORY V7.5.5 — DEEP VIDEO MEMORY
+// MULTIMEDIA MEMORY V7.5.4
 // Keeps the last photo/video/video-note file_id for 7 days.
 // A follow-up such as "какой бренд мышки?" re-opens the media
 // and asks Vision again instead of answering from general knowledge.
@@ -2676,18 +2644,6 @@ async function tryHandleMediaFollowup({ chatId, userId, text }) {
       }
     }
 
-    // First try the detailed cached visual memory. This uses the text model,
-    // not Qwen Vision. Only if the memory cannot support the answer do we
-    // reopen the media and spend another Vision request.
-    if (selected.length === 1) {
-      const cachedAnswer = await answerFromDeepMediaMemory({ text, media: selected[0], language });
-      if (cachedAnswer) {
-        await saveExchange(userId, text, cachedAnswer);
-        await sendMessage(chatId, cachedAnswer);
-        return true;
-      }
-    }
-
     const answers = [];
 
     for (let i = 0; i < selected.length; i++) {
@@ -2716,16 +2672,11 @@ ${media.description ? `Ранее было известно: ${String(media.desc
       const answer = await askVisionAI({ images, caption: prompt, userId, language });
 
       if (!isVisionFailure(answer)) {
-        // Preserve the original summary and enrich hidden memory with newly
-        // inspected details, so the same follow-up usually needs no more Vision.
-        const detail = `Вопрос: ${text}
-Ответ после повторного просмотра: ${answer}`;
-        await updateStoredMedia(userId, {
-          ...media,
-          description: media.description || answer,
-          deepDescription: `${String(media.deepDescription || media.description || "").trim()}
-${detail}`.trim().slice(0, 12000),
-        });
+        // Do not overwrite a good general description with a narrow answer like
+        // "логотип не видно". Keep narrow details in dialogue only.
+        if (!media.description) {
+          await updateStoredMedia(userId, { ...media, description: answer });
+        }
       }
 
       answers.push(selected.length > 1 ? `${i + 1}) ${answer}` : answer);
@@ -2744,7 +2695,7 @@ ${detail}`.trim().slice(0, 12000),
 }
 
 // ======================================================
-// PLAIN EMOJI REACTIONS V7.5.5
+// PLAIN EMOJI REACTIONS V7.5.4
 // ======================================================
 
 function isEmojiOnlyText(text) {
@@ -2824,7 +2775,7 @@ export async function POST(
 ) {
   try {
     console.log(
-      "AI-GUIDE-V7.5.6"
+      "AI-GUIDE-V7.5.8"
     );
 
     const update =
@@ -3200,7 +3151,7 @@ export async function GET() {
 
   return Response.json({
     version:
-      "AI-GUIDE-V7.5.6",
+      "AI-GUIDE-V7.5.8",
 
     status:
       "Bot is running",
