@@ -1,22 +1,21 @@
 export const runtime = "nodejs";
 
 // ======================================================
-// AI GUIDE V7.
-// Telegram + Groq + Tavily + Upstash
+// AI GUIDE V7.1
+// Groq + automatic model detection
+// Tavily + Upstash + Telegram
 //
-// Поддержка:
-// - текст
-// - 1 фото
-// - альбом до 5 фото
-// - голосовые
-// - audio
-// - статичные WEBP-стикеры
-// - "печатает..." во время ожидания
-// - постоянная память
-// - интернет через Tavily
-// - Telegram-safe математика
+// TEXT:
+//   GPT-OSS 120B -> GPT-OSS 20B -> available model
 //
-// OpenRouter НЕ используется.
+// VISION:
+//   Qwen 3.8 -> Qwen 3.6
+//   ONLY if actually available to current Groq key
+//
+// VOICE:
+//   Whisper Large V3 Turbo
+//
+// OpenRouter: DISABLED
 // ======================================================
 
 
@@ -24,9 +23,14 @@ export const runtime = "nodejs";
 // CONFIG
 // ======================================================
 
-const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const GROQ_API_KEY = process.env.GROQ_API_KEY;
-const TAVILY_API_KEY = process.env.TAVILY_API_KEY;
+const TELEGRAM_BOT_TOKEN =
+  process.env.TELEGRAM_BOT_TOKEN;
+
+const GROQ_API_KEY =
+  process.env.GROQ_API_KEY;
+
+const TAVILY_API_KEY =
+  process.env.TAVILY_API_KEY;
 
 const UPSTASH_REDIS_REST_URL =
   process.env.UPSTASH_REDIS_REST_URL;
@@ -42,25 +46,61 @@ const ALLOWED_USER_ID =
 const TELEGRAM_API =
   `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}`;
 
+const GROQ_API =
+  "https://api.groq.com/openai/v1";
+
 const GROQ_CHAT_API =
-  "https://api.groq.com/openai/v1/chat/completions";
+  `${GROQ_API}/chat/completions`;
+
+const GROQ_MODELS_API =
+  `${GROQ_API}/models`;
 
 const GROQ_TRANSCRIBE_API =
-  "https://api.groq.com/openai/v1/audio/transcriptions";
+  `${GROQ_API}/audio/transcriptions`;
 
-const AI_MODEL = "qwen/qwen3.6-27b";
-const WHISPER_MODEL = "whisper-large-v3-turbo";
+const WHISPER_MODEL =
+  "whisper-large-v3-turbo";
 
 const MAX_HISTORY_MESSAGES = 20;
-const MAX_IMAGES = 5;
+const MAX_IMAGES = 3;
 
 
 // ======================================================
-// SMALL HELPERS
+// MODEL PRIORITY
+// ======================================================
+
+const TEXT_MODEL_PRIORITY = [
+  "openai/gpt-oss-120b",
+  "openai/gpt-oss-20b",
+];
+
+const VISION_MODEL_PRIORITY = [
+  "qwen/qwen3.8-27b",
+  "qwen/qwen3.6-27b",
+];
+
+
+// ======================================================
+// MODEL CACHE
+// ======================================================
+
+let modelCache = {
+  models: [],
+  loadedAt: 0,
+};
+
+const MODEL_CACHE_TIME =
+  5 * 60 * 1000;
+
+
+// ======================================================
+// HELPERS
 // ======================================================
 
 function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+  return new Promise(
+    (resolve) => setTimeout(resolve, ms)
+  );
 }
 
 function memoryKey(userId) {
@@ -71,60 +111,105 @@ function albumKey(userId, mediaGroupId) {
   return `ai-guide:album:${userId}:${mediaGroupId}`;
 }
 
+function albumLockKey(userId, mediaGroupId) {
+  return `ai-guide:album-lock:${userId}:${mediaGroupId}`;
+}
+
 
 // ======================================================
 // REDIS
 // ======================================================
 
 async function redisCommand(command) {
-  if (!UPSTASH_REDIS_REST_URL || !UPSTASH_REDIS_REST_TOKEN) {
+  if (
+    !UPSTASH_REDIS_REST_URL ||
+    !UPSTASH_REDIS_REST_TOKEN
+  ) {
     console.error("Redis not configured");
     return null;
   }
 
   try {
-    const response = await fetch(UPSTASH_REDIS_REST_URL, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${UPSTASH_REDIS_REST_TOKEN}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify(command),
-    });
+    const response =
+      await fetch(
+        UPSTASH_REDIS_REST_URL,
+        {
+          method: "POST",
 
-    const raw = await response.text();
+          headers: {
+            Authorization:
+              `Bearer ${UPSTASH_REDIS_REST_TOKEN}`,
+
+            "Content-Type":
+              "application/json",
+          },
+
+          body:
+            JSON.stringify(command),
+        }
+      );
+
+    const raw =
+      await response.text();
 
     if (!response.ok) {
-      console.error("Redis error:", raw);
+      console.error(
+        "Redis error:",
+        raw
+      );
+
       return null;
     }
 
-    const data = JSON.parse(raw);
+    const data =
+      JSON.parse(raw);
+
     return data.result;
+
   } catch (error) {
-    console.error("Redis exception:", error);
+    console.error(
+      "Redis exception:",
+      error
+    );
+
     return null;
   }
 }
 
-async function getHistory(userId) {
-  const result = await redisCommand([
-    "GET",
-    memoryKey(userId),
-  ]);
 
-  if (!result) return [];
+async function getHistory(userId) {
+  const result =
+    await redisCommand([
+      "GET",
+      memoryKey(userId),
+    ]);
+
+  if (!result) {
+    return [];
+  }
 
   try {
-    const history = JSON.parse(result);
-    return Array.isArray(history) ? history : [];
+    const history =
+      JSON.parse(result);
+
+    return Array.isArray(history)
+      ? history
+      : [];
+
   } catch {
     return [];
   }
 }
 
-async function saveHistory(userId, history) {
-  const trimmed = history.slice(-MAX_HISTORY_MESSAGES);
+
+async function saveHistory(
+  userId,
+  history
+) {
+  const trimmed =
+    history.slice(
+      -MAX_HISTORY_MESSAGES
+    );
 
   await redisCommand([
     "SET",
@@ -133,21 +218,37 @@ async function saveHistory(userId, history) {
   ]);
 }
 
-async function saveExchange(userId, userText, assistantText) {
-  const history = await getHistory(userId);
+
+async function saveExchange(
+  userId,
+  userText,
+  assistantText
+) {
+  const history =
+    await getHistory(userId);
 
   history.push({
     role: "user",
-    content: String(userText).slice(0, 5000),
+
+    content:
+      String(userText)
+        .slice(0, 5000),
   });
 
   history.push({
     role: "assistant",
-    content: String(assistantText).slice(0, 5000),
+
+    content:
+      String(assistantText)
+        .slice(0, 5000),
   });
 
-  await saveHistory(userId, history);
+  await saveHistory(
+    userId,
+    history
+  );
 }
+
 
 async function clearHistory(userId) {
   await redisCommand([
@@ -158,34 +259,51 @@ async function clearHistory(userId) {
 
 
 // ======================================================
-// TELEGRAM SEND MESSAGE
+// TELEGRAM MESSAGE
 // ======================================================
 
-async function sendMessage(chatId, text) {
+async function sendMessage(
+  chatId,
+  text
+) {
   if (!text) {
-    text = "Не удалось получить ответ.";
+    text =
+      "Не удалось получить ответ.";
   }
 
-  for (let i = 0; i < text.length; i += 4000) {
-    const part = text.slice(i, i + 4000);
+  for (
+    let i = 0;
+    i < text.length;
+    i += 4000
+  ) {
+    const part =
+      text.slice(
+        i,
+        i + 4000
+      );
 
-    const response = await fetch(
-      `${TELEGRAM_API}/sendMessage`,
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          chat_id: chatId,
-          text: part,
-        }),
-      }
-    );
+    const response =
+      await fetch(
+        `${TELEGRAM_API}/sendMessage`,
+        {
+          method: "POST",
+
+          headers: {
+            "Content-Type":
+              "application/json",
+          },
+
+          body:
+            JSON.stringify({
+              chat_id: chatId,
+              text: part,
+            }),
+        }
+      );
 
     if (!response.ok) {
       console.error(
-        "Telegram sendMessage:",
+        "Telegram:",
         await response.text()
       );
     }
@@ -194,35 +312,53 @@ async function sendMessage(chatId, text) {
 
 
 // ======================================================
-// "ПЕЧАТАЕТ..."
+// TYPING...
 // ======================================================
 
-async function sendChatAction(chatId, action = "typing") {
+async function sendChatAction(
+  chatId,
+  action = "typing"
+) {
   try {
-    await fetch(`${TELEGRAM_API}/sendChatAction`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        chat_id: chatId,
-        action,
-      }),
-    });
+    await fetch(
+      `${TELEGRAM_API}/sendChatAction`,
+      {
+        method: "POST",
+
+        headers: {
+          "Content-Type":
+            "application/json",
+        },
+
+        body:
+          JSON.stringify({
+            chat_id: chatId,
+            action,
+          }),
+      }
+    );
   } catch (error) {
-    console.error("ChatAction:", error);
+    console.error(
+      "Chat action:",
+      error
+    );
   }
 }
 
-function startThinking(chatId, action = "typing") {
+
+function startThinking(
+  chatId,
+  action = "typing"
+) {
   let stopped = false;
 
   const run = async () => {
     while (!stopped) {
-      await sendChatAction(chatId, action);
+      await sendChatAction(
+        chatId,
+        action
+      );
 
-      // Telegram chat action живёт недолго,
-      // поэтому обновляем её.
       await sleep(4000);
     }
   };
@@ -236,31 +372,186 @@ function startThinking(chatId, action = "typing") {
 
 
 // ======================================================
-// TELEGRAM FILE
+// GROQ AVAILABLE MODELS
+// ======================================================
+
+async function getGroqModels(
+  forceRefresh = false
+) {
+  if (!GROQ_API_KEY) {
+    return [];
+  }
+
+  const now =
+    Date.now();
+
+  if (
+    !forceRefresh &&
+    modelCache.models.length &&
+    now - modelCache.loadedAt <
+      MODEL_CACHE_TIME
+  ) {
+    return modelCache.models;
+  }
+
+  try {
+    const response =
+      await fetch(
+        GROQ_MODELS_API,
+        {
+          method: "GET",
+
+          headers: {
+            Authorization:
+              `Bearer ${GROQ_API_KEY}`,
+
+            "Content-Type":
+              "application/json",
+          },
+        }
+      );
+
+    const raw =
+      await response.text();
+
+    console.log(
+      "Groq models:",
+      response.status
+    );
+
+    if (!response.ok) {
+      console.error(
+        "Groq models error:",
+        raw
+      );
+
+      return [];
+    }
+
+    const data =
+      JSON.parse(raw);
+
+    const models =
+      Array.isArray(data.data)
+        ? data.data
+            .map((item) => item.id)
+            .filter(Boolean)
+        : [];
+
+    modelCache = {
+      models,
+      loadedAt: now,
+    };
+
+    console.log(
+      "Available Groq models:",
+      models
+    );
+
+    return models;
+
+  } catch (error) {
+    console.error(
+      "Groq models exception:",
+      error
+    );
+
+    return [];
+  }
+}
+
+
+// ======================================================
+// CHOOSE MODEL
+// ======================================================
+
+function findAvailableModel(
+  available,
+  priority
+) {
+  for (const model of priority) {
+    if (available.includes(model)) {
+      return model;
+    }
+  }
+
+  return null;
+}
+
+
+async function chooseTextModel() {
+  const available =
+    await getGroqModels();
+
+  const preferred =
+    findAvailableModel(
+      available,
+      TEXT_MODEL_PRIORITY
+    );
+
+  if (preferred) {
+    return preferred;
+  }
+
+  // Если /models по какой-то причине
+  // не сработал, пробуем production
+  // модель напрямую.
+  if (!available.length) {
+    return "openai/gpt-oss-120b";
+  }
+
+  return null;
+}
+
+
+async function chooseVisionModel() {
+  const available =
+    await getGroqModels();
+
+  return findAvailableModel(
+    available,
+    VISION_MODEL_PRIORITY
+  );
+}
+
+
+// ======================================================
+// TELEGRAM FILE DOWNLOAD
 // ======================================================
 
 async function getTelegramFile(fileId) {
   try {
-    const response = await fetch(
-      `${TELEGRAM_API}/getFile?file_id=${encodeURIComponent(fileId)}`
-    );
+    const infoResponse =
+      await fetch(
+        `${TELEGRAM_API}/getFile?file_id=${encodeURIComponent(fileId)}`
+      );
 
-    const data = await response.json();
+    const info =
+      await infoResponse.json();
 
-    if (!data.ok || !data.result?.file_path) {
-      console.error("Telegram getFile:", data);
+    if (
+      !info.ok ||
+      !info.result?.file_path
+    ) {
+      console.error(
+        "Telegram getFile:",
+        info
+      );
+
       return null;
     }
 
-    const filePath = data.result.file_path;
+    const filePath =
+      info.result.file_path;
 
-    const fileResponse = await fetch(
-      `https://api.telegram.org/file/bot${TELEGRAM_BOT_TOKEN}/${filePath}`
-    );
+    const fileResponse =
+      await fetch(
+        `https://api.telegram.org/file/bot${TELEGRAM_BOT_TOKEN}/${filePath}`
+      );
 
     if (!fileResponse.ok) {
       console.error(
-        "Telegram file download:",
+        "Telegram download:",
         fileResponse.status
       );
 
@@ -271,48 +562,74 @@ async function getTelegramFile(fileId) {
       await fileResponse.arrayBuffer();
 
     return {
-      buffer: Buffer.from(arrayBuffer),
+      buffer:
+        Buffer.from(arrayBuffer),
+
       filePath,
     };
+
   } catch (error) {
-    console.error("Telegram file exception:", error);
+    console.error(
+      "Telegram file:",
+      error
+    );
+
     return null;
   }
 }
 
 
 // ======================================================
-// IMAGE -> DATA URL
+// IMAGE
 // ======================================================
 
-function imageMimeType(filePath) {
-  const lower = String(filePath).toLowerCase();
+function getImageMimeType(
+  filePath
+) {
+  const lower =
+    String(filePath)
+      .toLowerCase();
 
-  if (lower.endsWith(".png")) {
+  if (
+    lower.endsWith(".png")
+  ) {
     return "image/png";
   }
 
-  if (lower.endsWith(".webp")) {
+  if (
+    lower.endsWith(".webp")
+  ) {
     return "image/webp";
   }
 
-  if (lower.endsWith(".gif")) {
+  if (
+    lower.endsWith(".gif")
+  ) {
     return "image/gif";
   }
 
   return "image/jpeg";
 }
 
-async function getTelegramImageData(fileId) {
-  const file = await getTelegramFile(fileId);
 
-  if (!file) return null;
+async function getTelegramImageData(
+  fileId
+) {
+  const file =
+    await getTelegramFile(fileId);
+
+  if (!file) {
+    return null;
+  }
 
   const mimeType =
-    imageMimeType(file.filePath);
+    getImageMimeType(
+      file.filePath
+    );
 
   const base64 =
-    file.buffer.toString("base64");
+    file.buffer
+      .toString("base64");
 
   return (
     `data:${mimeType};base64,${base64}`
@@ -326,7 +643,8 @@ async function getTelegramImageData(fileId) {
 
 function detectLanguage(text) {
   const source =
-    String(text || "").trim();
+    String(text || "")
+      .trim();
 
   const lower =
     source.toLowerCase();
@@ -337,43 +655,57 @@ function detectLanguage(text) {
 
   if (
     /[іїєґ]/i.test(source) ||
-    /\b(що|цей|ця|зараз|сьогодні|поясни|виконай|зроби|скороти|новини|свіжі|останні)\b/i.test(lower)
+
+    /\b(що|цей|ця|зараз|сьогодні|поясни|виконай|зроби|скороти|новини|свіжі|останні)\b/i.test(
+      lower
+    )
   ) {
     return "uk";
   }
 
-  if (/[а-яё]/i.test(source)) {
+  if (
+    /[а-яё]/i.test(source)
+  ) {
     return "ru";
   }
 
   return "en";
 }
 
-function languageInstruction(language) {
+
+function languageInstruction(
+  language
+) {
   if (language === "uk") {
-    return "Відповідай українською мовою.";
+    return (
+      "Відповідай українською мовою."
+    );
   }
 
   if (language === "en") {
-    return "Answer in English.";
+    return (
+      "Answer in English."
+    );
   }
 
-  return "Отвечай на русском языке.";
+  return (
+    "Отвечай на русском языке."
+  );
 }
 
 
 // ======================================================
-// TELEGRAM MATH
+// TELEGRAM MATH RULES
 // ======================================================
 
 function telegramFormattingRules() {
   return `
 ВАЖНО ДЛЯ TELEGRAM:
 
-Telegram здесь показывает обычный текст.
-Не используй LaTeX.
+Telegram показывает обычный текст.
 
-НИКОГДА не используй:
+НЕ используй LaTeX:
+
 \\[
 \\]
 \\(
@@ -387,31 +719,35 @@ Telegram здесь показывает обычный текст.
 \\end
 \\boxed
 
-Не используй $...$ или $$...$$.
+Не используй $...$.
 
-Пиши:
+Пиши формулы обычным текстом.
+
+Примеры:
 
 5,4 · 10⁴
+
 1,02 · 10⁻²
+
 R = U / I
+
 Q = I² · R · t
+
 h = √(m · n)
+
 x = (-b ± √D) / (2a)
 
 Используй:
 · или × для умножения
 / или : для деления
 √ для корня
-² ³ ⁴ и Unicode-степени, когда возможно.
-
-Ответ должен нормально читаться
-прямо в Telegram.
+Unicode-степени, когда возможно.
 `;
 }
 
 
 // ======================================================
-// CLEAN RESPONSE
+// CLEAN OUTPUT
 // ======================================================
 
 function superscriptNumber(value) {
@@ -432,9 +768,13 @@ function superscriptNumber(value) {
 
   return String(value)
     .split("")
-    .map((char) => map[char] || char)
+    .map(
+      (char) =>
+        map[char] || char
+    )
     .join("");
 }
+
 
 function subscriptNumber(value) {
   const map = {
@@ -454,14 +794,21 @@ function subscriptNumber(value) {
 
   return String(value)
     .split("")
-    .map((char) => map[char] || char)
+    .map(
+      (char) =>
+        map[char] || char
+    )
     .join("");
 }
 
-function cleanAIResponse(text) {
-  if (!text) return "";
 
-  let result = String(text);
+function cleanAIResponse(text) {
+  if (!text) {
+    return "";
+  }
+
+  let result =
+    String(text);
 
   result = result.replace(
     /<\|tool_call_start\|>[\s\S]*?<\|tool_call_end\|>/gi,
@@ -479,26 +826,9 @@ function cleanAIResponse(text) {
   );
 
   result = result.replace(
-    /<\|tool_call[^>]*\|>/gi,
-    ""
-  );
-
-  result = result.replace(
     /^\s*User Safety\s*:\s*safe\s*$/gim,
     ""
   );
-
-  result = result.replace(
-    /^\s*Response Safety\s*:\s*safe\s*$/gim,
-    ""
-  );
-
-  result = result.replace(
-    /^\s*Safety\s*:\s*safe\s*$/gim,
-    ""
-  );
-
-  // LaTeX wrappers
 
   result = result
     .replace(/\\\[/g, "")
@@ -506,8 +836,6 @@ function cleanAIResponse(text) {
     .replace(/\\\(/g, "")
     .replace(/\\\)/g, "")
     .replace(/\$\$/g, "");
-
-  // LaTeX operators
 
   result = result
     .replace(/\\cdot/g, "·")
@@ -525,8 +853,6 @@ function cleanAIResponse(text) {
     .replace(/\\pi/g, "π")
     .replace(/\\Omega/g, "Ω");
 
-  // Text commands
-
   result = result.replace(
     /\\text\{([^{}]*)\}/g,
     "$1"
@@ -537,59 +863,50 @@ function cleanAIResponse(text) {
     "$1"
   );
 
-  // Square roots
-
   result = result.replace(
     /\\sqrt\{([^{}]*)\}/g,
     "√($1)"
   );
 
-  // Simple fractions
-
-  for (let i = 0; i < 5; i++) {
+  for (
+    let i = 0;
+    i < 5;
+    i++
+  ) {
     result = result.replace(
       /\\frac\{([^{}]+)\}\{([^{}]+)\}/g,
       "($1) / ($2)"
     );
   }
 
-  // Decimal comma from LaTeX
-
   result = result.replace(
     /\{,\}/g,
     ","
   );
 
-  // Powers
-
   result = result.replace(
     /10\^\{([+\-]?\d+)\}/g,
     (_, power) =>
-      "10" + superscriptNumber(power)
+      "10" +
+      superscriptNumber(power)
   );
 
   result = result.replace(
     /10\^([+\-]?\d+)/g,
     (_, power) =>
-      "10" + superscriptNumber(power)
+      "10" +
+      superscriptNumber(power)
   );
 
   result = result.replace(
     /([A-Za-zА-Яа-яІіЇїЄєҐґ0-9])\^\{([+\-]?\d+)\}/g,
     (_, base, power) =>
-      base + superscriptNumber(power)
+      base +
+      superscriptNumber(power)
   );
-
-  // Subscripts
 
   result = result.replace(
     /_\{([+\-]?\d+)\}/g,
-    (_, number) =>
-      subscriptNumber(number)
-  );
-
-  result = result.replace(
-    /_([0-9])/g,
     (_, number) =>
       subscriptNumber(number)
   );
@@ -609,11 +926,13 @@ function cleanAIResponse(text) {
 
 
 // ======================================================
-// INTERNET DETECTION
+// INTERNET
 // ======================================================
 
 function needsInternet(text) {
-  if (!text) return false;
+  if (!text) {
+    return false;
+  }
 
   const t =
     text.toLowerCase();
@@ -626,11 +945,8 @@ function needsInternet(text) {
     "свеж",
     "актуаль",
     "последн",
-    "недавно",
     "новости",
     "что нового",
-    "что произошло",
-    "что случилось",
     "погода",
     "температура",
     "дождь",
@@ -646,12 +962,11 @@ function needsInternet(text) {
     "цена",
     "сколько стоит",
     "обновление",
-    "обнова",
     "патч",
     "релиз",
     "утечк",
     "слив",
-    "инсайдер",
+    "инсайд",
 
     "зараз",
     "сьогодні",
@@ -682,12 +997,10 @@ function needsInternet(text) {
 }
 
 
-// ======================================================
-// CONTEXT FOLLOW-UP
-// ======================================================
-
 function isContextFollowUp(text) {
-  if (!text) return false;
+  if (!text) {
+    return false;
+  }
 
   const t =
     text.toLowerCase().trim();
@@ -724,7 +1037,10 @@ function isContextFollowUp(text) {
   );
 }
 
-async function getConversationContext(userId) {
+
+async function getConversationContext(
+  userId
+) {
   const history =
     await getHistory(userId);
 
@@ -738,16 +1054,13 @@ async function getConversationContext(userId) {
 
       return (
         `${speaker}: ` +
-        String(item.content).slice(0, 1200)
+        String(item.content)
+          .slice(0, 1200)
       );
     })
     .join("\n");
 }
 
-
-// ======================================================
-// SEARCH QUERY
-// ======================================================
 
 async function buildSearchQuery(
   text,
@@ -761,18 +1074,7 @@ async function buildSearchQuery(
     t.includes("курс доллара") ||
     t.includes("курс долара");
 
-  const anotherCurrency =
-    t.includes("руб") ||
-    t.includes("rub") ||
-    t.includes("евро") ||
-    t.includes("eur") ||
-    t.includes("злот") ||
-    t.includes("pln");
-
-  if (
-    genericDollar &&
-    !anotherCurrency
-  ) {
+  if (genericDollar) {
     if (language === "uk") {
       return (
         "актуальний курс долара США " +
@@ -786,21 +1088,24 @@ async function buildSearchQuery(
     );
   }
 
-  if (isContextFollowUp(text)) {
+  if (
+    isContextFollowUp(text)
+  ) {
     const context =
-      await getConversationContext(userId);
+      await getConversationContext(
+        userId
+      );
 
     if (context) {
       return `
-Найди свежую информацию по теме разговора.
+Найди свежую информацию
+по теме разговора.
 
 КОНТЕКСТ:
 ${context}
 
 ВОПРОС:
 ${text}
-
-Определи конкретную тему из контекста.
 `.trim();
     }
   }
@@ -815,42 +1120,51 @@ ${text}
 
 async function searchWeb(query) {
   if (!TAVILY_API_KEY) {
-    console.error("Tavily not configured");
     return null;
   }
 
   try {
-    const response = await fetch(
-      "https://api.tavily.com/search",
-      {
-        method: "POST",
-        headers: {
-          "Content-Type":
-            "application/json",
+    const response =
+      await fetch(
+        "https://api.tavily.com/search",
+        {
+          method: "POST",
 
-          Authorization:
-            `Bearer ${TAVILY_API_KEY}`,
-        },
+          headers: {
+            "Content-Type":
+              "application/json",
 
-        body: JSON.stringify({
-          query,
-          search_depth: "basic",
-          max_results: 7,
-          include_answer: true,
-          include_raw_content: false,
-        }),
-      }
-    );
+            Authorization:
+              `Bearer ${TAVILY_API_KEY}`,
+          },
+
+          body:
+            JSON.stringify({
+              query,
+              search_depth:
+                "basic",
+              max_results: 7,
+              include_answer: true,
+              include_raw_content:
+                false,
+            }),
+        }
+      );
 
     const raw =
       await response.text();
 
     if (!response.ok) {
-      console.error("Tavily:", raw);
+      console.error(
+        "Tavily:",
+        raw
+      );
+
       return null;
     }
 
     return JSON.parse(raw);
+
   } catch (error) {
     console.error(
       "Tavily exception:",
@@ -861,17 +1175,23 @@ async function searchWeb(query) {
   }
 }
 
+
 function makeWebContext(data) {
-  if (!data) return null;
+  if (!data) {
+    return null;
+  }
 
   let result = "";
 
   if (data.answer) {
     result +=
-      `SEARCH SUMMARY:\n${data.answer}\n\n`;
+      `SEARCH SUMMARY:\n` +
+      `${data.answer}\n\n`;
   }
 
-  if (Array.isArray(data.results)) {
+  if (
+    Array.isArray(data.results)
+  ) {
     result += data.results
       .slice(0, 7)
       .map(
@@ -896,142 +1216,69 @@ ${item.url || "Unknown"}
 
 
 // ======================================================
-// GROQ CHAT / VISION
-// ======================================================
-
-async function requestGroq(
-  messages,
-  options = {}
-) {
-  if (!GROQ_API_KEY) {
-    console.error("GROQ_API_KEY missing");
-    return null;
-  }
-
-  try {
-    const response = await fetch(
-      GROQ_CHAT_API,
-      {
-        method: "POST",
-
-        headers: {
-          "Content-Type":
-            "application/json",
-
-          Authorization:
-            `Bearer ${GROQ_API_KEY}`,
-        },
-
-        body: JSON.stringify({
-          model: AI_MODEL,
-          messages,
-
-          temperature:
-            options.temperature ?? 0.4,
-
-          max_completion_tokens:
-            options.maxTokens ?? 1800,
-
-          // Не позволяем модели самой
-          // вызывать инструменты.
-          tool_choice: "none",
-        }),
-      }
-    );
-
-    const raw =
-      await response.text();
-
-    console.log(
-      "Groq:",
-      response.status
-    );
-
-    if (!response.ok) {
-      console.error(
-        "Groq error:",
-        raw
-      );
-
-      return null;
-    }
-
-    const data =
-      JSON.parse(raw);
-
-    return (
-      data?.choices?.[0]?.message?.content ||
-      null
-    );
-  } catch (error) {
-    console.error(
-      "Groq exception:",
-      error
-    );
-
-    return null;
-  }
-}
-
-
-// ======================================================
 // SYSTEM PROMPT
 // ======================================================
 
 function makeSystemPrompt({
   language,
-  webContext,
+  webContext = null,
   vision = false,
 }) {
   const currentTime =
-    new Date().toLocaleString(
-      "ru-RU",
-      {
-        timeZone:
-          "Europe/Kyiv",
-      }
-    );
+    new Date()
+      .toLocaleString(
+        "ru-RU",
+        {
+          timeZone:
+            "Europe/Kyiv",
+        }
+      );
 
   let prompt = `
-Ты AI Guide — персональный Telegram AI-ассистент.
+Ты AI Guide —
+персональный Telegram AI-ассистент.
 
-Текущая дата и время:
+Текущее время:
 ${currentTime}
 
 ${languageInstruction(language)}
 
 Учитывай историю разговора.
 
-Если пользователь пишет:
-"сделай короче",
-"подробнее",
-"а почему?",
-"продолжи",
-"сделай №3",
-то учитывай предыдущие сообщения.
+Понимай продолжения:
+"сократи"
+"подробнее"
+"продолжи"
+"а почему?"
+"сделай №3"
+
+Не проси повторять информацию,
+если она уже есть в истории.
 
 Не придумывай факты.
 
-Если не уверен — скажи об этом.
+Если не уверен —
+честно скажи об этом.
 
 Для школьных заданий:
-- внимательно читай условие;
-- не меняй числа;
-- не придумывай текст;
-- проверяй вычисления;
-- если попросили конкретный пункт, выполняй только его.
+1. Внимательно прочитай условие.
+2. Не меняй числа.
+3. Не придумывай условие.
+4. Решай именно тот номер,
+   который попросил пользователь.
+5. Проверяй вычисления.
 
-Если на странице написано "Вправа №1",
-а внутри есть пункты 1, 2, 3...
-и пользователь пишет "виконай вправу 3",
+Если написано "Вправа №1",
+внутри есть пункты 1, 2, 3...
+и пользователь пишет
+"виконай вправу 3",
 обычно имеется в виду пункт 3.
-Не решай всю страницу без просьбы.
 
-Не показывай внутренние рассуждения модели.
-Давай только полезный итог и нужное объяснение.
+Не решай всю страницу,
+если этого не просили.
 
-Не вызывай самостоятельно Google,
-browser, search или другие инструменты.
+Не показывай внутреннюю
+цепочку рассуждений модели.
 
 ${telegramFormattingRules()}
 `;
@@ -1039,23 +1286,31 @@ ${telegramFormattingRules()}
   if (vision) {
     prompt += `
 
-Пользователь прислал одно или несколько изображений.
+Пользователь прислал изображение
+или несколько изображений.
 
-Реально изучи каждое изображение.
+Реально изучи изображения.
 
-Если это:
-- школьное задание — прочитай и выполни просьбу;
-- скриншот ошибки — прочитай ошибку и объясни решение;
-- интерфейс — объясни, что видно;
-- текст — прочитай его;
-- обычное фото — ответь на вопрос об изображении.
+Если это школьная работа:
+прочитай точное условие.
+
+Если это скриншот:
+прочитай интерфейс и ошибки.
+
+Если это текст:
+прочитай его.
+
+Если это обычное фото:
+ответь на вопрос пользователя.
 
 Если изображений несколько,
-учитывай их как части одного запроса.
+рассматривай их вместе.
 
-Не придумывай мелкие или нечитаемые детали.
-Если важный текст не читается,
-скажи, что именно не удалось прочитать.
+Не придумывай нечитаемые детали.
+
+Если часть изображения
+действительно невозможно прочитать,
+скажи об этом.
 `;
   }
 
@@ -1063,13 +1318,15 @@ ${telegramFormattingRules()}
     prompt += `
 
 WEB DATA:
+
 ${webContext}
 
-Это свежие результаты поиска Tavily.
+Это результаты Tavily.
 
-Используй их для актуального вопроса.
+Используй их для свежей информации.
 Проверяй даты.
-Не показывай сырые URL,
+
+Не показывай URL,
 если пользователь не попросил ссылки.
 `;
   }
@@ -1079,7 +1336,128 @@ ${webContext}
 
 
 // ======================================================
-// ASK TEXT
+// GROQ CHAT REQUEST
+// ======================================================
+
+async function requestGroq({
+  messages,
+  model,
+  temperature = 0.4,
+  maxTokens = 1800,
+}) {
+  if (!GROQ_API_KEY) {
+    return {
+      ok: false,
+      status: 0,
+      text: null,
+      error:
+        "GROQ_API_KEY missing",
+    };
+  }
+
+  try {
+    const response =
+      await fetch(
+        GROQ_CHAT_API,
+        {
+          method: "POST",
+
+          headers: {
+            "Content-Type":
+              "application/json",
+
+            Authorization:
+              `Bearer ${GROQ_API_KEY}`,
+          },
+
+          body:
+            JSON.stringify({
+              model,
+              messages,
+              temperature,
+
+              max_completion_tokens:
+                maxTokens,
+
+              tool_choice:
+                "none",
+            }),
+        }
+      );
+
+    const raw =
+      await response.text();
+
+    console.log(
+      `Groq ${model}:`,
+      response.status
+    );
+
+    if (!response.ok) {
+      console.error(
+        `Groq ${model}:`,
+        raw
+      );
+
+      // Если модель пропала/недоступна,
+      // обновим cache при следующем запросе.
+      if (
+        response.status === 400 ||
+        response.status === 404
+      ) {
+        modelCache = {
+          models: [],
+          loadedAt: 0,
+        };
+      }
+
+      return {
+        ok: false,
+        status:
+          response.status,
+        text: null,
+        error: raw,
+      };
+    }
+
+    const data =
+      JSON.parse(raw);
+
+    const content =
+      data
+        ?.choices
+        ?.[0]
+        ?.message
+        ?.content;
+
+    return {
+      ok: true,
+      status:
+        response.status,
+      text:
+        content || null,
+      error: null,
+    };
+
+  } catch (error) {
+    console.error(
+      "Groq exception:",
+      error
+    );
+
+    return {
+      ok: false,
+      status: 0,
+      text: null,
+      error:
+        String(error),
+    };
+  }
+}
+
+
+// ======================================================
+// TEXT AI
 // ======================================================
 
 async function askTextAI({
@@ -1091,13 +1469,25 @@ async function askTextAI({
   const history =
     await getHistory(userId);
 
+  const model =
+    await chooseTextModel();
+
+  if (!model) {
+    return (
+      "⚠️ Groq сейчас не показывает " +
+      "ни одной подходящей текстовой модели для этого API-ключа."
+    );
+  }
+
   const messages = [
     {
       role: "system",
-      content: makeSystemPrompt({
-        language,
-        webContext,
-      }),
+
+      content:
+        makeSystemPrompt({
+          language,
+          webContext,
+        }),
     },
 
     ...history,
@@ -1108,21 +1498,67 @@ async function askTextAI({
     },
   ];
 
-  const answer =
-    await requestGroq(messages);
+  let result =
+    await requestGroq({
+      messages,
+      model,
+      temperature: 0.4,
+      maxTokens: 1800,
+    });
+
+  // Если GPT-OSS 120B внезапно
+  // недоступна, пробуем 20B.
+  if (
+    !result.ok &&
+    model ===
+      "openai/gpt-oss-120b"
+  ) {
+    const available =
+      await getGroqModels(true);
+
+    if (
+      available.includes(
+        "openai/gpt-oss-20b"
+      )
+    ) {
+      result =
+        await requestGroq({
+          messages,
+
+          model:
+            "openai/gpt-oss-20b",
+
+          temperature: 0.4,
+          maxTokens: 1800,
+        });
+    }
+  }
 
   const cleaned =
-    cleanAIResponse(answer);
+    cleanAIResponse(
+      result.text
+    );
+
+  if (cleaned) {
+    return cleaned;
+  }
+
+  if (result.status === 429) {
+    return (
+      "⚠️ Сейчас достигнут лимит Groq. " +
+      "Попробуй немного позже."
+    );
+  }
 
   return (
-    cleaned ||
-    "⚠️ Не удалось получить ответ от Groq. Попробуй ещё раз."
+    "⚠️ Groq не смог получить ответ. " +
+    "Посмотри логи Vercel — там будет точная ошибка."
   );
 }
 
 
 // ======================================================
-// ASK VISION
+// VISION AI
 // ======================================================
 
 async function askVisionAI({
@@ -1131,30 +1567,50 @@ async function askVisionAI({
   userId,
   language,
 }) {
+  const model =
+    await chooseVisionModel();
+
+  if (!model) {
+    return (
+      "⚠️ Твой Groq API-ключ сейчас не показывает " +
+      "доступную Vision-модель. " +
+      "Текст и голос продолжат работать, " +
+      "но фото пока недоступны для этого ключа."
+    );
+  }
+
   const history =
     await getHistory(userId);
-
-  const safeHistory =
-    history.slice(-10);
 
   const userContent = [
     {
       type: "text",
+
       text:
         caption ||
         (
           images.length > 1
-            ? "Проанализируй все эти изображения вместе. Если на них есть задания или текст, помоги с ними."
-            : "Внимательно проанализируй изображение и помоги с тем, что на нём."
+            ? "Проанализируй все изображения вместе."
+            : "Внимательно проанализируй изображение."
         ),
     },
   ];
 
+  const imageLimit =
+    model === "qwen/qwen3.8-27b"
+      ? 3
+      : 5;
+
   for (
-    const imageData of images.slice(0, MAX_IMAGES)
+    const imageData of
+    images.slice(
+      0,
+      imageLimit
+    )
   ) {
     userContent.push({
       type: "image_url",
+
       image_url: {
         url: imageData,
       },
@@ -1164,13 +1620,15 @@ async function askVisionAI({
   const messages = [
     {
       role: "system",
-      content: makeSystemPrompt({
-        language,
-        vision: true,
-      }),
+
+      content:
+        makeSystemPrompt({
+          language,
+          vision: true,
+        }),
     },
 
-    ...safeHistory,
+    ...history.slice(-10),
 
     {
       role: "user",
@@ -1178,34 +1636,67 @@ async function askVisionAI({
     },
   ];
 
-  const answer =
-    await requestGroq(
+  let result =
+    await requestGroq({
       messages,
-      {
-        temperature: 0.2,
-        maxTokens: 2400,
-      }
-    );
+      model,
+      temperature: 0.2,
+      maxTokens: 2400,
+    });
+
+  // Если одна Qwen исчезла,
+  // обновляем список и пробуем вторую.
+  if (!result.ok) {
+    const available =
+      await getGroqModels(true);
+
+    const fallback =
+      VISION_MODEL_PRIORITY.find(
+        (candidate) =>
+          candidate !== model &&
+          available.includes(candidate)
+      );
+
+    if (fallback) {
+      result =
+        await requestGroq({
+          messages,
+          model: fallback,
+          temperature: 0.2,
+          maxTokens: 2400,
+        });
+    }
+  }
 
   const cleaned =
-    cleanAIResponse(answer);
+    cleanAIResponse(
+      result.text
+    );
+
+  if (cleaned) {
+    return cleaned;
+  }
+
+  if (result.status === 429) {
+    return (
+      "⚠️ Сейчас достигнут лимит Groq Vision. " +
+      "Попробуй немного позже."
+    );
+  }
 
   return (
-    cleaned ||
-    "⚠️ Не удалось проанализировать изображение. Попробуй ещё раз."
+    "⚠️ Groq не смог проанализировать изображение."
   );
 }
 
 
 // ======================================================
-// GROQ WHISPER
+// WHISPER
 // ======================================================
 
-async function transcribeTelegramAudio(fileId) {
-  if (!GROQ_API_KEY) {
-    return null;
-  }
-
+async function transcribeTelegramAudio(
+  fileId
+) {
   const file =
     await getTelegramFile(fileId);
 
@@ -1217,31 +1708,46 @@ async function transcribeTelegramAudio(fileId) {
     const form =
       new FormData();
 
-    let extension = "ogg";
-
     const lower =
-      String(file.filePath).toLowerCase();
+      String(file.filePath)
+        .toLowerCase();
 
-    if (lower.endsWith(".mp3")) {
+    let extension = "ogg";
+    let mime = "audio/ogg";
+
+    if (
+      lower.endsWith(".mp3")
+    ) {
       extension = "mp3";
-    } else if (lower.endsWith(".wav")) {
+      mime = "audio/mpeg";
+    }
+
+    if (
+      lower.endsWith(".wav")
+    ) {
       extension = "wav";
-    } else if (lower.endsWith(".m4a")) {
+      mime = "audio/wav";
+    }
+
+    if (
+      lower.endsWith(".m4a")
+    ) {
       extension = "m4a";
-    } else if (lower.endsWith(".webm")) {
+      mime = "audio/mp4";
+    }
+
+    if (
+      lower.endsWith(".webm")
+    ) {
       extension = "webm";
-    } else if (lower.endsWith(".mp4")) {
-      extension = "mp4";
+      mime = "audio/webm";
     }
 
     const blob =
       new Blob(
         [file.buffer],
         {
-          type:
-            extension === "ogg"
-              ? "audio/ogg"
-              : `audio/${extension}`,
+          type: mime,
         }
       );
 
@@ -1291,7 +1797,7 @@ async function transcribeTelegramAudio(fileId) {
 
     if (!response.ok) {
       console.error(
-        "Whisper error:",
+        "Whisper:",
         raw
       );
 
@@ -1305,6 +1811,7 @@ async function transcribeTelegramAudio(fileId) {
       data?.text?.trim() ||
       null
     );
+
   } catch (error) {
     console.error(
       "Whisper exception:",
@@ -1317,7 +1824,7 @@ async function transcribeTelegramAudio(fileId) {
 
 
 // ======================================================
-// HANDLE VOICE
+// VOICE
 // ======================================================
 
 async function handleVoice({
@@ -1340,14 +1847,14 @@ async function handleVoice({
     if (!transcription) {
       await sendMessage(
         chatId,
-        "⚠️ Не удалось распознать голосовое сообщение."
+        "⚠️ Не удалось распознать голосовое."
       );
 
       return;
     }
 
     console.log(
-      "Voice transcription:",
+      "VOICE:",
       transcription
     );
 
@@ -1374,9 +1881,7 @@ async function handleVoice({
         await searchWeb(query);
 
       webContext =
-        makeWebContext(
-          webData
-        );
+        makeWebContext(webData);
     }
 
     const answer =
@@ -1389,7 +1894,9 @@ async function handleVoice({
 
     await saveExchange(
       userId,
+
       `[Голосовое сообщение]\n${transcription}`,
+
       answer
     );
 
@@ -1397,6 +1904,70 @@ async function handleVoice({
       chatId,
       answer
     );
+
+  } finally {
+    stopThinking();
+  }
+}
+
+
+// ======================================================
+// SINGLE PHOTO
+// ======================================================
+
+async function handleSinglePhoto({
+  chatId,
+  userId,
+  fileId,
+  caption,
+}) {
+  const stopThinking =
+    startThinking(
+      chatId,
+      "typing"
+    );
+
+  try {
+    const image =
+      await getTelegramImageData(
+        fileId
+      );
+
+    if (!image) {
+      await sendMessage(
+        chatId,
+        "⚠️ Не удалось скачать фото."
+      );
+
+      return;
+    }
+
+    const language =
+      detectLanguage(caption);
+
+    const answer =
+      await askVisionAI({
+        images: [image],
+        caption,
+        userId,
+        language,
+      });
+
+    await saveExchange(
+      userId,
+
+      caption
+        ? `[Фото]\n${caption}`
+        : "[Пользователь отправил фото]",
+
+      answer
+    );
+
+    await sendMessage(
+      chatId,
+      answer
+    );
+
   } finally {
     stopThinking();
   }
@@ -1405,8 +1976,6 @@ async function handleVoice({
 
 // ======================================================
 // ALBUM
-// Telegram отправляет каждое фото отдельно.
-// Собираем file_id в Redis.
 // ======================================================
 
 async function addAlbumPhoto({
@@ -1464,24 +2033,20 @@ async function addAlbumPhoto({
     "EX",
     "60",
   ]);
-
-  return album;
 }
+
 
 async function getAlbum(
   userId,
   mediaGroupId
 ) {
-  const key =
-    albumKey(
-      userId,
-      mediaGroupId
-    );
-
   const raw =
     await redisCommand([
       "GET",
-      key,
+      albumKey(
+        userId,
+        mediaGroupId
+      ),
     ]);
 
   if (!raw) {
@@ -1494,6 +2059,7 @@ async function getAlbum(
     return null;
   }
 }
+
 
 async function deleteAlbum(
   userId,
@@ -1509,22 +2075,6 @@ async function deleteAlbum(
 }
 
 
-// ======================================================
-// ALBUM LOCK
-// Нужен, чтобы несколько webhook-запросов
-// не ответили на один альбом одновременно.
-// ======================================================
-
-function albumLockKey(
-  userId,
-  mediaGroupId
-) {
-  return (
-    `ai-guide:album-lock:` +
-    `${userId}:${mediaGroupId}`
-  );
-}
-
 async function tryAlbumLock(
   userId,
   mediaGroupId
@@ -1532,10 +2082,12 @@ async function tryAlbumLock(
   const result =
     await redisCommand([
       "SET",
+
       albumLockKey(
         userId,
         mediaGroupId
       ),
+
       "1",
       "NX",
       "EX",
@@ -1545,10 +2097,6 @@ async function tryAlbumLock(
   return result === "OK";
 }
 
-
-// ======================================================
-// HANDLE ALBUM
-// ======================================================
 
 async function handleAlbum({
   chatId,
@@ -1564,23 +2112,18 @@ async function handleAlbum({
     caption,
   });
 
-  // Даём Telegram время прислать
-  // остальные фото альбома.
   await sleep(1800);
 
-  const gotLock =
+  const locked =
     await tryAlbumLock(
       userId,
       mediaGroupId
     );
 
-  // Другой webhook уже занимается
-  // этим альбомом.
-  if (!gotLock) {
+  if (!locked) {
     return;
   }
 
-  // Ещё немного ждём поздние фото.
   await sleep(700);
 
   const album =
@@ -1591,8 +2134,7 @@ async function handleAlbum({
 
   if (
     !album ||
-    !Array.isArray(album.photos) ||
-    album.photos.length === 0
+    !album.photos?.length
   ) {
     return;
   }
@@ -1607,60 +2149,55 @@ async function handleAlbum({
     const images = [];
 
     for (
-      const albumFileId of
+      const photoId of
       album.photos.slice(
         0,
         MAX_IMAGES
       )
     ) {
-      const imageData =
+      const image =
         await getTelegramImageData(
-          albumFileId
+          photoId
         );
 
-      if (imageData) {
-        images.push(
-          imageData
-        );
+      if (image) {
+        images.push(image);
       }
     }
 
     if (!images.length) {
       await sendMessage(
         chatId,
-        "⚠️ Не удалось скачать фотографии."
+        "⚠️ Не удалось загрузить фотографии."
       );
 
       return;
     }
 
-    const finalCaption =
-      album.caption || "";
-
     const language =
       detectLanguage(
-        finalCaption
+        album.caption
       );
 
     const answer =
       await askVisionAI({
         images,
-        caption: finalCaption,
+        caption:
+          album.caption,
         userId,
         language,
       });
 
     await saveExchange(
       userId,
+
+      `[Альбом: ${images.length} фото]` +
       (
-        `[Пользователь отправил альбом: ` +
-        `${images.length} фото]` +
-        (
-          finalCaption
-            ? `\nПодпись: ${finalCaption}`
-            : ""
-        )
+        album.caption
+          ? `\n${album.caption}`
+          : ""
       ),
+
       answer
     );
 
@@ -1668,6 +2205,7 @@ async function handleAlbum({
       chatId,
       answer
     );
+
   } finally {
     stopThinking();
 
@@ -1680,76 +2218,7 @@ async function handleAlbum({
 
 
 // ======================================================
-// SINGLE PHOTO
-// ======================================================
-
-async function handleSinglePhoto({
-  chatId,
-  userId,
-  fileId,
-  caption,
-}) {
-  const stopThinking =
-    startThinking(
-      chatId,
-      "typing"
-    );
-
-  try {
-    const imageData =
-      await getTelegramImageData(
-        fileId
-      );
-
-    if (!imageData) {
-      await sendMessage(
-        chatId,
-        "⚠️ Не удалось скачать изображение."
-      );
-
-      return;
-    }
-
-    const language =
-      detectLanguage(
-        caption
-      );
-
-    const answer =
-      await askVisionAI({
-        images: [
-          imageData,
-        ],
-        caption,
-        userId,
-        language,
-      });
-
-    await saveExchange(
-      userId,
-      (
-        "[Пользователь отправил изображение]" +
-        (
-          caption
-            ? `\nПодпись: ${caption}`
-            : ""
-        )
-      ),
-      answer
-    );
-
-    await sendMessage(
-      chatId,
-      answer
-    );
-  } finally {
-    stopThinking();
-  }
-}
-
-
-// ======================================================
-// STATIC STICKER
+// STICKER
 // ======================================================
 
 async function handleSticker({
@@ -1757,15 +2226,13 @@ async function handleSticker({
   userId,
   sticker,
 }) {
-  // animated .tgs и video .webm
-  // пока не отправляем в vision.
   if (
     sticker.is_animated ||
     sticker.is_video
   ) {
     await sendMessage(
       chatId,
-      "😀 Этот стикер анимированный. Пока я умею анализировать обычные статичные стикеры."
+      "😀 Пока я анализирую только обычные статичные стикеры."
     );
 
     return;
@@ -1778,12 +2245,12 @@ async function handleSticker({
     );
 
   try {
-    const imageData =
+    const image =
       await getTelegramImageData(
         sticker.file_id
       );
 
-    if (!imageData) {
+    if (!image) {
       await sendMessage(
         chatId,
         "⚠️ Не удалось загрузить стикер."
@@ -1794,22 +2261,18 @@ async function handleSticker({
 
     const answer =
       await askVisionAI({
-        images: [
-          imageData,
-        ],
+        images: [image],
 
         caption:
-          "Пользователь отправил тебе стикер. Посмотри на него и коротко, естественно отреагируй на него как собеседник. Если на стикере есть важный текст, учти его.",
+          "Посмотри на стикер и коротко, естественно отреагируй как собеседник. Если на нём есть текст, учти его.",
 
         userId,
-
-        language:
-          "ru",
+        language: "ru",
       });
 
     await saveExchange(
       userId,
-      "[Пользователь отправил стикер]",
+      "[Стикер]",
       answer
     );
 
@@ -1817,6 +2280,7 @@ async function handleSticker({
       chatId,
       answer
     );
+
   } finally {
     stopThinking();
   }
@@ -1827,10 +2291,12 @@ async function handleSticker({
 // POST
 // ======================================================
 
-export async function POST(request) {
+export async function POST(
+  request
+) {
   try {
     console.log(
-      "AI-GUIDE-V7"
+      "AI-GUIDE-V7.1"
     );
 
     const update =
@@ -1851,19 +2317,24 @@ export async function POST(request) {
     const userId =
       message.from?.id;
 
-    if (!chatId || !userId) {
+    if (
+      !chatId ||
+      !userId
+    ) {
       return Response.json({
         ok: true,
       });
     }
 
+
     // ==================================================
-    // PRIVATE MODE
+    // PRIVATE
     // ==================================================
 
     if (
       ALLOWED_USER_ID &&
-      userId !== ALLOWED_USER_ID
+      userId !==
+        ALLOWED_USER_ID
     ) {
       await sendMessage(
         chatId,
@@ -1877,20 +2348,26 @@ export async function POST(request) {
 
 
     // ==================================================
-    // COMMANDS
+    // TEXT / COMMAND
     // ==================================================
 
     const text =
       message.text?.trim();
 
+
     if (
       text &&
       (
-        text.toLowerCase() === "/clear" ||
-        text.toLowerCase() === "/reset"
+        text.toLowerCase() ===
+          "/clear" ||
+
+        text.toLowerCase() ===
+          "/reset"
       )
     ) {
-      await clearHistory(userId);
+      await clearHistory(
+        userId
+      );
 
       await sendMessage(
         chatId,
@@ -1907,10 +2384,13 @@ export async function POST(request) {
     // VOICE
     // ==================================================
 
-    if (message.voice?.file_id) {
+    if (
+      message.voice?.file_id
+    ) {
       await handleVoice({
         chatId,
         userId,
+
         fileId:
           message.voice.file_id,
       });
@@ -1922,13 +2402,16 @@ export async function POST(request) {
 
 
     // ==================================================
-    // AUDIO FILE
+    // AUDIO
     // ==================================================
 
-    if (message.audio?.file_id) {
+    if (
+      message.audio?.file_id
+    ) {
       await handleVoice({
         chatId,
         userId,
+
         fileId:
           message.audio.file_id,
       });
@@ -1943,10 +2426,13 @@ export async function POST(request) {
     // STICKER
     // ==================================================
 
-    if (message.sticker?.file_id) {
+    if (
+      message.sticker?.file_id
+    ) {
       await handleSticker({
         chatId,
         userId,
+
         sticker:
           message.sticker,
       });
@@ -1965,22 +2451,23 @@ export async function POST(request) {
       Array.isArray(
         message.photo
       ) &&
-      message.photo.length > 0
+      message.photo.length
     ) {
-      const biggestPhoto =
+      const photo =
         message.photo[
           message.photo.length - 1
         ];
 
       const fileId =
-        biggestPhoto.file_id;
+        photo.file_id;
 
       const caption =
         message.caption?.trim() ||
         "";
 
-      // Альбом
-      if (message.media_group_id) {
+      if (
+        message.media_group_id
+      ) {
         await handleAlbum({
           chatId,
           userId,
@@ -1997,7 +2484,6 @@ export async function POST(request) {
         });
       }
 
-      // Одиночное фото
       await handleSinglePhoto({
         chatId,
         userId,
@@ -2012,7 +2498,7 @@ export async function POST(request) {
 
 
     // ==================================================
-    // TEXT
+    // NORMAL TEXT
     // ==================================================
 
     if (text) {
@@ -2026,13 +2512,12 @@ export async function POST(request) {
         const language =
           detectLanguage(text);
 
-        let webContext =
-          null;
+        let webContext = null;
 
         if (
           needsInternet(text)
         ) {
-          const searchQuery =
+          const query =
             await buildSearchQuery(
               text,
               userId,
@@ -2040,9 +2525,7 @@ export async function POST(request) {
             );
 
           const webData =
-            await searchWeb(
-              searchQuery
-            );
+            await searchWeb(query);
 
           webContext =
             makeWebContext(
@@ -2068,6 +2551,7 @@ export async function POST(request) {
           chatId,
           answer
         );
+
       } finally {
         stopThinking();
       }
@@ -2079,12 +2563,12 @@ export async function POST(request) {
 
 
     // ==================================================
-    // OTHER
+    // UNKNOWN
     // ==================================================
 
     await sendMessage(
       chatId,
-      "Пока я понимаю текст, фото, альбомы фотографий, голосовые, аудио и обычные статичные стикеры."
+      "Сейчас я понимаю текст, фото, несколько фото, голосовые, аудио и статичные стикеры."
     );
 
     return Response.json({
@@ -2097,8 +2581,6 @@ export async function POST(request) {
       error
     );
 
-    // Возвращаем 200, чтобы Telegram
-    // не повторял update снова и снова.
     return Response.json({
       ok: true,
     });
@@ -2111,9 +2593,24 @@ export async function POST(request) {
 // ======================================================
 
 export async function GET() {
+  const models =
+    await getGroqModels();
+
+  const textModel =
+    findAvailableModel(
+      models,
+      TEXT_MODEL_PRIORITY
+    );
+
+  const visionModel =
+    findAvailableModel(
+      models,
+      VISION_MODEL_PRIORITY
+    );
+
   return Response.json({
     version:
-      "AI-GUIDE-V7-GROQ",
+      "AI-GUIDE-V7.1",
 
     status:
       "Bot is running",
@@ -2139,27 +2636,38 @@ export async function GET() {
     privateMode:
       !!ALLOWED_USER_ID,
 
-    model:
-      AI_MODEL,
+    textModel:
+      textModel ||
+      "NO SUPPORTED TEXT MODEL",
 
-    speechModel:
+    visionModel:
+      visionModel ||
+      "NO VISION MODEL AVAILABLE",
+
+    whisperModel:
       WHISPER_MODEL,
 
-    memory:
-      "Upstash Redis",
+    availableGroqModels:
+      models,
 
     features: {
       text: true,
-      photos: true,
-      multiPhoto: true,
-      maxPhotos: MAX_IMAGES,
+      photos:
+        !!visionModel,
+      multiPhoto:
+        !!visionModel,
       voice: true,
       audio: true,
-      staticStickers: true,
-      animatedStickers: false,
-      typingIndicator: true,
-      webSearch: "Tavily",
-      telegramSafeMath: true,
+      staticStickers:
+        !!visionModel,
+      typingIndicator:
+        true,
+      memory:
+        "Upstash Redis",
+      webSearch:
+        "Tavily",
+      telegramSafeMath:
+        true,
     },
   });
 }
