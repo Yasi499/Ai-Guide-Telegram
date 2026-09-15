@@ -12,13 +12,13 @@ const ffmpegPath = path.join(process.cwd(), "ffmpeg-bin", "ffmpeg");
 export const runtime = "nodejs";
 
 // ======================================================
-// AI GUIDE V7.6.1
+// AI GUIDE V7.6.2
 //
 // Groq:
 // - Text: openai/gpt-oss-120b
 // - Text fallback: openai/gpt-oss-20b
 // - Vision primary: qwen/qwen3.8-27b
-// - Vision fallback: Google Gemini 3.5 Flash
+// - Vision fallback: Google Gemini 3.8 Flash
 // - Voice: whisper-large-v3-turbo
 //
 // Features:
@@ -94,7 +94,7 @@ const VISION_MODEL =
   "qwen/qwen3.8-27b";
 
 const GEMINI_VISION_MODEL =
-  "gemini-3.5-flash";
+  "gemini-3.8-flash";
 
 const GEMINI_OPENAI_CHAT_API =
   "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions";
@@ -297,7 +297,15 @@ async function getLastMedia(userId) {
 function looksLikeMediaFollowup(text) {
   const t = String(text || "").trim().toLowerCase();
   if (!t) return false;
-  return /(?:видео|видос|круж|фото|картин|изображ|кадр|там|тут|на н[её]м|на этом|на первом|на втором|первый|второй|последн|предыдущ|эти два|оба|двух|мыш|клавиат|бренд|марка|логотип|модель|предмет|человек|что это|что за|кто это|покажи|посмотри|рассмотри|увелич|прочитай|надпис|цвет|слева|справа|фон|video|photo|brand|logo)/i.test(t);
+
+  // Explicit references to recent media or visual details.
+  if (/(?:видео|видос|круж|фото|картин|изображ|кадр|там|тут|на н[её]м|на этом|на первом|на втором|первый|второй|последн|предыдущ|эти два|оба|двух|мыш|клавиат|бренд|марка|логотип|модель|предмет|человек|что это|что за|кто это|покажи|посмотри|рассмотри|увелич|прочитай|надпис|цвет|форм|размер|материал|текстур|слева|справа|фон|video|photo|brand|logo)/i.test(t)) {
+    return true;
+  }
+
+  // Natural follow-ups after a photo/circle: "а какой она формы?",
+  // "а он какого цвета?", "а что рядом?" etc.
+  return /^(?:а\s+)?(?:како(?:й|го|му|м)|какая|какую|какие|какого|какой|что|кто|где|есть\s+ли|видно\s+ли)\b.*(?:он|она|оно|они|его|е[её]|их|рядом|сверху|снизу|слева|справа)?/i.test(t);
 }
 
 function pickMediaFromStack(stack, text) {
@@ -1292,7 +1300,29 @@ async function requestGeminiVision({
   }
 }
 
-async function requestVision({ messages, temperature = 0.1, maxTokens = 1200 }) {
+async function requestVision({ messages, temperature = 0.1, maxTokens = 1200, preferGemini = false }) {
+  // First analysis: Groq -> Gemini fallback.
+  // Follow-up re-analysis of saved media: Gemini -> Groq fallback.
+  if (preferGemini) {
+    const gemini = await requestGeminiVision({ messages, temperature, maxTokens });
+    if (gemini.ok && gemini.text) return { ...gemini, provider: "gemini" };
+
+    console.log(`Gemini Vision failed (${gemini.status || "network"}) -> Groq fallback`);
+    const groq = await requestGroq({
+      model: VISION_MODEL,
+      messages,
+      temperature,
+      maxTokens,
+    });
+    if (groq.ok && groq.text) return { ...groq, provider: "groq" };
+
+    return {
+      ...groq,
+      geminiStatus: gemini.status,
+      geminiError: gemini.error,
+    };
+  }
+
   let result = await requestGroq({
     model: VISION_MODEL,
     messages,
@@ -1300,11 +1330,11 @@ async function requestVision({ messages, temperature = 0.1, maxTokens = 1200 }) 
     maxTokens,
   });
 
-  if (result.ok && result.text) return result;
+  if (result.ok && result.text) return { ...result, provider: "groq" };
 
   console.log(`Groq Vision failed (${result.status || "network"}) -> Gemini fallback`);
   const gemini = await requestGeminiVision({ messages, temperature, maxTokens });
-  if (gemini.ok && gemini.text) return gemini;
+  if (gemini.ok && gemini.text) return { ...gemini, provider: "gemini" };
 
   return {
     ...result,
@@ -1413,6 +1443,7 @@ async function askVisionAI({
   caption,
   userId,
   language,
+  preferGemini = false,
 }) {
   const history =
     await getHistory(userId);
@@ -1474,6 +1505,7 @@ async function askVisionAI({
       messages,
       temperature: 0.1,
       maxTokens: 1300,
+      preferGemini,
     });
 
   // Retry with minimal prompt
@@ -1521,6 +1553,7 @@ R = U / I
         messages,
         temperature: 0.1,
         maxTokens: 900,
+        preferGemini,
       });
   }
 
@@ -2701,7 +2734,15 @@ async function tryHandleMediaFollowup({ chatId, userId, text }) {
 ${media.description ? `Ранее было известно: ${String(media.description).slice(0, 1200)}` : "Предыдущего описания нет."}
 Ответь только на вопрос, кратко и конкретно. Если нужная деталь (бренд, логотип, надпись) неразличима — прямо скажи это и не перечисляй варианты.`;
 
-      const answer = await askVisionAI({ images, caption: prompt, userId, language });
+      // Follow-up question about saved media: really re-open it and let Gemini
+      // inspect the frames first. If Gemini fails, Groq Vision is the fallback.
+      const answer = await askVisionAI({
+        images,
+        caption: prompt,
+        userId,
+        language,
+        preferGemini: true,
+      });
 
       if (!isVisionFailure(answer)) {
         // Do not overwrite a good general description with a narrow answer like
