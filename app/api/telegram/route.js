@@ -1,7 +1,16 @@
+import ffmpegPath from "ffmpeg-static";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+
+const execFileAsync = promisify(execFile);
+
 export const runtime = "nodejs";
 
 // ======================================================
-// AI GUIDE V7.4.2
+// AI GUIDE V7.5
 //
 // Groq:
 // - Text: openai/gpt-oss-120b
@@ -24,7 +33,7 @@ export const runtime = "nodejs";
 // - Telegram custom emoji
 // - Better Telegram-safe math
 //
-// Ordinary VIDEO intentionally disabled for now.
+// Ordinary VIDEO + video notes supported via FFmpeg frames + Whisper.
 // OpenRouter disabled.
 // ======================================================
 
@@ -80,8 +89,10 @@ const VISION_MODEL =
 const WHISPER_MODEL =
   "whisper-large-v3-turbo";
 
-const MAX_HISTORY_MESSAGES = 20;
+const MAX_HISTORY_MESSAGES = 40;
+const MEMORY_SUMMARY_BATCH = 20;
 const MAX_VISION_IMAGES = 3;
+const MAX_VIDEO_FRAMES = 3;
 
 
 // ======================================================
@@ -96,6 +107,10 @@ function sleep(ms) {
 
 function memoryKey(userId) {
   return `ai-guide:history:${userId}`;
+}
+
+function memorySummaryKey(userId) {
+  return `ai-guide:memory-summary:${userId}`;
 }
 
 function albumKey(userId, mediaGroupId) {
@@ -174,54 +189,63 @@ async function getHistory(userId) {
 }
 
 
-async function saveHistory(
-  userId,
-  history
-) {
+async function saveHistory(userId, history) {
   await redisCommand([
     "SET",
     memoryKey(userId),
-    JSON.stringify(
-      history.slice(
-        -MAX_HISTORY_MESSAGES
-      )
-    ),
+    JSON.stringify(history),
   ]);
 }
 
+async function getLongMemory(userId) {
+  const result = await redisCommand(["GET", memorySummaryKey(userId)]);
+  return result ? String(result) : "";
+}
 
-async function saveExchange(
-  userId,
-  userText,
-  assistantText
-) {
-  const history =
-    await getHistory(userId);
+async function updateLongMemory(userId, messages) {
+  if (!messages?.length) return;
+  const previous = await getLongMemory(userId);
+  const transcript = messages.map(x =>
+    `${x.role === "assistant" ? "AI" : "Пользователь"}: ${String(x.content || "").slice(0, 1800)}`
+  ).join("\n");
 
-  history.push({
-    role: "user",
-    content:
-      String(userText).slice(0, 5000),
+  const prompt = `Сожми старую часть диалога в долговременную память AI Guide.\nСохрани только полезные факты, решения, предпочтения, проекты, имена, договорённости и важный контекст.\nНе сохраняй случайный мусор и не выдумывай факты. Пиши компактно на русском.\n\nПредыдущая долговременная память:\n${previous || "(пусто)"}\n\nНовые старые сообщения:\n${transcript}`;
+
+  let result = await requestGroq({
+    model: TEXT_FALLBACK_MODEL,
+    messages: [{ role: "user", content: prompt }],
+    temperature: 0.1,
+    maxTokens: 900,
   });
 
-  history.push({
-    role: "assistant",
-    content:
-      String(assistantText).slice(0, 5000),
-  });
+  const summary = cleanAIResponse(result.text);
+  if (summary) {
+    await redisCommand(["SET", memorySummaryKey(userId), summary.slice(0, 12000)]);
+  }
+}
 
-  await saveHistory(
-    userId,
-    history
-  );
+
+async function saveExchange(userId, userText, assistantText) {
+  const history = await getHistory(userId);
+
+  history.push({ role: "user", content: String(userText).slice(0, 5000) });
+  history.push({ role: "assistant", content: String(assistantText).slice(0, 5000) });
+
+  if (history.length > MAX_HISTORY_MESSAGES) {
+    const overflow = history.length - MAX_HISTORY_MESSAGES;
+    const batchSize = Math.max(MEMORY_SUMMARY_BATCH, overflow);
+    const oldMessages = history.splice(0, Math.min(batchSize, history.length - 20));
+    try { await updateLongMemory(userId, oldMessages); }
+    catch (e) { console.error("Long memory summary:", e); }
+  }
+
+  await saveHistory(userId, history);
 }
 
 
 async function clearHistory(userId) {
-  await redisCommand([
-    "DEL",
-    memoryKey(userId),
-  ]);
+  await redisCommand(["DEL", memoryKey(userId)]);
+  await redisCommand(["DEL", memorySummaryKey(userId)]);
 }
 
 
@@ -467,7 +491,13 @@ function detectLanguage(text) {
     return "ru";
   }
 
-  return "en";
+  if (/[a-z]/i.test(source)) {
+    return "en";
+  }
+
+  // Emoji / numbers / punctuation without letters:
+  // default to Russian instead of accidental English.
+  return "ru";
 }
 
 
@@ -1141,6 +1171,7 @@ async function askTextAI({
 }) {
   const history =
     await getHistory(userId);
+  const longMemory = await getLongMemory(userId);
 
   const messages = [
     {
@@ -1149,7 +1180,7 @@ async function askTextAI({
         makeSystemPrompt({
           language,
           webContext,
-        }),
+        }) + (longMemory ? `\n\nДОЛГОВРЕМЕННАЯ ПАМЯТЬ ИЗ БОЛЕЕ СТАРОГО ДИАЛОГА:\n${longMemory}` : ""),
     },
 
     ...history,
@@ -2156,6 +2187,135 @@ ${visibleText || "(только emoji)"}
 
 
 // ======================================================
+// VIDEO V7.5
+// ======================================================
+
+function videoMimeType(filePath) {
+  const lower = String(filePath || "").toLowerCase();
+  if (lower.endsWith(".webm")) return { mime: "video/webm", extension: "webm" };
+  if (lower.endsWith(".mov")) return { mime: "video/quicktime", extension: "mov" };
+  return { mime: "video/mp4", extension: "mp4" };
+}
+
+async function transcribeVideoFile(file) {
+  if (!file || !GROQ_API_KEY) return null;
+  try {
+    const { mime, extension } = videoMimeType(file.filePath);
+    const form = new FormData();
+    form.append("file", new Blob([file.buffer], { type: mime }), `video.${extension}`);
+    form.append("model", WHISPER_MODEL);
+    form.append("response_format", "json");
+    form.append("temperature", "0");
+    const response = await fetch(GROQ_TRANSCRIBE_API, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${GROQ_API_KEY}` },
+      body: form,
+    });
+    const raw = await response.text();
+    if (!response.ok) {
+      console.error("Video Whisper:", response.status, raw);
+      return null;
+    }
+    const data = JSON.parse(raw);
+    return String(data?.text || "").trim() || null;
+  } catch (error) {
+    console.error("Video Whisper exception:", error);
+    return null;
+  }
+}
+
+async function extractVideoFrames(file, durationSeconds = 0) {
+  if (!file || !ffmpegPath) return [];
+  const dir = await mkdtemp(path.join(os.tmpdir(), "ai-guide-video-"));
+  try {
+    const ext = path.extname(file.filePath || "") || ".mp4";
+    const input = path.join(dir, `input${ext}`);
+    await writeFile(input, file.buffer);
+
+    const duration = Number(durationSeconds) || 0;
+    let times;
+    if (duration >= 3) {
+      times = [Math.max(0.2, duration * 0.15), duration * 0.5, Math.max(0.3, duration * 0.85)];
+    } else {
+      times = [0.1, 0.8, 1.5];
+    }
+
+    const frames = [];
+    for (let i = 0; i < Math.min(times.length, MAX_VIDEO_FRAMES); i++) {
+      const output = path.join(dir, `frame-${i}.jpg`);
+      try {
+        await execFileAsync(ffmpegPath, [
+          "-hide_banner", "-loglevel", "error",
+          "-ss", String(times[i]), "-i", input,
+          "-frames:v", "1",
+          "-vf", "scale='min(960,iw)':-2",
+          "-q:v", "4", "-y", output,
+        ], { timeout: 15000 });
+        const buffer = await readFile(output);
+        if (buffer.length) {
+          frames.push({
+            bytes: buffer.length,
+            dataUrl: `data:image/jpeg;base64,${buffer.toString("base64")}`,
+          });
+        }
+      } catch (e) {
+        console.error("Frame extraction:", i, e?.message || e);
+      }
+    }
+    return frames;
+  } finally {
+    await rm(dir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+async function handleVideo({ chatId, userId, video, caption = "", kind = "видео" }) {
+  const stop = startThinking(chatId);
+  try {
+    const file = await getTelegramFile(video.file_id);
+    if (!file) {
+      await sendMessage(chatId, "Не удалось скачать видео. Возможно, файл слишком большой для Telegram Bot API.");
+      return;
+    }
+
+    const language = await getConversationLanguage(userId, caption);
+    const [frames, transcript] = await Promise.all([
+      extractVideoFrames(file, video.duration || 0),
+      transcribeVideoFile(file),
+    ]);
+
+    if (!frames.length && !transcript) {
+      await sendMessage(chatId, "Не удалось разобрать это видео: не получилось получить ни кадры, ни речь.");
+      return;
+    }
+
+    const userInstruction = String(caption || "").trim();
+    const visualPrompt = `${languageInstruction(language)}\nПользователь отправил ${kind}. Это кадры из разных моментов одного видео в хронологическом порядке.\n${userInstruction ? `Запрос пользователя: ${userInstruction}` : "Кратко объясни, что происходит на видео."}\n${transcript ? `Распознанная речь/звук:\n${transcript.slice(0, 7000)}` : "Речь не распознана или её нет."}\nОпирайся на реальные кадры и транскрипцию. Не придумывай невидимые события. Если кадры показывают изменение положения/действия, можешь осторожно описать движение.`;
+
+    let answer;
+    if (frames.length) {
+      answer = await askVisionAI({ images: frames, caption: visualPrompt, userId, language });
+    } else {
+      answer = await askTextAI({
+        userId, language, webContext: null,
+        text: `${userInstruction || "Кратко перескажи видео по распознанной речи."}\n\nТранскрипция видео:\n${transcript}`,
+      });
+    }
+
+    await saveExchange(
+      userId,
+      userInstruction || `[${kind}${transcript ? `; речь: ${transcript.slice(0, 1200)}` : ""}]`,
+      answer
+    );
+    await sendMessage(chatId, answer);
+  } catch (error) {
+    console.error("Video handler:", error);
+    await sendMessage(chatId, "Не удалось обработать видео. Проверь логи Vercel — возможно, FFmpeg не запустился или файл слишком большой.");
+  } finally {
+    stop();
+  }
+}
+
+// ======================================================
 // NORMAL TEXT
 // ======================================================
 
@@ -2215,7 +2375,7 @@ export async function POST(
 ) {
   try {
     console.log(
-      "AI-GUIDE-V7.4.2"
+      "AI-GUIDE-V7.5"
     );
 
     const update =
@@ -2501,22 +2661,23 @@ export async function POST(
 
 
     // ==================================================
-    // ORDINARY VIDEO
-    // intentionally disabled
+    // VIDEO / VIDEO NOTE V7.5
     // ==================================================
 
-    if (
-      message.video ||
-      message.video_note
-    ) {
-      await sendMessage(
-        chatId,
-        "🎬 Видео пока не анализирую. Фото, несколько фото, Reply на фото, голосовые, аудио, стикеры и custom emoji уже поддерживаются."
-      );
-
-      return Response.json({
-        ok: true,
+    if (message.video?.file_id) {
+      await handleVideo({
+        chatId, userId, video: message.video,
+        caption: message.caption || "", kind: "обычное видео",
       });
+      return Response.json({ ok: true });
+    }
+
+    if (message.video_note?.file_id) {
+      await handleVideo({
+        chatId, userId, video: message.video_note,
+        caption: "", kind: "Telegram-кружок",
+      });
+      return Response.json({ ok: true });
     }
 
 
@@ -2584,7 +2745,7 @@ export async function GET() {
 
   return Response.json({
     version:
-      "AI-GUIDE-V7.4.2",
+      "AI-GUIDE-V7.5",
 
     status:
       "Bot is running",
@@ -2672,14 +2833,14 @@ export async function GET() {
 
       customEmoji: true,
 
-      ordinaryVideo: false,
+      ordinaryVideo: "FFmpeg frames + Whisper",
 
       gifAnimation: "thumbnail Vision",
 
       typingIndicator: true,
 
       memory:
-        "Upstash Redis",
+        "Upstash Redis: 40 recent messages + long-term summary",
 
       webSearch:
         "Tavily",
