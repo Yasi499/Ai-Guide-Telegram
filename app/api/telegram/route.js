@@ -12,7 +12,7 @@ const ffmpegPath = path.join(process.cwd(), "ffmpeg-bin", "ffmpeg");
 export const runtime = "nodejs";
 
 // ======================================================
-// AI GUIDE V7.5.2
+// AI GUIDE V7.5.3
 //
 // Groq:
 // - Text: openai/gpt-oss-120b
@@ -117,6 +117,10 @@ function memorySummaryKey(userId) {
 
 function lastMediaKey(userId) {
   return `ai-guide:last-media:${userId}`;
+}
+
+function mediaStackKey(userId) {
+  return `ai-guide:media-stack:${userId}`;
 }
 
 function albumKey(userId, mediaGroupId) {
@@ -231,26 +235,81 @@ async function updateLongMemory(userId, messages) {
 }
 
 
+async function getMediaStack(userId) {
+  const raw = await redisCommand(["GET", mediaStackKey(userId)]);
+  if (!raw) return [];
+  try {
+    const list = JSON.parse(raw);
+    return Array.isArray(list) ? list.slice(-5) : [];
+  } catch { return []; }
+}
+
+async function saveMediaStack(userId, list) {
+  const clean = (Array.isArray(list) ? list : []).slice(-5);
+  await redisCommand(["SET", mediaStackKey(userId), JSON.stringify(clean), "EX", "604800"]);
+}
+
 async function saveLastMedia(userId, media) {
   if (!media?.fileId || !media?.type) return;
   const value = {
     ...media,
+    id: media.id || `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
     savedAt: Date.now(),
     description: String(media.description || "").slice(0, 6000),
+    transcript: String(media.transcript || "").slice(0, 3000),
   };
   await redisCommand(["SET", lastMediaKey(userId), JSON.stringify(value), "EX", "604800"]);
+  const stack = await getMediaStack(userId);
+  const withoutSame = stack.filter(x => x?.fileId !== value.fileId);
+  withoutSame.push(value);
+  await saveMediaStack(userId, withoutSame);
+  return value;
+}
+
+async function updateStoredMedia(userId, media) {
+  if (!media?.fileId) return;
+  const value = { ...media, savedAt: media.savedAt || Date.now() };
+  await redisCommand(["SET", lastMediaKey(userId), JSON.stringify(value), "EX", "604800"]);
+  const stack = await getMediaStack(userId);
+  const index = stack.findIndex(x => x?.fileId === value.fileId);
+  if (index >= 0) stack[index] = value; else stack.push(value);
+  await saveMediaStack(userId, stack);
 }
 
 async function getLastMedia(userId) {
   const raw = await redisCommand(["GET", lastMediaKey(userId)]);
-  if (!raw) return null;
-  try { return JSON.parse(raw); } catch { return null; }
+  if (raw) { try { return JSON.parse(raw); } catch {} }
+  const stack = await getMediaStack(userId);
+  return stack.at(-1) || null;
 }
 
 function looksLikeMediaFollowup(text) {
   const t = String(text || "").trim().toLowerCase();
   if (!t) return false;
-  return /(?:видео|круж|фото|картин|изображ|кадр|там|тут|на н[её]м|на этом|мыш|клавиат|бренд|марка|логотип|модель|предмет|человек|что это|что за|кто это|покажи|посмотри|рассмотри|увелич|прочитай|надпис|цвет|слева|справа|фон|video|photo|brand|logo)/i.test(t);
+  return /(?:видео|видос|круж|фото|картин|изображ|кадр|там|тут|на н[её]м|на этом|на первом|на втором|первый|второй|последн|предыдущ|эти два|оба|двух|мыш|клавиат|бренд|марка|логотип|модель|предмет|человек|что это|что за|кто это|покажи|посмотри|рассмотри|увелич|прочитай|надпис|цвет|слева|справа|фон|video|photo|brand|logo)/i.test(t);
+}
+
+function pickMediaFromStack(stack, text) {
+  const list = Array.isArray(stack) ? stack : [];
+  if (!list.length) return [];
+  const t = String(text || "").toLowerCase();
+  if (/(?:оба|эти два|два круж|двух круж|два видео|двух видео)/i.test(t)) return list.slice(-2);
+  if (/(?:перв(?:ый|ом|ого)|1(?:-й|й)?)/i.test(t) && list.length >= 2) return [list.at(-2)];
+  if (/(?:втор(?:ой|ом|ого)|2(?:-й|й)?)/i.test(t) && list.length >= 2) return [list.at(-1)];
+  if (/(?:предыдущ)/i.test(t) && list.length >= 2) return [list.at(-2)];
+  return [list.at(-1)];
+}
+
+function isVisionFailure(answer) {
+  return /^⚠️/.test(String(answer || "").trim());
+}
+
+function isProbablyWhisperHallucination(text, duration = 0) {
+  const t = String(text || "").trim();
+  if (!t) return true;
+  if (Number(duration) <= 6 && t.length < 18) return true;
+  if (/^(?:thank you|thanks for watching|subscribe|you|hvað er það|adehi apalagi)[.!? ]*$/i.test(t)) return true;
+  return false;
 }
 
 function isTechnicalMemoryEntry(text) {
@@ -283,6 +342,7 @@ async function clearHistory(userId) {
   await redisCommand(["DEL", memoryKey(userId)]);
   await redisCommand(["DEL", memorySummaryKey(userId)]);
   await redisCommand(["DEL", lastMediaKey(userId)]);
+  await redisCommand(["DEL", mediaStackKey(userId)]);
 }
 
 
@@ -1548,8 +1608,13 @@ async function handleVoice({
       return;
     }
 
+    // Voice follow-ups must be able to refer to recent photos/videos too.
+    if (await tryHandleMediaFollowup({ chatId, userId, text: transcription })) {
+      return;
+    }
+
     const language =
-      detectLanguage(transcription);
+      await getConversationLanguage(userId, transcription);
 
     let webContext = null;
 
@@ -2223,7 +2288,7 @@ ${visibleText || "(только emoji)"}
 
 
 // ======================================================
-// VIDEO V7.5.2
+// VIDEO V7.5.3
 // ======================================================
 
 function videoMimeType(filePath) {
@@ -2312,63 +2377,63 @@ async function extractVideoFrames(file, durationSeconds = 0) {
 
 async function handleVideo({ chatId, userId, video, caption = "", kind = "видео" }) {
   const stop = startThinking(chatId);
+  let stored = null;
   try {
+    // Save file_id BEFORE Vision. Even a 429 must not erase the video from memory.
+    stored = await saveLastMedia(userId, {
+      type: kind === "Telegram-кружок" ? "video_note" : "video",
+      fileId: video.file_id,
+      duration: Number(video.duration || 0),
+      description: "", transcript: "", caption: String(caption || "").slice(0, 1200),
+    });
+
     const file = await getTelegramFile(video.file_id);
     if (!file) {
-      await sendMessage(chatId, "Не удалось скачать видео. Возможно, файл слишком большой для Telegram Bot API.");
+      await sendMessage(chatId, "Не удалось скачать видео.");
       return;
     }
 
     const language = await getConversationLanguage(userId, caption);
-    const [frames, transcript] = await Promise.all([
+    const [frames, rawTranscript] = await Promise.all([
       extractVideoFrames(file, video.duration || 0),
       transcribeVideoFile(file),
     ]);
 
+    const transcriptReliable = !isProbablyWhisperHallucination(rawTranscript, video.duration || 0);
+    const transcript = transcriptReliable ? rawTranscript : null;
+
     if (!frames.length) {
       console.error("Video has no extracted frames; refusing audio-only visual analysis.");
-      await sendMessage(chatId, "⚠️ Не удалось получить кадры из видео. Я не буду угадывать содержание только по аудио. Проверь FFmpeg в логах Vercel.");
+      await updateStoredMedia(userId, { ...stored, transcript: transcript || "" });
+      await sendMessage(chatId, "⚠️ Не удалось получить кадры из видео. Видео сохранено в памяти — можно попробовать спросить о нём позже.");
       return;
     }
 
     const userInstruction = String(caption || "").trim();
-    const visualPrompt = `${languageInstruction(language)}\nПользователь отправил ${kind}. Это кадры из разных моментов одного видео в хронологическом порядке.\n${userInstruction ? `Запрос пользователя: ${userInstruction}` : "Кратко объясни, что происходит на видео."}\n${transcript ? `Распознанная речь/звук:\n${transcript.slice(0, 7000)}` : "Речь не распознана или её нет."}\nОпирайся на реальные кадры и транскрипцию. Не придумывай невидимые события. Если кадры показывают изменение положения/действия, можешь осторожно описать движение.`;
+    const visualPrompt = `${languageInstruction(language)}
+Это ${kind}; переданы кадры из разных моментов в хронологическом порядке.
+${userInstruction ? `Вопрос: ${userInstruction}` : "Скажи конкретно, что видно и что происходит."}
+${transcript ? `Надёжно распознанная речь: ${transcript.slice(0, 2500)}` : "Надёжной речи не обнаружено. Не придумывай слова из шума."}
+Ответь кратко и конкретно: обычно 1–3 предложения. Не расписывай очевидные детали и не выдумывай движение, которого нельзя подтвердить кадрами.`;
 
-    let answer;
-    if (frames.length) {
-      answer = await askVisionAI({ images: frames, caption: visualPrompt, userId, language });
-    } else {
-      answer = await askTextAI({
-        userId, language, webContext: null,
-        text: `${userInstruction || "Кратко перескажи видео по распознанной речи."}\n\nТранскрипция видео:\n${transcript}`,
-      });
-    }
-
-    await saveLastMedia(userId, {
-      type: kind === "Telegram-кружок" ? "video_note" : "video",
-      fileId: video.file_id,
-      duration: Number(video.duration || 0),
-      description: answer,
-      transcript: String(transcript || "").slice(0, 3000),
-      caption: userInstruction.slice(0, 1200),
+    const answer = await askVisionAI({ images: frames, caption: visualPrompt, userId, language });
+    await updateStoredMedia(userId, {
+      ...stored, description: isVisionFailure(answer) ? "" : answer,
+      transcript: transcript || "", caption: userInstruction.slice(0, 1200),
     });
 
-    await saveExchange(
-      userId,
-      userInstruction || `[${kind}${transcript ? `; речь: ${transcript.slice(0, 1200)}` : ""}]`,
-      answer
-    );
+    await saveExchange(userId, userInstruction || `[${kind}]`, answer);
     await sendMessage(chatId, answer);
   } catch (error) {
     console.error("Video handler:", error);
-    await sendMessage(chatId, "Не удалось обработать видео. Проверь логи Vercel — возможно, FFmpeg не запустился или файл слишком большой.");
+    await sendMessage(chatId, "Не удалось обработать видео, но если файл успел сохраниться, я смогу попробовать открыть его позже.");
   } finally {
     stop();
   }
 }
 
 // ======================================================
-// MULTIMEDIA MEMORY V7.5.2
+// MULTIMEDIA MEMORY V7.5.3
 // Keeps the last photo/video/video-note file_id for 7 days.
 // A follow-up such as "какой бренд мышки?" re-opens the media
 // and asks Vision again instead of answering from general knowledge.
@@ -2376,30 +2441,51 @@ async function handleVideo({ chatId, userId, video, caption = "", kind = "вид
 
 async function tryHandleMediaFollowup({ chatId, userId, text }) {
   if (!looksLikeMediaFollowup(text)) return false;
-  const media = await getLastMedia(userId);
-  if (!media?.fileId) return false;
+  let stack = await getMediaStack(userId);
+  // Migration from V7.5.2: keep the previously saved single media usable.
+  if (!stack.length) {
+    const legacy = await getLastMedia(userId);
+    if (legacy?.fileId) stack = [legacy];
+  }
+  const selected = pickMediaFromStack(stack, text);
+  if (!selected.length) return false;
 
   const stop = startThinking(chatId);
   try {
     const language = await getConversationLanguage(userId, text);
-    let images = [];
+    const answers = [];
 
-    if (media.type === "photo") {
-      const image = await getTelegramImageData(media.fileId);
-      if (image) images = [image];
-    } else if (media.type === "video" || media.type === "video_note") {
-      const file = await getTelegramFile(media.fileId);
-      if (file) images = await extractVideoFrames(file, Number(media.duration || 0));
+    for (let i = 0; i < selected.length; i++) {
+      const media = selected[i];
+      let images = [];
+      if (media.type === "photo") {
+        const image = await getTelegramImageData(media.fileId);
+        if (image) images = [image];
+      } else if (media.type === "video" || media.type === "video_note") {
+        const file = await getTelegramFile(media.fileId);
+        if (file) images = await extractVideoFrames(file, Number(media.duration || 0));
+      }
+
+      if (!images.length) {
+        answers.push(`Медиа ${i + 1}: не удалось повторно получить кадры.`);
+        continue;
+      }
+
+      const prompt = `${languageInstruction(language)}
+Это повторный просмотр ${media.type === "photo" ? "фото" : media.type === "video_note" ? "Telegram-кружка" : "видео"}.
+Вопрос пользователя: ${text}
+${media.description ? `Что было известно раньше: ${String(media.description).slice(0, 1600)}` : "Предыдущий Vision-анализ не удался, поэтому внимательно проанализируй кадры сейчас."}
+${media.transcript ? `Ранее надёжно распознанная речь: ${String(media.transcript).slice(0, 1000)}` : "Надёжной речи нет."}
+Ответь ТОЛЬКО по вопросу. Коротко и конкретно, обычно 1–3 предложения. Если бренд/надпись/деталь не видна — так и скажи; не перечисляй варианты из общих знаний.`;
+
+      const answer = await askVisionAI({ images, caption: prompt, userId, language });
+      if (!isVisionFailure(answer)) await updateStoredMedia(userId, { ...media, description: answer });
+      answers.push(selected.length > 1 ? `${i + 1}) ${answer}` : answer);
     }
 
-    if (!images.length) return false;
-
-    const prompt = `${languageInstruction(language)}\nПользователь задаёт уточняющий вопрос к НЕДАВНО присланному ${media.type === "photo" ? "фото" : media.type === "video_note" ? "Telegram-кружку" : "видео"}.\n\nВопрос: ${text}\n\nПредыдущий анализ этого медиа:\n${String(media.description || "(нет)").slice(0, 3500)}\n${media.transcript ? `\nРанее распознанная речь (может содержать ошибки):\n${String(media.transcript).slice(0, 1800)}` : ""}\n\nСейчас тебе снова переданы реальные кадры/изображение. Ответь ИМЕННО на новый вопрос по ним. Если пользователь спрашивает бренд, модель, логотип или мелкую деталь — внимательно рассмотри кадры. Не перечисляй популярные варианты из общих знаний. Если точную деталь нельзя уверенно прочитать/увидеть, прямо скажи, что определить её по этим кадрам нельзя.`;
-
-    const answer = await askVisionAI({ images, caption: prompt, userId, language });
-    await saveExchange(userId, text, answer);
-    await redisCommand(["SET", lastMediaKey(userId), JSON.stringify({ ...media, description: answer, savedAt: Date.now() }), "EX", "604800"]);
-    await sendMessage(chatId, answer);
+    const finalAnswer = answers.join("\n");
+    await saveExchange(userId, text, finalAnswer);
+    await sendMessage(chatId, finalAnswer);
     return true;
   } catch (error) {
     console.error("Media followup:", error);
@@ -2410,7 +2496,7 @@ async function tryHandleMediaFollowup({ chatId, userId, text }) {
 }
 
 // ======================================================
-// PLAIN EMOJI REACTIONS V7.5.2
+// PLAIN EMOJI REACTIONS V7.5.3
 // ======================================================
 
 function isEmojiOnlyText(text) {
@@ -2490,7 +2576,7 @@ export async function POST(
 ) {
   try {
     console.log(
-      "AI-GUIDE-V7.5.2"
+      "AI-GUIDE-V7.5.3"
     );
 
     const update =
@@ -2866,7 +2952,7 @@ export async function GET() {
 
   return Response.json({
     version:
-      "AI-GUIDE-V7.5.2",
+      "AI-GUIDE-V7.5.3",
 
     status:
       "Bot is running",
