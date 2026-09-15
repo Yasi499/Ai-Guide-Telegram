@@ -1,7 +1,7 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
   outputFileTracingIncludes: {
-    "/api/telegram": ["./node_modules/ffmpeg-static/ffmpeg"],
+    "/api/telegram": ["./ffmpeg-bin/ffmpeg"],
   },
 };
 
