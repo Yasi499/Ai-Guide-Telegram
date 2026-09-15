@@ -12,7 +12,7 @@ const ffmpegPath = path.join(process.cwd(), "ffmpeg-bin", "ffmpeg");
 export const runtime = "nodejs";
 
 // ======================================================
-// AI GUIDE V7.5.8
+// AI GUIDE V7.5.4
 //
 // Groq:
 // - Text: openai/gpt-oss-120b
@@ -87,9 +87,6 @@ const TEXT_FALLBACK_MODEL =
 
 const VISION_MODEL =
   "qwen/qwen3.8-27b";
-
-const VISION_FALLBACK_MODEL =
-  "qwen/qwen3.6-27b";
 
 const WHISPER_MODEL =
   "whisper-large-v3-turbo";
@@ -1402,30 +1399,6 @@ async function askVisionAI({
       maxTokens: 1300,
     });
 
-  // Vision fallback: keep the original V7.5.4 Vision/sticker flow,
-  // but if the primary Vision model is rate-limited or temporarily unavailable,
-  // retry the SAME request with the fallback Vision model.
-  if (
-    !result.ok &&
-    (result.status === 429 || result.status >= 500)
-  ) {
-    console.log(
-      `Vision fallback: ${VISION_MODEL} -> ${VISION_FALLBACK_MODEL}`
-    );
-
-    const fallbackResult =
-      await requestGroq({
-        model: VISION_FALLBACK_MODEL,
-        messages,
-        temperature: 0.1,
-        maxTokens: 1300,
-      });
-
-    // Use fallback result if it answered, or preserve its real error
-    // so logs/user message reflect the final Vision attempt.
-    result = fallbackResult;
-  }
-
   // Retry with minimal prompt
   if (
     !result.ok &&
@@ -1473,23 +1446,6 @@ R = U / I
         temperature: 0.1,
         maxTokens: 900,
       });
-
-    if (
-      !result.ok &&
-      (result.status === 429 || result.status >= 500)
-    ) {
-      console.log(
-        `Vision fallback (minimal): ${VISION_MODEL} -> ${VISION_FALLBACK_MODEL}`
-      );
-
-      result =
-        await requestGroq({
-          model: VISION_FALLBACK_MODEL,
-          messages,
-          temperature: 0.1,
-          maxTokens: 900,
-        });
-    }
   }
 
   const cleaned =
@@ -2775,7 +2731,7 @@ export async function POST(
 ) {
   try {
     console.log(
-      "AI-GUIDE-V7.5.8"
+      "AI-GUIDE-V7.5.4"
     );
 
     const update =
@@ -3151,7 +3107,7 @@ export async function GET() {
 
   return Response.json({
     version:
-      "AI-GUIDE-V7.5.8",
+      "AI-GUIDE-V7.5.4",
 
     status:
       "Bot is running",
