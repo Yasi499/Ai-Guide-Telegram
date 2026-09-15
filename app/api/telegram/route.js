@@ -12,7 +12,7 @@ const ffmpegPath = path.join(process.cwd(), "ffmpeg-bin", "ffmpeg");
 export const runtime = "nodejs";
 
 // ======================================================
-// AI GUIDE V7.6.4
+// AI GUIDE V7.6.5 DEBUG-FALLBACK
 //
 // Groq:
 // - Text: openai/gpt-oss-120b
@@ -1174,6 +1174,7 @@ async function requestGroq({
   messages,
   temperature = 0.4,
   maxTokens = 1800,
+  allowVisionFallback = true,
 }) {
   if (!GROQ_API_KEY) {
     return {
@@ -1214,10 +1215,20 @@ async function requestGroq({
     );
 
     if (!response.ok) {
-      console.error(
-        `Groq ${model}:`,
-        raw
-      );
+      console.error(`Groq ${model}:`, raw);
+
+      // V7.6.5 HARD SAFETY NET:
+      // If ANY code path calls Groq Vision directly and it fails,
+      // Gemini is invoked right here instead of relying on a caller.
+      if (model === VISION_MODEL && allowVisionFallback) {
+        console.log("V7.6.5 DEBUG: direct Groq Vision failure -> Gemini safety net");
+        const gemini = await requestGeminiVision({ messages, temperature, maxTokens });
+        if (gemini.ok && gemini.text) {
+          console.log("V7.6.5 DEBUG: Gemini safety net SUCCESS");
+          return { ...gemini, provider: "gemini" };
+        }
+        console.error(`V7.6.5 DEBUG: Gemini safety net FAILED (${gemini.status || "network/config"})`);
+      }
 
       return {
         ok: false,
@@ -1260,6 +1271,7 @@ async function requestGeminiVision({
   temperature = 0.2,
   maxTokens = 1200,
 }) {
+  console.log(`V7.6.5 DEBUG: requestGeminiVision ENTER keyPresent=${Boolean(GEMINI_API_KEY)}`);
   if (!GEMINI_API_KEY) {
     console.error("Gemini Vision: GEMINI_API_KEY missing");
     return { ok: false, status: 0, error: "GEMINI_API_KEY missing", text: null };
@@ -1348,6 +1360,7 @@ async function requestGeminiVision({
 }
 
 async function requestVision({ messages, temperature = 0.1, maxTokens = 1200, preferGemini = false }) {
+  console.log(`V7.6.5 DEBUG: requestVision ENTER preferGemini=${preferGemini}`);
   // Follow-up re-analysis: Gemini first, then Groq.
   if (preferGemini) {
     console.log("Vision route: Gemini -> Groq (media follow-up)");
@@ -1360,6 +1373,7 @@ async function requestVision({ messages, temperature = 0.1, maxTokens = 1200, pr
       messages,
       temperature,
       maxTokens,
+      allowVisionFallback: false,
     });
     if (groq.ok && groq.text) return { ...groq, provider: "groq" };
 
@@ -1382,6 +1396,7 @@ async function requestVision({ messages, temperature = 0.1, maxTokens = 1200, pr
     messages,
     temperature,
     maxTokens,
+    allowVisionFallback: false,
   });
   if (groq.ok && groq.text) return { ...groq, provider: "groq" };
 
@@ -2906,7 +2921,7 @@ export async function POST(
 ) {
   try {
     console.log(
-      "AI-GUIDE-V7.5.9"
+      "AI GUIDE VERSION: 7.6.5 DEBUG-FALLBACK"
     );
 
     const update =
@@ -3282,7 +3297,7 @@ export async function GET() {
 
   return Response.json({
     version:
-      "AI-GUIDE-V7.5.9",
+      "AI GUIDE VERSION: 7.6.5 DEBUG-FALLBACK",
 
     status:
       "Bot is running",
