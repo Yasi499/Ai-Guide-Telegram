@@ -12,7 +12,7 @@ const ffmpegPath = path.join(process.cwd(), "ffmpeg-bin", "ffmpeg");
 export const runtime = "nodejs";
 
 // ======================================================
-// AI GUIDE V7.7.0 CONVERSATION-CONTEXT
+// AI GUIDE V7.8.0 SEMANTIC-CONTEXT-RESOLVER
 //
 // Groq:
 // - Text: openai/gpt-oss-120b
@@ -403,6 +403,13 @@ function isContextModifier(text) {
     /^(?:завдан(?:ня|ие)\s*)?№?\s*\d+\s+(?:ще\s+|ещ[её]\s+)?(?:коротше|короче|подробнее|детальніше)/i.test(t);
 }
 
+function replyNeedsMediaInspection(text) {
+  const t = String(text || "").trim().toLowerCase();
+  if (!t) return false;
+  if (/^(?:да|ну да|ага|понял|поняла|ок|okay|хорошо|ясно|спасибо|спс)[.!? ]*$/i.test(t)) return false;
+  return looksLikeMediaFollowup(t) || /(?:реально|правда|точно|уверен|уверена|почему|это кто|кто это)/i.test(t);
+}
+
 async function buildReplyContext(userId, message) {
   const reply = message?.reply_to_message;
   if (!reply?.message_id) return { chain: [], media: null, text: "" };
@@ -418,6 +425,90 @@ async function buildReplyContext(userId, message) {
     sourceMessageId: mediaNode?.messageId || chain.at(-1)?.messageId || null,
     text: `Пользователь сделал Telegram Reply на сообщение:\n${quotedText || "(без текста)"}${chainText ? `\n\nСвязанная цепочка:\n${chainText}` : ""}`,
   };
+}
+
+function mediaFromTelegramMessage(message) {
+  if (!message) return null;
+  if (message.photo?.length) {
+    const photo = selectVisionPhoto(message.photo);
+    return photo?.file_id ? { type: "photo", fileId: photo.file_id, caption: message.caption || "" } : null;
+  }
+  if (message.video_note?.file_id) {
+    return { type: "video_note", fileId: message.video_note.file_id, duration: Number(message.video_note.duration || 0), caption: "" };
+  }
+  if (message.video?.file_id) {
+    return { type: "video", fileId: message.video.file_id, duration: Number(message.video.duration || 0), caption: message.caption || "" };
+  }
+  if (message.sticker?.file_id) {
+    const sticker = message.sticker;
+    const visualFileId = sticker.thumbnail?.file_id || sticker.thumb?.file_id || sticker.file_id;
+    return {
+      type: sticker.is_video ? "video_sticker" : sticker.is_animated ? "animated_sticker" : "sticker",
+      fileId: visualFileId,
+      caption: sticker.emoji || "",
+    };
+  }
+  return null;
+}
+
+function parseJsonObject(text) {
+  const source = String(text || "").replace(/```(?:json)?/gi, "").replace(/```/g, "").trim();
+  const match = source.match(/\{[\s\S]*\}/);
+  if (!match) return null;
+  try { return JSON.parse(match[0]); } catch { return null; }
+}
+
+// This is the semantic resolver. It is deliberately separate from the answer
+// model: it chooses which previous object the user means, then Vision/text
+// answers only about that object. Regexes below are only an outage fallback.
+async function resolveSemanticContext({ userId, message, text, replyContext }) {
+  const directReplyMedia = mediaFromTelegramMessage(message?.reply_to_message);
+  const graphMedia = replyContext?.media || null;
+  const stack = await getMediaStack(userId);
+
+  // Telegram itself gives an exact target for a direct reply to media.
+  if (directReplyMedia || graphMedia) {
+    const media = directReplyMedia || graphMedia;
+    const result = await requestGroq({
+      model: TEXT_FALLBACK_MODEL,
+      temperature: 0,
+      maxTokens: 80,
+      messages: [{
+        role: "user",
+        content: `Определи намерение сообщения в Telegram Reply.\nСообщение: ${text}\nОбъект Reply: ${media.type}; описание: ${String(media.description || "нет").slice(0, 500)}\nНужна ли повторная проверка изображения/видео, чтобы ответить? Верни только JSON: {"needsVision":true} или {"needsVision":false}.\nДля согласия, благодарности, «ага», «ну да», «ок» верни false.`,
+      }],
+    });
+    const parsed = result.ok ? parseJsonObject(result.text) : null;
+    return {
+      media,
+      sourceMessageId: replyContext?.sourceMessageId || message?.reply_to_message?.message_id || null,
+      needsVision: parsed?.needsVision === true,
+      resolved: true,
+    };
+  }
+
+  if (!stack.length) return { media: null, needsVision: false, resolved: false };
+
+  const candidates = stack.slice(-8).map((media, index) => ({
+    id: index + 1,
+    type: media.type,
+    caption: String(media.caption || "").slice(0, 250),
+    description: String(media.description || "").slice(0, 500),
+    transcript: String(media.transcript || "").slice(0, 250),
+  }));
+  const result = await requestGroq({
+    model: TEXT_FALLBACK_MODEL,
+    temperature: 0,
+    maxTokens: 120,
+    messages: [{
+      role: "user",
+      content: `Ты определяешь контекст одного сообщения в Telegram.\nНовое сообщение: ${text}\nНедавние медиа-объекты в хронологическом порядке: ${JSON.stringify(candidates)}\nВыбери объект только если пользователь действительно спрашивает о его содержимом. Не выбирай для обычного разговора, согласия, благодарности или новой темы. Верни только JSON: {"mediaId": число или null, "needsVision": true/false}.`,
+    }],
+  });
+  const parsed = result.ok ? parseJsonObject(result.text) : null;
+  const index = Number(parsed?.mediaId) - 1;
+  const media = Number.isInteger(index) && stack.slice(-8)[index] ? stack.slice(-8)[index] : null;
+  return { media, needsVision: !!media && parsed?.needsVision === true, resolved: !!parsed };
 }
 
 function looksLikeMediaFollowup(text) {
@@ -438,11 +529,27 @@ function pickMediaFromStack(stack, text) {
   const list = Array.isArray(stack) ? stack : [];
   if (!list.length) return [];
   const t = String(text || "").toLowerCase();
-  if (/(?:оба|эти два|два круж|двух круж|два видео|двух видео)/i.test(t)) return list.slice(-2);
-  if (/(?:перв(?:ый|ом|ого)|1(?:-й|й)?)/i.test(t) && list.length >= 2) return [list.at(-2)];
-  if (/(?:втор(?:ой|ом|ого)|2(?:-й|й)?)/i.test(t) && list.length >= 2) return [list.at(-1)];
+  const byType = /(?:стикер|gif|гиф)/i.test(t)
+    ? list.filter(x => ["sticker", "animated_sticker", "video_sticker", "gif"].includes(x?.type))
+    : /(?:фото|скрин|картин|изображ)/i.test(t)
+      ? list.filter(x => x?.type === "photo")
+      : /(?:круж|видео|ролик)/i.test(t)
+        ? list.filter(x => ["video", "video_note"].includes(x?.type))
+        : list;
+  const source = byType.length ? byType : list;
+
+  if (/(?:оба|эти два|два круж|двух круж|два видео|двух видео)/i.test(t)) return source.slice(-2);
+  // "на 2 скрине", "второе фото" and "первый стикер" use the order
+  // within the requested media type, not whichever file happened to be last.
+  const numberMatch = t.match(/(?:на|в|про)?\s*(\d+)\s*(?:-?(?:м|й|е|я))?\s*(?:скрин|фото|картин|изображ|стикер|видео|круж)/i);
+  if (numberMatch) {
+    const index = Number(numberMatch[1]) - 1;
+    if (source[index]) return [source[index]];
+  }
+  if (/(?:перв(?:ый|ом|ого)|1(?:-й|й)?)/i.test(t) && source.length >= 2) return [source[0]];
+  if (/(?:втор(?:ой|ом|ого)|2(?:-й|й)?)/i.test(t) && source.length >= 2) return [source[1]];
   if (/(?:предыдущ)/i.test(t) && list.length >= 2) return [list.at(-2)];
-  return [list.at(-1)];
+  return [source.at(-1)];
 }
 
 function isVisionFailure(answer) {
@@ -1953,14 +2060,18 @@ async function handleVoice({
     }
 
     const replyContext = await buildReplyContext(userId, message);
+    const semanticContext = await resolveSemanticContext({
+      userId, message, text: transcription, replyContext,
+    });
 
-    // Voice follow-ups must be able to refer to a replied or recent media item.
+    // Semantic resolver selects the intended object before Vision is called.
     if (await tryHandleMediaFollowup({
       chatId,
       userId,
       text: transcription,
       messageId: message?.message_id || null,
-      explicitMedia: replyContext.media,
+      explicitMedia: semanticContext.needsVision ? semanticContext.media :
+        (semanticContext.resolved ? null : replyNeedsMediaInspection(transcription) ? replyContext.media : null),
       replyContext,
     })) {
       return;
@@ -2168,10 +2279,11 @@ async function handleReplyToPhoto({
       answer
     );
 
-    await sendMessage(
-      chatId,
-      answer
-    );
+    await sendTrackedMessage(chatId, userId, answer, {
+      parentMessageId: message.message_id,
+      sourceMessageId: reply.message_id,
+      media: { type: "photo", fileId: photo.file_id, caption: reply.caption || "" },
+    });
 
     return true;
 
@@ -2432,7 +2544,7 @@ async function askStickerVisionAI({ image, language, kind = "стикер" }) {
 // STICKER
 // ======================================================
 
-async function handleSticker({ chatId, userId, sticker }) {
+async function handleSticker({ chatId, userId, sticker, messageId = null }) {
   const stop = startThinking(chatId);
   try {
     const language = await getConversationLanguage(userId);
@@ -2442,18 +2554,39 @@ async function handleSticker({ chatId, userId, sticker }) {
     const kind = video ? "видеостикер" : animated ? "анимированный стикер" : "стикер";
 
     let image = null;
+    let visualFileId = null;
     if (!animated && !video && sticker.file_id) {
+      visualFileId = sticker.file_id;
       image = await getTelegramImageData(sticker.file_id);
     } else {
       const previewId = sticker.thumbnail?.file_id || sticker.thumb?.file_id || null;
-      if (previewId) image = await getTelegramImageData(previewId);
+      if (previewId) {
+        visualFileId = previewId;
+        image = await getTelegramImageData(previewId);
+      }
     }
+
+    // Stickers are real visual chat objects too. Saving them prevents a later
+    // "последний стикер" from accidentally reopening an older photo/video.
+    const media = visualFileId ? {
+      type: video ? "video_sticker" : animated ? "animated_sticker" : "sticker",
+      fileId: visualFileId,
+      sourceFileId: sticker.file_id,
+      description: "",
+      caption: emoji,
+    } : null;
+    if (media) await saveLastMedia(userId, media);
 
     if (image) {
       const answer = await askStickerVisionAI({ image, language, kind });
       if (answer) {
+        if (media) await updateStoredMedia(userId, { ...media, description: answer });
         await saveExchange(userId, `[${kind}${emoji ? ` ${emoji}` : ""}]`, answer);
-        await sendMessage(chatId, answer);
+        await sendTrackedMessage(chatId, userId, answer, {
+          parentMessageId: messageId,
+          sourceMessageId: messageId,
+          media,
+        });
         return;
       }
     }
@@ -2467,7 +2600,11 @@ async function handleSticker({ chatId, userId, sticker }) {
       text: `Пользователь отправил ${kind}${emoji ? `, связанный emoji: ${emoji}` : ""}. Реального изображения сейчас нет. Не придумывай, что нарисовано. Просто коротко и весело отреагируй как собеседник на текущий контекст: 2–8 слов, можно emoji. Не объясняй технические ограничения.`
     });
     await saveExchange(userId, `[${kind}${emoji ? ` ${emoji}` : ""}]`, fallback);
-    await sendMessage(chatId, fallback);
+    await sendTrackedMessage(chatId, userId, fallback, {
+      parentMessageId: messageId,
+      sourceMessageId: messageId,
+      media,
+    });
   } finally {
     stop();
   }
@@ -2999,7 +3136,7 @@ async function tryHandleMediaFollowup({ chatId, userId, text, messageId = null, 
       const media = selected[i];
       let images = [];
 
-      if (media.type === "photo") {
+      if (media.type === "photo" || media.type === "sticker" || media.type === "animated_sticker" || media.type === "video_sticker" || media.type === "gif") {
         const image = await getTelegramImageData(media.fileId);
         if (image) images = [image];
       } else if (media.type === "video" || media.type === "video_note") {
@@ -3012,11 +3149,15 @@ async function tryHandleMediaFollowup({ chatId, userId, text, messageId = null, 
         continue;
       }
 
+      const mediaName = media.type === "photo" ? "фото" :
+        media.type === "video_note" ? "Telegram-кружка" :
+        ["sticker", "animated_sticker", "video_sticker"].includes(media.type) ? "стикера" :
+        media.type === "gif" ? "GIF" : "видео";
       const prompt = `${languageInstruction(language)}
-Это повторный просмотр ${media.type === "photo" ? "фото" : media.type === "video_note" ? "Telegram-кружка" : "видео"}.
+Это повторный просмотр ${mediaName}.
 Вопрос пользователя: ${text}
 ${media.description ? `Ранее было известно: ${String(media.description).slice(0, 1200)}` : "Предыдущего описания нет."}
-Ответь только на вопрос, кратко и конкретно. Если нужная деталь (бренд, логотип, надпись) неразличима — прямо скажи это и не перечисляй варианты.`;
+Ответь только на вопрос, кратко и конкретно. Если пользователь спрашивает «кто это», назови человека только при уверенности; иначе скажи, что это похоже на конкретного человека, но точно подтвердить нельзя. Если нужная деталь (бренд, логотип, надпись) неразличима — прямо скажи это и не перечисляй варианты.`;
 
       // Follow-up question about saved media: really re-open it and let Gemini
       // inspect the frames first. If Gemini fails, Groq Vision is the fallback.
@@ -3102,13 +3243,17 @@ async function handleText({
   try {
     const messageId = message?.message_id || null;
     const replyContext = await buildReplyContext(userId, message);
+    const semanticContext = await resolveSemanticContext({
+      userId, message, text, replyContext,
+    });
 
     if (await tryHandleMediaFollowup({
       chatId,
       userId,
       text,
       messageId,
-      explicitMedia: replyContext.media,
+      explicitMedia: semanticContext.needsVision ? semanticContext.media :
+        (semanticContext.resolved ? null : replyNeedsMediaInspection(text) ? replyContext.media : null),
       replyContext,
     })) return;
 
@@ -3195,7 +3340,7 @@ export async function POST(
 ) {
   try {
     console.log(
-      "AI GUIDE VERSION: 7.7.0 CONVERSATION-CONTEXT"
+      "AI GUIDE VERSION: 7.8.0 SEMANTIC-CONTEXT-RESOLVER"
     );
 
     const update =
@@ -3260,6 +3405,11 @@ export async function POST(
       fileId: message.video.file_id,
       duration: message.video.duration || 0,
       caption: message.caption || "",
+    } : message.sticker?.file_id ? {
+      type: message.sticker.is_video ? "video_sticker" : message.sticker.is_animated ? "animated_sticker" : "sticker",
+      // Animated/video stickers are queried through their preview image.
+      fileId: message.sticker.thumbnail?.file_id || message.sticker.thumb?.file_id || message.sticker.file_id,
+      caption: message.sticker.emoji || "",
     } : null;
 
     await saveMessageNode(userId, {
@@ -3417,6 +3567,7 @@ export async function POST(
         userId,
         sticker:
           message.sticker,
+        messageId: message.message_id,
       });
 
       return Response.json({
@@ -3601,7 +3752,7 @@ export async function GET() {
 
   return Response.json({
     version:
-      "AI GUIDE VERSION: 7.7.0 CONVERSATION-CONTEXT",
+      "AI GUIDE VERSION: 7.8.0 SEMANTIC-CONTEXT-RESOLVER",
 
     status:
       "Bot is running",
