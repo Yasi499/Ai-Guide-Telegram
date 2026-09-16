@@ -12,7 +12,7 @@ const ffmpegPath = path.join(process.cwd(), "ffmpeg-bin", "ffmpeg");
 export const runtime = "nodejs";
 
 // ======================================================
-// AI GUIDE V7.6.5 DEBUG-FALLBACK
+// AI GUIDE V7.7.0 CONVERSATION-CONTEXT
 //
 // Groq:
 // - Text: openai/gpt-oss-120b
@@ -106,6 +106,8 @@ const MAX_HISTORY_MESSAGES = 40;
 const MEMORY_SUMMARY_BATCH = 20;
 const MAX_VISION_IMAGES = 3;
 const MAX_VIDEO_FRAMES = 3;
+const MESSAGE_GRAPH_LIMIT = 50;
+const CONTEXT_TTL_SECONDS = 604800;
 
 
 // ======================================================
@@ -140,6 +142,14 @@ function albumKey(userId, mediaGroupId) {
 
 function albumLockKey(userId, mediaGroupId) {
   return `ai-guide:album-lock:${userId}:${mediaGroupId}`;
+}
+
+function messageGraphKey(userId) {
+  return `ai-guide:message-graph:${userId}`;
+}
+
+function activeContextKey(userId) {
+  return `ai-guide:active-context:${userId}`;
 }
 
 
@@ -294,6 +304,122 @@ async function getLastMedia(userId) {
   return stack.at(-1) || null;
 }
 
+async function getMessageGraph(userId) {
+  const raw = await redisCommand(["GET", messageGraphKey(userId)]);
+  if (!raw) return [];
+  try {
+    const graph = JSON.parse(raw);
+    return Array.isArray(graph) ? graph.slice(-MESSAGE_GRAPH_LIMIT) : [];
+  } catch {
+    return [];
+  }
+}
+
+async function saveMessageNode(userId, node) {
+  if (!node?.messageId) return null;
+  const graph = await getMessageGraph(userId);
+  const cleanNode = {
+    messageId: Number(node.messageId),
+    role: node.role === "assistant" ? "assistant" : "user",
+    text: String(node.text || "").slice(0, 5000),
+    replyToMessageId: node.replyToMessageId ? Number(node.replyToMessageId) : null,
+    parentMessageId: node.parentMessageId ? Number(node.parentMessageId) : null,
+    sourceMessageId: node.sourceMessageId ? Number(node.sourceMessageId) : null,
+    media: node.media?.fileId ? {
+      type: node.media.type,
+      fileId: node.media.fileId,
+      duration: Number(node.media.duration || 0),
+      caption: String(node.media.caption || "").slice(0, 1200),
+    } : null,
+    task: node.task || null,
+    createdAt: Date.now(),
+  };
+  const withoutSame = graph.filter(x => Number(x?.messageId) !== cleanNode.messageId);
+  withoutSame.push(cleanNode);
+  await redisCommand([
+    "SET", messageGraphKey(userId),
+    JSON.stringify(withoutSame.slice(-MESSAGE_GRAPH_LIMIT)),
+    "EX", String(CONTEXT_TTL_SECONDS),
+  ]);
+  return cleanNode;
+}
+
+async function findMessageNode(userId, messageId) {
+  if (!messageId) return null;
+  const graph = await getMessageGraph(userId);
+  return graph.find(x => Number(x?.messageId) === Number(messageId)) || null;
+}
+
+async function traceMessageContext(userId, messageId, maxDepth = 12) {
+  const graph = await getMessageGraph(userId);
+  const byId = new Map(graph.map(x => [Number(x.messageId), x]));
+  const chain = [];
+  const seen = new Set();
+  let current = byId.get(Number(messageId)) || null;
+  while (current && chain.length < maxDepth && !seen.has(Number(current.messageId))) {
+    chain.push(current);
+    seen.add(Number(current.messageId));
+    const nextId = current.parentMessageId || current.replyToMessageId || current.sourceMessageId;
+    current = nextId ? byId.get(Number(nextId)) || null : null;
+  }
+  return chain;
+}
+
+async function getActiveContext(userId) {
+  const raw = await redisCommand(["GET", activeContextKey(userId)]);
+  if (!raw) return null;
+  try { return JSON.parse(raw); } catch { return null; }
+}
+
+async function saveActiveContext(userId, context) {
+  if (!context) return;
+  await redisCommand([
+    "SET", activeContextKey(userId),
+    JSON.stringify({ ...context, updatedAt: Date.now() }),
+    "EX", String(CONTEXT_TTL_SECONDS),
+  ]);
+}
+
+function extractTaskSelection(text) {
+  const t = String(text || "").toLowerCase();
+  const match = t.match(/(?:завдан(?:ня|ие|ия)|вправ(?:а|у|ы|и)|пункт(?:ы|и|а)?|номер(?:а|ы)?)?\s*№?\s*(\d+(?:\s*[,іи]\s*\d+){0,8})/i);
+  if (!match) return [];
+  return [...new Set(match[1].split(/\s*[,іи]\s*/).map(Number).filter(Number.isFinite))];
+}
+
+function detectTaskModifiers(text) {
+  const t = String(text || "").trim().toLowerCase();
+  return {
+    length: /(?:ещ[её]\s+)?(?:коротк|кратк|стисл)/i.test(t) ? "short" :
+      /(?:подробн|детальн|розгорнут)/i.test(t) ? "detailed" : null,
+    all: /^(?:ало[,.!? ]*)?(?:ус[еі]|все)\s+(?:завдан|вправ|пункт)/i.test(t),
+    simplify: /(?:простіш|проще|простыми словами)/i.test(t),
+  };
+}
+
+function isContextModifier(text) {
+  const t = String(text || "").trim().toLowerCase();
+  return /^(?:ало[,.!? ]*)?(?:ще\s+|ещ[её]\s+)?(?:коротко|короче|стисло|детальніше|подробнее|простіше|проще|ус[еі]\s+завдання|все\s+задания|продовж(?:уй)?|продолж(?:ай)?)[.!? ]*$/i.test(t) ||
+    /^(?:завдан(?:ня|ие)\s*)?№?\s*\d+\s+(?:ще\s+|ещ[её]\s+)?(?:коротше|короче|подробнее|детальніше)/i.test(t);
+}
+
+async function buildReplyContext(userId, message) {
+  const reply = message?.reply_to_message;
+  if (!reply?.message_id) return { chain: [], media: null, text: "" };
+  const chain = await traceMessageContext(userId, reply.message_id);
+  const mediaNode = chain.find(x => x?.media?.fileId) || null;
+  const quotedText = String(reply.text || reply.caption || chain[0]?.text || "").slice(0, 4000);
+  const chainText = chain.slice(0, 8).map(x =>
+    `${x.role === "assistant" ? "AI" : "Пользователь"} #${x.messageId}: ${String(x.text || "").slice(0, 1000)}`
+  ).join("\n");
+  return {
+    chain,
+    media: mediaNode?.media || null,
+    sourceMessageId: mediaNode?.messageId || chain.at(-1)?.messageId || null,
+    text: `Пользователь сделал Telegram Reply на сообщение:\n${quotedText || "(без текста)"}${chainText ? `\n\nСвязанная цепочка:\n${chainText}` : ""}`,
+  };
+}
+
 function looksLikeMediaFollowup(text) {
   const t = String(text || "").trim().toLowerCase();
   if (!t) return false;
@@ -362,6 +488,8 @@ async function clearHistory(userId) {
   await redisCommand(["DEL", memorySummaryKey(userId)]);
   await redisCommand(["DEL", lastMediaKey(userId)]);
   await redisCommand(["DEL", mediaStackKey(userId)]);
+  await redisCommand(["DEL", messageGraphKey(userId)]);
+  await redisCommand(["DEL", activeContextKey(userId)]);
 }
 
 
@@ -421,6 +549,7 @@ async function sendMessage(
   }
 
   // Telegram message limit safety
+  const sent = [];
   for (
     let i = 0;
     i < output.length;
@@ -429,14 +558,32 @@ async function sendMessage(
     const part =
       output.slice(i, i + 4000);
 
-    await telegramRequest(
+    const result = await telegramRequest(
       "sendMessage",
       {
         chat_id: chatId,
         text: part,
       }
     );
+    if (result?.ok && result.result) sent.push(result.result);
   }
+  return sent;
+}
+
+async function sendTrackedMessage(chatId, userId, text, context = {}) {
+  const sent = await sendMessage(chatId, text);
+  for (const item of sent || []) {
+    await saveMessageNode(userId, {
+      messageId: item.message_id,
+      role: "assistant",
+      text: item.text || text,
+      parentMessageId: context.parentMessageId || null,
+      sourceMessageId: context.sourceMessageId || null,
+      media: context.media || null,
+      task: context.task || null,
+    });
+  }
+  return sent;
 }
 
 
@@ -1070,6 +1217,16 @@ ${languageInstruction(language)}
 
 Учитывай историю разговора.
 
+СТИЛЬ ОТВЕТОВ:
+- Сначала дай прямой ответ или готовый результат.
+- Не повторяй вопрос пользователя и не пиши длинное вступление.
+- Не добавляй общие советы, предупреждения и варианты, если их не просили.
+- По умолчанию отвечай компактно: обычно 1–4 абзаца. Для сложной задачи можно подробнее.
+- Если пользователь просит конкретные пункты, выполни все названные пункты и ничего лишнего.
+- «коротко», «ещё короче», «подробнее», «проще» относятся ко всему активному ответу, если номер пункта не указан.
+- Не говори «я текстовая модель», «я не вижу прошлое медиа» или о внутренних ограничениях. Если анализ временно упал, кратко скажи, что произошла ошибка анализа и предложи/выполни повторную проверку.
+- Не придумывай недостающие данные. Если без них нельзя ответить точно, задай один конкретный вопрос.
+
 Если пользователь пишет:
 "короче"
 "подробнее"
@@ -1217,17 +1374,17 @@ async function requestGroq({
     if (!response.ok) {
       console.error(`Groq ${model}:`, raw);
 
-      // V7.6.5 HARD SAFETY NET:
+      // V7.7.0 HARD SAFETY NET:
       // If ANY code path calls Groq Vision directly and it fails,
       // Gemini is invoked right here instead of relying on a caller.
       if (model === VISION_MODEL && allowVisionFallback) {
-        console.log("V7.6.5 DEBUG: direct Groq Vision failure -> Gemini safety net");
+        console.log("V7.7.0 DEBUG: direct Groq Vision failure -> Gemini safety net");
         const gemini = await requestGeminiVision({ messages, temperature, maxTokens });
         if (gemini.ok && gemini.text) {
-          console.log("V7.6.5 DEBUG: Gemini safety net SUCCESS");
+          console.log("V7.7.0 DEBUG: Gemini safety net SUCCESS");
           return { ...gemini, provider: "gemini" };
         }
-        console.error(`V7.6.5 DEBUG: Gemini safety net FAILED (${gemini.status || "network/config"})`);
+        console.error(`V7.7.0 DEBUG: Gemini safety net FAILED (${gemini.status || "network/config"})`);
       }
 
       return {
@@ -1271,7 +1428,7 @@ async function requestGeminiVision({
   temperature = 0.2,
   maxTokens = 1200,
 }) {
-  console.log(`V7.6.5 DEBUG: requestGeminiVision ENTER keyPresent=${Boolean(GEMINI_API_KEY)}`);
+  console.log(`V7.7.0 DEBUG: requestGeminiVision ENTER keyPresent=${Boolean(GEMINI_API_KEY)}`);
   if (!GEMINI_API_KEY) {
     console.error("Gemini Vision: GEMINI_API_KEY missing");
     return { ok: false, status: 0, error: "GEMINI_API_KEY missing", text: null };
@@ -1360,7 +1517,7 @@ async function requestGeminiVision({
 }
 
 async function requestVision({ messages, temperature = 0.1, maxTokens = 1200, preferGemini = false }) {
-  console.log(`V7.6.5 DEBUG: requestVision ENTER preferGemini=${preferGemini}`);
+  console.log(`V7.7.0 DEBUG: requestVision ENTER preferGemini=${preferGemini}`);
   // Follow-up re-analysis: Gemini first, then Groq.
   if (preferGemini) {
     console.log("Vision route: Gemini -> Groq (media follow-up)");
@@ -1446,6 +1603,8 @@ async function askTextAI({
   userId,
   language,
   webContext = null,
+  referenceContext = "",
+  activeContext = null,
 }) {
   const history =
     await getHistory(userId);
@@ -1458,7 +1617,9 @@ async function askTextAI({
         makeSystemPrompt({
           language,
           webContext,
-        }) + (longMemory ? `\n\nДОЛГОВРЕМЕННАЯ ПАМЯТЬ ИЗ БОЛЕЕ СТАРОГО ДИАЛОГА:\n${longMemory}` : ""),
+        }) + (longMemory ? `\n\nДОЛГОВРЕМЕННАЯ ПАМЯТЬ ИЗ БОЛЕЕ СТАРОГО ДИАЛОГА:\n${longMemory}` : "") +
+        (referenceContext ? `\n\nТОЧНЫЙ КОНТЕКСТ TELEGRAM REPLY:\n${referenceContext}\nReply имеет приоритет над последней общей темой. Отвечай именно на него.` : "") +
+        (activeContext ? `\n\nАКТИВНАЯ ЗАДАЧА:\n${JSON.stringify(activeContext)}\nЕсли новое сообщение — модификатор вроде «коротко» или «все задания», переделай всю активную задачу с этим изменением.` : ""),
     },
 
     ...history,
@@ -1772,6 +1933,7 @@ async function handleVoice({
   chatId,
   userId,
   fileId,
+  message = null,
 }) {
   const stop =
     startThinking(chatId);
@@ -1790,8 +1952,17 @@ async function handleVoice({
       return;
     }
 
-    // Voice follow-ups must be able to refer to recent photos/videos too.
-    if (await tryHandleMediaFollowup({ chatId, userId, text: transcription })) {
+    const replyContext = await buildReplyContext(userId, message);
+
+    // Voice follow-ups must be able to refer to a replied or recent media item.
+    if (await tryHandleMediaFollowup({
+      chatId,
+      userId,
+      text: transcription,
+      messageId: message?.message_id || null,
+      explicitMedia: replyContext.media,
+      replyContext,
+    })) {
       return;
     }
 
@@ -1817,6 +1988,8 @@ async function handleVoice({
         userId,
         language,
         webContext,
+        referenceContext: replyContext.text,
+        activeContext: await getActiveContext(userId),
       });
 
     await saveExchange(
@@ -1825,10 +1998,11 @@ async function handleVoice({
       answer
     );
 
-    await sendMessage(
-      chatId,
-      answer
-    );
+    await sendTrackedMessage(chatId, userId, answer, {
+      parentMessageId: message?.message_id || null,
+      sourceMessageId: replyContext.sourceMessageId || null,
+      media: replyContext.media || null,
+    });
 
   } finally {
     stop();
@@ -1860,6 +2034,7 @@ async function handleSinglePhoto({
   userId,
   fileId,
   caption,
+  messageId = null,
 }) {
   const stop =
     startThinking(chatId);
@@ -1904,10 +2079,24 @@ async function handleSinglePhoto({
       answer
     );
 
-    await sendMessage(
-      chatId,
-      answer
-    );
+    const photoItems = extractTaskSelection(caption);
+    if (photoItems.length || /(?:завдан|задан|вправ|упражнен|виконай|выполни)/i.test(caption)) {
+      await saveActiveContext(userId, {
+        type: "media_task",
+        request: caption || "Выполнить задания с фото",
+        selectedItems: photoItems,
+        sourceMessageId: messageId,
+        media: { type: "photo", fileId, caption },
+        lastAnswer: answer.slice(0, 5000),
+        modifiers: detectTaskModifiers(caption),
+      });
+    }
+
+    await sendTrackedMessage(chatId, userId, answer, {
+      parentMessageId: messageId,
+      sourceMessageId: messageId,
+      media: { type: "photo", fileId, caption },
+    });
 
   } finally {
     stop();
@@ -2605,7 +2794,7 @@ async function extractVideoFrames(file, durationSeconds = 0) {
   }
 }
 
-async function handleVideo({ chatId, userId, video, caption = "", kind = "видео" }) {
+async function handleVideo({ chatId, userId, video, caption = "", kind = "видео", messageId = null }) {
   const stop = startThinking(chatId);
   let stored = null;
 
@@ -2674,7 +2863,16 @@ ${transcript ? `Надёжно распознанная речь: ${transcript.s
     });
 
     await saveExchange(userId, userInstruction || `[${kind}]`, answer);
-    await sendMessage(chatId, answer);
+    await sendTrackedMessage(chatId, userId, answer, {
+      parentMessageId: messageId,
+      sourceMessageId: messageId,
+      media: {
+        type: kind === "Telegram-кружок" ? "video_note" : "video",
+        fileId: video.file_id,
+        duration: Number(video.duration || 0),
+        caption: userInstruction,
+      },
+    });
   } catch (error) {
     console.error("Video handler:", error);
     await sendMessage(chatId, "Не удалось обработать кружок, но он сохранён в мультимедиа-памяти.");
@@ -2728,8 +2926,8 @@ async function getOrRefreshMediaTranscript(userId, media) {
   return { transcript, checked: true };
 }
 
-async function tryHandleMediaFollowup({ chatId, userId, text }) {
-  if (!looksLikeMediaFollowup(text)) return false;
+async function tryHandleMediaFollowup({ chatId, userId, text, messageId = null, explicitMedia = null, replyContext = null }) {
+  if (!explicitMedia && !looksLikeMediaFollowup(text)) return false;
 
   let stack = await getMediaStack(userId);
   if (!stack.length) {
@@ -2737,7 +2935,12 @@ async function tryHandleMediaFollowup({ chatId, userId, text }) {
     if (legacy?.fileId) stack = [legacy];
   }
 
-  const selected = pickMediaFromStack(stack, text);
+  const storedExplicit = explicitMedia?.fileId
+    ? stack.find(x => x?.fileId === explicitMedia.fileId)
+    : null;
+  const selected = explicitMedia?.fileId
+    ? [{ ...(storedExplicit || {}), ...explicitMedia }]
+    : pickMediaFromStack(stack, text);
   if (!selected.length) return false;
 
   const stop = startThinking(chatId);
@@ -2766,7 +2969,11 @@ async function tryHandleMediaFollowup({ chatId, userId, text }) {
 
       const finalAnswer = answers.join("\n");
       await saveExchange(userId, text, finalAnswer);
-      await sendMessage(chatId, finalAnswer);
+      await sendTrackedMessage(chatId, userId, finalAnswer, {
+        parentMessageId: messageId,
+        sourceMessageId: replyContext?.sourceMessageId || null,
+        media: selected[0] || null,
+      });
       return true;
     }
 
@@ -2777,7 +2984,11 @@ async function tryHandleMediaFollowup({ chatId, userId, text }) {
       if (media.description) {
         const answer = String(media.description).trim();
         await saveExchange(userId, text, answer);
-        await sendMessage(chatId, answer);
+        await sendTrackedMessage(chatId, userId, answer, {
+          parentMessageId: messageId,
+          sourceMessageId: replyContext?.sourceMessageId || null,
+          media,
+        });
         return true;
       }
     }
@@ -2830,7 +3041,23 @@ ${media.description ? `Ранее было известно: ${String(media.desc
 
     const finalAnswer = answers.join("\n");
     await saveExchange(userId, text, finalAnswer);
-    await sendMessage(chatId, finalAnswer);
+    const taskItems = extractTaskSelection(text);
+    if (taskItems.length || /(?:завдан|задан|вправ|упражнен|виконай|выполни)/i.test(text)) {
+      await saveActiveContext(userId, {
+        type: "media_task",
+        request: text,
+        selectedItems: taskItems,
+        sourceMessageId: replyContext?.sourceMessageId || messageId,
+        media: selected[0] || null,
+        lastAnswer: finalAnswer.slice(0, 5000),
+        modifiers: detectTaskModifiers(text),
+      });
+    }
+    await sendTrackedMessage(chatId, userId, finalAnswer, {
+      parentMessageId: messageId,
+      sourceMessageId: replyContext?.sourceMessageId || null,
+      media: selected[0] || null,
+    });
     return true;
   } catch (error) {
     console.error("Media followup:", error);
@@ -2867,21 +3094,60 @@ async function handleText({
   chatId,
   userId,
   text,
+  message,
 }) {
   const stop =
     startThinking(chatId);
 
   try {
-    if (await tryHandleMediaFollowup({ chatId, userId, text })) return;
+    const messageId = message?.message_id || null;
+    const replyContext = await buildReplyContext(userId, message);
+
+    if (await tryHandleMediaFollowup({
+      chatId,
+      userId,
+      text,
+      messageId,
+      explicitMedia: replyContext.media,
+      replyContext,
+    })) return;
+
+    const previousActive = await getActiveContext(userId);
+    const modifiers = detectTaskModifiers(text);
+    const modifierOnly = isContextModifier(text);
+    const selectedItems = extractTaskSelection(text);
+    let effectiveText = text;
+    let activeContext = previousActive;
+
+    if (modifierOnly && previousActive?.request) {
+      const targetItems = selectedItems.length ? selectedItems : previousActive.selectedItems || [];
+      effectiveText = `Вернись к активной задаче и переделай весь нужный результат.\nИсходная просьба: ${previousActive.request}\n${previousActive.sourceText ? `Текст/условие: ${previousActive.sourceText}\n` : ""}Новая инструкция: ${text}\n${targetItems.length ? `Пункты: ${targetItems.join(", ")}` : ""}`;
+      activeContext = {
+        ...previousActive,
+        selectedItems: targetItems,
+        modifiers: { ...(previousActive.modifiers || {}), ...Object.fromEntries(Object.entries(modifiers).filter(([, v]) => v)) },
+      };
+      await saveActiveContext(userId, activeContext);
+    } else if (selectedItems.length || /(?:завдан|задан|вправ|упражнен|виконай|выполни)/i.test(text)) {
+      activeContext = {
+        type: "task",
+        request: text,
+        selectedItems,
+        sourceMessageId: replyContext.sourceMessageId || messageId,
+        sourceText: replyContext.text || "",
+        modifiers: Object.fromEntries(Object.entries(modifiers).filter(([, v]) => v)),
+      };
+      await saveActiveContext(userId, activeContext);
+    }
 
     const language =
       await getConversationLanguage(userId, text);
 
     let webContext = null;
 
-    if (needsInternet(text)) {
+    if (needsInternet(effectiveText)) {
       const search =
-        await searchWeb(text);
+        await searchWeb(effectiveText);
 
       webContext =
         makeWebContext(search);
@@ -2889,10 +3155,12 @@ async function handleText({
 
     const answer =
       await askTextAI({
-        text,
+        text: effectiveText,
         userId,
         language,
         webContext,
+        referenceContext: replyContext.text,
+        activeContext,
       });
 
     await saveExchange(
@@ -2901,10 +3169,16 @@ async function handleText({
       answer
     );
 
-    await sendMessage(
-      chatId,
-      answer
-    );
+    if (activeContext?.request) {
+      await saveActiveContext(userId, { ...activeContext, lastAnswer: answer.slice(0, 5000) });
+    }
+
+    await sendTrackedMessage(chatId, userId, answer, {
+      parentMessageId: messageId,
+      sourceMessageId: replyContext.sourceMessageId || activeContext?.sourceMessageId || null,
+      media: replyContext.media || null,
+      task: activeContext || null,
+    });
 
   } finally {
     stop();
@@ -2921,7 +3195,7 @@ export async function POST(
 ) {
   try {
     console.log(
-      "AI GUIDE VERSION: 7.6.5 DEBUG-FALLBACK"
+      "AI GUIDE VERSION: 7.7.0 CONVERSATION-CONTEXT"
     );
 
     const update =
@@ -2971,6 +3245,30 @@ export async function POST(
     const text =
       message.text?.trim() ||
       "";
+
+    const incomingMedia = message.photo?.length ? {
+      type: "photo",
+      fileId: selectVisionPhoto(message.photo)?.file_id,
+      caption: message.caption || "",
+    } : message.video_note?.file_id ? {
+      type: "video_note",
+      fileId: message.video_note.file_id,
+      duration: message.video_note.duration || 0,
+      caption: "",
+    } : message.video?.file_id ? {
+      type: "video",
+      fileId: message.video.file_id,
+      duration: message.video.duration || 0,
+      caption: message.caption || "",
+    } : null;
+
+    await saveMessageNode(userId, {
+      messageId: message.message_id,
+      role: "user",
+      text: text || message.caption || (incomingMedia ? `[${incomingMedia.type}]` : message.sticker ? "[стикер]" : "[медиа]"),
+      replyToMessageId: message.reply_to_message?.message_id || null,
+      media: incomingMedia,
+    });
 
 
     // ==================================================
@@ -3034,6 +3332,7 @@ export async function POST(
         userId,
         fileId:
           message.voice.file_id,
+        message,
       });
 
       return Response.json({
@@ -3052,6 +3351,7 @@ export async function POST(
         userId,
         fileId:
           message.audio.file_id,
+        message,
       });
 
       return Response.json({
@@ -3098,6 +3398,7 @@ export async function POST(
         fileId:
           largest.file_id,
         caption,
+        messageId: message.message_id,
       });
 
       return Response.json({
@@ -3167,6 +3468,7 @@ export async function POST(
         chatId,
         userId,
         text,
+        message,
       });
 
       return Response.json({
@@ -3220,6 +3522,7 @@ export async function POST(
       await handleVideo({
         chatId, userId, video: message.video,
         caption: message.caption || "", kind: "обычное видео",
+        messageId: message.message_id,
       });
       return Response.json({ ok: true });
     }
@@ -3228,6 +3531,7 @@ export async function POST(
       await handleVideo({
         chatId, userId, video: message.video_note,
         caption: "", kind: "Telegram-кружок",
+        messageId: message.message_id,
       });
       return Response.json({ ok: true });
     }
@@ -3297,7 +3601,7 @@ export async function GET() {
 
   return Response.json({
     version:
-      "AI GUIDE VERSION: 7.6.5 DEBUG-FALLBACK",
+      "AI GUIDE VERSION: 7.7.0 CONVERSATION-CONTEXT",
 
     status:
       "Bot is running",
