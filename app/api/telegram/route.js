@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { runConversation } from "./conversation.mjs";
 import { promisify } from "node:util";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
@@ -12,7 +13,7 @@ const ffmpegPath = path.join(process.cwd(), "ffmpeg-bin", "ffmpeg");
 export const runtime = "nodejs";
 
 // ======================================================
-// AI GUIDE V7.8.5 WEB-IMAGE-NEWS
+// AI GUIDE V7.9.0 CONVERSATION-TOOLS
 //
 // Groq:
 // - Text: openai/gpt-oss-120b
@@ -739,17 +740,6 @@ async function sendMessage(
   return sent;
 }
 
-async function sendPhoto(chatId, photo, caption = "") {
-  const url = String(photo || "").trim();
-  if (!/^https?:\/\//i.test(url)) return null;
-  const result = await telegramRequest("sendPhoto", {
-    chat_id: chatId,
-    photo: url,
-    ...(caption ? { caption: String(caption).slice(0, 1024) } : {}),
-  });
-  return result?.ok ? result.result : null;
-}
-
 async function sendTrackedMessage(chatId, userId, text, context = {}) {
   if (context.turnMessageId && !(await isLatestTurn(userId, context.turnMessageId))) {
     console.log(`Skipping stale answer for Telegram message ${context.turnMessageId}`);
@@ -1314,11 +1304,6 @@ async function searchWeb(query) {
           max_results: 7,
           include_answer: true,
           include_raw_content: false,
-          // Tavily returns source-linked image URLs that Telegram can send
-          // directly. They are used only when the semantic selector below
-          // decides that visuals improve this particular answer.
-          include_images: true,
-          include_image_descriptions: true,
         }),
       }
     );
@@ -1373,51 +1358,6 @@ ${item.content || "Unknown"}
   }
 
   return output.trim() || null;
-}
-
-function getWebImageUrls(data, limit = 3) {
-  const images = Array.isArray(data?.images) ? data.images : [];
-  const seen = new Set();
-  const urls = [];
-  for (const image of images) {
-    const url = typeof image === "string"
-      ? image
-      : image?.url || image?.image_url || image?.src || "";
-    const clean = String(url || "").trim();
-    if (!/^https?:\/\//i.test(clean) || seen.has(clean)) continue;
-    seen.add(clean);
-    urls.push(clean);
-    if (urls.length >= limit) break;
-  }
-  return urls;
-}
-
-// Images are not tied to word markers. A small semantic decision prevents a
-// weather question or a simple fact from receiving random stock photos, while
-// fresh game/news/product/event requests can include useful visual context.
-async function shouldAttachWebImages({ query, answer, imageCount }) {
-  if (!imageCount) return false;
-  const result = await requestGroq({
-    model: TEXT_FALLBACK_MODEL,
-    temperature: 0,
-    maxTokens: 50,
-    messages: [{
-      role: "user",
-      content: `Определи, помогут ли пользователю 1–3 актуальные картинки из веб-поиска как дополнение к этому ответу Telegram.\nЗапрос: ${String(query || "").slice(0, 900)}\nОтвет: ${String(answer || "").slice(0, 1200)}\nКартинки нужны для новостей, обновлений игр, событий, товаров, мест, людей, дизайна или когда пользователь явно просит фото. Не нужны для погоды, времени, простого определения, разговора или когда они будут случайным украшением. Верни только JSON: {"sendImages":true} или {"sendImages":false}.`,
-    }],
-  });
-  const parsed = result.ok ? parseJsonObject(result.text) : null;
-  return parsed?.sendImages === true;
-}
-
-async function sendRelevantWebImages({ chatId, userId, turnMessageId, query, answer, search }) {
-  if (turnMessageId && !(await isLatestTurn(userId, turnMessageId))) return;
-  const urls = getWebImageUrls(search);
-  if (!(await shouldAttachWebImages({ query, answer, imageCount: urls.length }))) return;
-  for (const url of urls) {
-    if (turnMessageId && !(await isLatestTurn(userId, turnMessageId))) return;
-    await sendPhoto(chatId, url);
-  }
 }
 
 
@@ -2205,69 +2145,7 @@ async function handleVoice({
       return;
     }
 
-    const replyContext = await buildReplyContext(userId, message);
-    const semanticContext = await resolveSemanticContext({
-      userId, message, text: transcription, replyContext,
-    });
-
-    // Semantic resolver selects the intended object before Vision is called.
-    if (await tryHandleMediaFollowup({
-      chatId,
-      userId,
-      text: transcription,
-      messageId: message?.message_id || null,
-      explicitMedia: semanticContext.needsVision ? semanticContext.media :
-        (semanticContext.resolved ? null : replyNeedsMediaInspection(transcription) ? replyContext.media : null),
-      replyContext,
-    })) {
-      return;
-    }
-
-    const language =
-      await getConversationLanguage(userId, transcription);
-
-    let webContext = null;
-    let webSearch = null;
-
-    if (
-      needsInternet(transcription)
-    ) {
-      webSearch = await searchWeb(transcription);
-      webContext = makeWebContext(webSearch);
-    }
-
-    const answer =
-      await askTextAI({
-        text: transcription,
-        userId,
-        language,
-        webContext,
-        referenceContext: replyContext.text,
-        activeContext: await getActiveContext(userId),
-        isolatedReply: Boolean(message?.reply_to_message),
-      });
-
-    await saveExchange(
-      userId,
-      `[Голосовое]\n${transcription}`,
-      answer
-    );
-
-    await sendTrackedMessage(chatId, userId, answer, {
-      parentMessageId: message?.message_id || null,
-      turnMessageId: message?.message_id || null,
-      sourceMessageId: replyContext.sourceMessageId || null,
-      media: replyContext.media || null,
-    });
-    await sendRelevantWebImages({
-      chatId,
-      userId,
-      turnMessageId: message?.message_id || null,
-      query: transcription,
-      answer,
-      search: webSearch,
-    });
-
+    await handleConversationTurn({ chatId, userId, text: transcription, message });
   } finally {
     stop();
   }
@@ -3388,6 +3266,71 @@ async function handlePlainEmoji({ chatId, userId, text }) {
 // NORMAL TEXT
 // ======================================================
 
+async function handleConversationTurn({ chatId, userId, text, message }) {
+  const reply = await buildReplyContext(userId, message);
+  const [history, stack, graph, longMemory, activeTask] = await Promise.all([
+    getHistory(userId), getMediaStack(userId), getMessageGraph(userId),
+    getLongMemory(userId), getActiveContext(userId),
+  ]);
+  const media = stack.map((item, index) => ({ ...item, id: `media-${index + 1}` }));
+  const exact = mediaFromTelegramMessage(message?.reply_to_message) || reply.media;
+  if (exact) media.push({ ...exact, id: 'reply-media' });
+  const result = await runConversation({
+    context: {
+      now: new Date().toLocaleString('ru-RU', { timeZone: 'Europe/Kyiv' }),
+      text,
+      longMemory,
+      activeTask,
+      reply: reply.text || null,
+      replyMediaId: exact ? 'reply-media' : null,
+      history: history.slice(-24),
+      messages: graph.slice(-24).map(item => ({
+        id: item.messageId, role: item.role, text: item.text,
+        replyTo: item.replyToMessageId, parent: item.parentMessageId,
+      })),
+      media,
+    },
+    request: async messages => {
+      let response = await requestGroq({ model: TEXT_MODEL, messages, temperature: 0.2, maxTokens: 2000 });
+      if (!response.ok) response = await requestGroq({ model: TEXT_FALLBACK_MODEL, messages, temperature: 0.2, maxTokens: 2000 });
+      return response.text;
+    },
+    search: async query => {
+      const data = await searchWeb(query);
+      if (!data) return { error: 'Поиск недоступен. Актуальные факты не проверены.' };
+      return { results: (data.results || []).slice(0, 7).map(item => ({
+        title: item.title, url: item.url, published: item.published_date || null,
+        excerpt: String(item.content || '').slice(0, 3500),
+      })) };
+    },
+    inspect: async (item, question, mode) => {
+      if (mode === 'audio') return getOrRefreshMediaTranscript(userId, item);
+      let images = [];
+      if (['video', 'video_note'].includes(item.type)) {
+        const file = await getTelegramFile(item.fileId);
+        if (file) images = await extractVideoFrames(file, Number(item.duration || 0));
+      } else {
+        const image = await getTelegramImageData(item.fileId);
+        if (image) images = [image];
+      }
+      if (!images.length) return { error: 'Не удалось получить изображение. Его содержимое неизвестно.' };
+      const observation = await askVisionAI({
+        images, caption: question, userId, language: detectLanguage(text),
+        isolated: true, preferGemini: true,
+      });
+      return isVisionFailure(observation) ? { error: observation } : { observation, mediaId: item.id };
+    },
+  });
+  if (!(await isLatestTurn(userId, message?.message_id))) return;
+  await saveExchange(userId, text, result.text);
+  await sendTrackedMessage(chatId, userId, result.text, {
+    parentMessageId: message?.message_id,
+    turnMessageId: message?.message_id,
+    sourceMessageId: reply.sourceMessageId,
+    media: result.media,
+  });
+}
+
 async function handleText({
   chatId,
   userId,
@@ -3398,98 +3341,7 @@ async function handleText({
     startThinking(chatId);
 
   try {
-    const messageId = message?.message_id || null;
-    const replyContext = await buildReplyContext(userId, message);
-    const semanticContext = await resolveSemanticContext({
-      userId, message, text, replyContext,
-    });
-
-    if (await tryHandleMediaFollowup({
-      chatId,
-      userId,
-      text,
-      messageId,
-      explicitMedia: semanticContext.needsVision ? semanticContext.media :
-        (semanticContext.resolved ? null : replyNeedsMediaInspection(text) ? replyContext.media : null),
-      replyContext,
-    })) return;
-
-    const previousActive = await getActiveContext(userId);
-    const modifiers = detectTaskModifiers(text);
-    const modifierOnly = isContextModifier(text);
-    const selectedItems = extractTaskSelection(text);
-    let effectiveText = text;
-    let activeContext = previousActive;
-
-    if (modifierOnly && previousActive?.request) {
-      const targetItems = selectedItems.length ? selectedItems : previousActive.selectedItems || [];
-      effectiveText = `Вернись к активной задаче и переделай весь нужный результат.\nИсходная просьба: ${previousActive.request}\n${previousActive.sourceText ? `Текст/условие: ${previousActive.sourceText}\n` : ""}Новая инструкция: ${text}\n${targetItems.length ? `Пункты: ${targetItems.join(", ")}` : ""}`;
-      activeContext = {
-        ...previousActive,
-        selectedItems: targetItems,
-        modifiers: { ...(previousActive.modifiers || {}), ...Object.fromEntries(Object.entries(modifiers).filter(([, v]) => v)) },
-      };
-      await saveActiveContext(userId, activeContext);
-    } else if (selectedItems.length || /(?:завдан|задан|вправ|упражнен|виконай|выполни)/i.test(text)) {
-      activeContext = {
-        type: "task",
-        request: text,
-        selectedItems,
-        sourceMessageId: replyContext.sourceMessageId || messageId,
-        sourceText: replyContext.text || "",
-        modifiers: Object.fromEntries(Object.entries(modifiers).filter(([, v]) => v)),
-      };
-      await saveActiveContext(userId, activeContext);
-    }
-
-    const language =
-      await getConversationLanguage(userId, text);
-
-    let webContext = null;
-    let webSearch = null;
-
-    if (needsInternet(effectiveText)) {
-      webSearch = await searchWeb(effectiveText);
-      webContext = makeWebContext(webSearch);
-    }
-
-    const answer =
-      await askTextAI({
-        text: effectiveText,
-        userId,
-        language,
-        webContext,
-        referenceContext: replyContext.text,
-        activeContext,
-        isolatedReply: Boolean(message?.reply_to_message),
-      });
-
-    await saveExchange(
-      userId,
-      text,
-      answer
-    );
-
-    if (activeContext?.request) {
-      await saveActiveContext(userId, { ...activeContext, lastAnswer: answer.slice(0, 5000) });
-    }
-
-    await sendTrackedMessage(chatId, userId, answer, {
-      parentMessageId: messageId,
-      turnMessageId: messageId,
-      sourceMessageId: replyContext.sourceMessageId || activeContext?.sourceMessageId || null,
-      media: replyContext.media || null,
-      task: activeContext || null,
-    });
-    await sendRelevantWebImages({
-      chatId,
-      userId,
-      turnMessageId: messageId,
-      query: effectiveText,
-      answer,
-      search: webSearch,
-    });
-
+    await handleConversationTurn({ chatId, userId, text, message });
   } finally {
     stop();
   }
@@ -3505,7 +3357,7 @@ export async function POST(
 ) {
   try {
     console.log(
-      "AI GUIDE VERSION: 7.8.5 WEB-IMAGE-NEWS"
+      "AI GUIDE VERSION: 7.9.0 CONVERSATION-TOOLS"
     );
 
     const update =
@@ -3919,7 +3771,7 @@ export async function GET() {
 
   return Response.json({
     version:
-      "AI GUIDE VERSION: 7.8.5 WEB-IMAGE-NEWS",
+      "AI GUIDE VERSION: 7.9.0 CONVERSATION-TOOLS",
 
     status:
       "Bot is running",
