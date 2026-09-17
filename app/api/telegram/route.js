@@ -13,7 +13,7 @@ const ffmpegPath = path.join(process.cwd(), "ffmpeg-bin", "ffmpeg");
 export const runtime = "nodejs";
 
 // ======================================================
-// AI GUIDE V7.9.2 VERIFIED-MEDIA
+// AI GUIDE V7.9.5 SINGLE-PASS-CONTEXT
 //
 // Groq:
 // - Text: openai/gpt-oss-120b
@@ -160,6 +160,7 @@ function geminiVisionCooldownKey() {
 function latestIncomingMessageKey(userId) {
   return `ai-guide:latest-incoming:${userId}`;
 }
+
 
 
 // ======================================================
@@ -671,6 +672,7 @@ async function clearHistory(userId) {
   await redisCommand(["DEL", activeContextKey(userId)]);
   await redisCommand(["DEL", latestIncomingMessageKey(userId)]);
 }
+
 
 
 // ======================================================
@@ -1516,6 +1518,7 @@ async function requestGroq({
   temperature = 0.4,
   maxTokens = 1800,
   allowVisionFallback = true,
+  jsonMode = false,
 }) {
   if (!GROQ_API_KEY) {
     return {
@@ -1544,6 +1547,7 @@ async function requestGroq({
           temperature,
           max_completion_tokens:
             maxTokens,
+          ...(jsonMode ? { response_format: { type: "json_object" } } : {}),
         }),
       }
     );
@@ -2573,13 +2577,15 @@ async function getConversationLanguage(userId, currentText = "") {
   return last ? detectLanguage(last.content) : "ru";
 }
 
-async function askStickerVisionAI({ image, language, kind = "стикер" }) {
+async function askStickerVisionAI({ image, language, kind = "стикер", conversation = "" }) {
   const lang = languageInstruction(language);
   const messages = [{
     role: "user",
     content: [
       { type: "text", text: `${lang}
-Это ${kind} из Telegram. Посмотри на реальное изображение. Не описывай его подробно, если пользователь об этом не спрашивал. Отреагируй как живой собеседник: весело, коротко, обычно 2–10 слов, можно 1–2 подходящих emoji. Не начинай с «вижу», «на превью», «на изображении». Не упоминай Telegram/API/файл. Не придумывай движение по одному кадру.` },
+Это ${kind} из Telegram. Всегда дай короткую живую реакцию на него как собеседник, 2–10 слов. Посмотри на реальные пиксели, а не на emoji стикера.
+Контекст последних сообщений: ${conversation || "нет"}
+Реагируй на настроение, шутку, приветствие или ситуацию; не превращай реакцию в подробное описание картинки. Не начинай с «вижу», «на изображении», «на стикере». Не выдумывай движение по одному кадру и не упоминай Telegram/API/файл.` },
       { type: "image_url", image_url: { url: image.dataUrl } }
     ]
   }];
@@ -2600,22 +2606,9 @@ async function handleSticker({ chatId, userId, sticker, messageId = null }) {
     const animated = !!sticker.is_animated;
     const video = !!sticker.is_video;
     const kind = video ? "видеостикер" : animated ? "анимированный стикер" : "стикер";
-
-    let image = null;
-    let visualFileId = null;
-    if (!animated && !video && sticker.file_id) {
-      visualFileId = sticker.file_id;
-      image = await getTelegramImageData(sticker.file_id);
-    } else {
-      const previewId = sticker.thumbnail?.file_id || sticker.thumb?.file_id || null;
-      if (previewId) {
-        visualFileId = previewId;
-        image = await getTelegramImageData(previewId);
-      }
-    }
-
-    // Stickers are real visual chat objects too. Saving them prevents a later
-    // "последний стикер" from accidentally reopening an older photo/video.
+    const visualFileId = !animated && !video
+      ? sticker.file_id
+      : sticker.thumbnail?.file_id || sticker.thumb?.file_id || null;
     const media = visualFileId ? {
       type: video ? "video_sticker" : animated ? "animated_sticker" : "sticker",
       fileId: visualFileId,
@@ -2625,8 +2618,23 @@ async function handleSticker({ chatId, userId, sticker, messageId = null }) {
     } : null;
     if (media) await saveLastMedia(userId, media);
 
+    const history = await getHistory(userId);
+    const conversation = history.slice(-4)
+      .map(item => `${item.role === "assistant" ? "AI" : "USER"}: ${String(item.content || "").slice(0, 300)}`)
+      .join("\n");
+
+    let image = null;
+    if (!animated && !video && sticker.file_id) {
+      image = await getTelegramImageData(sticker.file_id);
+    } else {
+      const previewId = sticker.thumbnail?.file_id || sticker.thumb?.file_id || null;
+      if (previewId) {
+        image = await getTelegramImageData(previewId);
+      }
+    }
+
     if (image) {
-      const answer = await askStickerVisionAI({ image, language, kind });
+      const answer = await askStickerVisionAI({ image, language, kind, conversation });
       if (answer) {
         if (media) await updateStoredMedia(userId, { ...media, description: answer });
         await saveExchange(userId, `[${kind}${emoji ? ` ${emoji}` : ""}]`, answer);
@@ -2640,8 +2648,8 @@ async function handleSticker({ chatId, userId, sticker, messageId = null }) {
       }
     }
 
-    // No usable pixels means no visual claim. A text model must never guess
-    // that an unavailable sticker is a cat, Shrek, or a previous image.
+    // The sticker still deserves a response, but without pixels we keep it
+    // generic instead of claiming to know what it depicts.
     const fallback = emoji ? `${emoji} понял` : "Понял 😳";
     await saveExchange(userId, `[${kind}${emoji ? ` ${emoji}` : ""}]`, fallback);
     await sendTrackedMessage(chatId, userId, fallback, {
@@ -2826,6 +2834,7 @@ ${visibleText || "(только emoji)"}
         });
     }
 
+    if (!answer) answer = "Понял 😳";
     // Custom emoji is a reaction, not a memory fact.
     await sendMessage(
       chatId,
@@ -3287,18 +3296,21 @@ async function handleConversationTurn({ chatId, userId, text, message }) {
     getMediaStack(userId), getMessageGraph(userId),
   ]);
   const exact = mediaFromTelegramMessage(message?.reply_to_message) || reply.media;
-  const result = await runConversation({
-    context: buildConversationContext({
+  const createContext = mediaEnabled => buildConversationContext({
       now: new Date().toLocaleString('ru-RU', { timeZone: 'Europe/Kyiv' }),
       text, stack, graph, exact, reply: reply.text || null,
       messageId: message?.message_id || Number.MAX_SAFE_INTEGER,
-    }),
-    request: async messages => {
-      let response = await requestGroq({ model: TEXT_MODEL, messages, temperature: 0.2, maxTokens: 2000 });
-      if (!response.ok || !response.text?.trim()) response = await requestGroq({ model: TEXT_FALLBACK_MODEL, messages, temperature: 0.2, maxTokens: 2000 });
-      if (!response.ok || !response.text?.trim()) throw new Error('Text providers unavailable');
-      return response.text;
-    },
+      mediaEnabled,
+    });
+  const request = async messages => {
+    let response = await requestGroq({ model: TEXT_MODEL, messages, temperature: 0.2, maxTokens: 900, jsonMode: true });
+    if (!response.ok || !response.text?.trim()) response = await requestGroq({ model: TEXT_FALLBACK_MODEL, messages, temperature: 0.2, maxTokens: 900, jsonMode: true });
+    if (!response.ok || !response.text?.trim()) throw new Error('Text providers unavailable');
+    return response.text;
+  };
+  const run = context => runConversation({
+    context,
+    request,
     search: async query => {
       const data = await searchWeb(query);
       if (!data) return { error: 'Поиск недоступен. Актуальные факты не проверены.' };
@@ -3325,6 +3337,8 @@ async function handleConversationTurn({ chatId, userId, text, message }) {
       return isVisionFailure(observation) ? { error: observation } : { observation, mediaId: item.id };
     },
   });
+  let result = await run(createContext(false));
+  if (result.needsMedia) result = await run(createContext(true));
   if (!(await isLatestTurn(userId, message?.message_id))) return;
   await saveExchange(userId, text, result.text);
   await sendTrackedMessage(chatId, userId, result.text, {
@@ -3361,7 +3375,7 @@ export async function POST(
 ) {
   try {
     console.log(
-      "AI GUIDE VERSION: 7.9.2 VERIFIED-MEDIA"
+      "AI GUIDE VERSION: 7.9.5 SINGLE-PASS-CONTEXT"
     );
 
     const update =
@@ -3465,7 +3479,6 @@ export async function POST(
         ok: true,
       });
     }
-
 
     // ==================================================
     // REPLY TO PHOTO
@@ -3672,15 +3685,7 @@ export async function POST(
             }
           }
         }
-
-        const answer = await askTextAI({
-          userId,
-          language,
-          webContext: null,
-          text: "Пользователь отправил GIF-анимацию, но кадр сейчас недоступен. Коротко и естественно отреагируй по контексту, не выдумывая содержимое GIF."
-        });
-        await saveExchange(userId, "[GIF-анимация]", answer);
-        await sendMessage(chatId, answer);
+        await sendMessage(chatId, "Понял 😳");
         return Response.json({ ok: true });
       } finally {
         stop();
@@ -3775,7 +3780,7 @@ export async function GET() {
 
   return Response.json({
     version:
-      "AI GUIDE VERSION: 7.9.2 VERIFIED-MEDIA",
+      "AI GUIDE VERSION: 7.9.5 SINGLE-PASS-CONTEXT",
 
     status:
       "Bot is running",
