@@ -12,7 +12,7 @@ const ffmpegPath = path.join(process.cwd(), "ffmpeg-bin", "ffmpeg");
 export const runtime = "nodejs";
 
 // ======================================================
-// AI GUIDE V7.8.3 DIRECT-REPLY-MEDIA
+// AI GUIDE V7.8.4 CURRENT-MEDIA-CONTEXT
 //
 // Groq:
 // - Text: openai/gpt-oss-120b
@@ -536,8 +536,11 @@ async function resolveSemanticContext({ userId, message, text, replyContext }) {
 
   if (!stack.length) return { media: null, needsVision: false, resolved: false };
 
-  const candidates = stack.slice(-8).map((media, index) => ({
+  const recentMedia = stack.slice(-8);
+  const currentMedia = recentMedia.at(-1) || null;
+  const candidates = recentMedia.map((media, index) => ({
     id: index + 1,
+    relation: index === recentMedia.length - 1 ? "CURRENT" : "earlier",
     type: media.type,
     caption: String(media.caption || "").slice(0, 250),
     description: String(media.description || "").slice(0, 500),
@@ -549,13 +552,24 @@ async function resolveSemanticContext({ userId, message, text, replyContext }) {
     maxTokens: 120,
     messages: [{
       role: "user",
-      content: `Ты определяешь контекст одного сообщения в Telegram.\nНовое сообщение: ${text}\nНедавние медиа-объекты в хронологическом порядке: ${JSON.stringify(candidates)}\nВыбери объект только если пользователь действительно спрашивает о его содержимом. Не выбирай для обычного разговора, согласия, благодарности или новой темы. Верни только JSON: {"mediaId": число или null, "needsVision": true/false}.`,
+      content: `Ты определяешь контекст одного сообщения в Telegram.\nНовое сообщение: ${text}\nНедавние медиа-объекты в хронологическом порядке: ${JSON.stringify(candidates)}\n\nПравило естественного диалога: CURRENT — это объект, который пользователь прислал последним, и он является темой по умолчанию. Вопрос после нового стикера/фото/видео («что на стикере?», «а это кто?», «какой цвет?») относится именно к CURRENT. Выбирай более ранний объект ТОЛЬКО когда пользователь по смыслу явно отсылает к нему: например, называет прошлый/первый/второй объект или отличительную деталь. Не подменяй новый объект старым лишь потому, что старый уже был описан.\n\nВыбери объект только если пользователь действительно спрашивает о его содержимом. Для обычного разговора, согласия, благодарности или новой темы выбери NONE. Верни только JSON: {"target":"CURRENT"|"EARLIER"|"NONE", "mediaId": число или null, "needsVision": true/false}. Для CURRENT mediaId=null.`,
     }],
   });
   const parsed = result.ok ? parseJsonObject(result.text) : null;
+  // If the resolver cannot prove that the user means an earlier object, keep
+  // the conversation anchored to the newest one. This avoids a known failure
+  // mode where an already-described sticker "wins" over a fresh sticker.
+  const target = String(parsed?.target || "").toUpperCase();
   const index = Number(parsed?.mediaId) - 1;
-  const media = Number.isInteger(index) && stack.slice(-8)[index] ? stack.slice(-8)[index] : null;
-  return { media, needsVision: !!media && parsed?.needsVision === true, resolved: !!parsed };
+  const earlierMedia = Number.isInteger(index) && recentMedia[index] && recentMedia[index] !== currentMedia
+    ? recentMedia[index]
+    : null;
+  const media = target === "NONE" ? null : target === "EARLIER" && earlierMedia ? earlierMedia : currentMedia;
+  return {
+    media,
+    needsVision: !!media && parsed?.needsVision === true,
+    resolved: !!parsed,
+  };
 }
 
 function looksLikeMediaFollowup(text) {
@@ -3419,7 +3433,7 @@ export async function POST(
 ) {
   try {
     console.log(
-      "AI GUIDE VERSION: 7.8.3 DIRECT-REPLY-MEDIA"
+      "AI GUIDE VERSION: 7.8.4 CURRENT-MEDIA-CONTEXT"
     );
 
     const update =
@@ -3833,7 +3847,7 @@ export async function GET() {
 
   return Response.json({
     version:
-      "AI GUIDE VERSION: 7.8.3 DIRECT-REPLY-MEDIA",
+      "AI GUIDE VERSION: 7.8.4 CURRENT-MEDIA-CONTEXT",
 
     status:
       "Bot is running",
