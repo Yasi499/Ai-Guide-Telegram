@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { runConversation } from "./conversation.mjs";
+import { runConversation, buildConversationContext } from "./conversation.mjs";
 import { promisify } from "node:util";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
@@ -13,7 +13,7 @@ const ffmpegPath = path.join(process.cwd(), "ffmpeg-bin", "ffmpeg");
 export const runtime = "nodejs";
 
 // ======================================================
-// AI GUIDE V7.9.0 CONVERSATION-TOOLS
+// AI GUIDE V7.9.1 CHRONOLOGICAL-CONTEXT
 //
 // Groq:
 // - Text: openai/gpt-oss-120b
@@ -351,7 +351,6 @@ async function getMessageGraph(userId) {
 
 async function saveMessageNode(userId, node) {
   if (!node?.messageId) return null;
-  const graph = await getMessageGraph(userId);
   const cleanNode = {
     messageId: Number(node.messageId),
     role: node.role === "assistant" ? "assistant" : "user",
@@ -368,12 +367,21 @@ async function saveMessageNode(userId, node) {
     task: node.task || null,
     createdAt: Date.now(),
   };
-  const withoutSame = graph.filter(x => Number(x?.messageId) !== cleanNode.messageId);
-  withoutSame.push(cleanNode);
   await redisCommand([
-    "SET", messageGraphKey(userId),
-    JSON.stringify(withoutSame.slice(-MESSAGE_GRAPH_LIMIT)),
-    "EX", String(CONTEXT_TTL_SECONDS),
+    'EVAL', `
+local raw = redis.call('GET', KEYS[1])
+local nodes = raw and cjson.decode(raw) or {}
+local incoming = cjson.decode(ARGV[1])
+local merged = {}
+for _, node in ipairs(nodes) do
+  if node.messageId ~= incoming.messageId then table.insert(merged, node) end
+end
+table.insert(merged, incoming)
+table.sort(merged, function(a,b) return a.messageId < b.messageId end)
+while #merged > tonumber(ARGV[2]) do table.remove(merged, 1) end
+redis.call('SET', KEYS[1], cjson.encode(merged), 'EX', ARGV[3])
+return 1`, '1', messageGraphKey(userId), JSON.stringify(cleanNode),
+    String(MESSAGE_GRAPH_LIMIT), String(CONTEXT_TTL_SECONDS),
   ]);
   return cleanNode;
 }
@@ -2145,6 +2153,10 @@ async function handleVoice({
       return;
     }
 
+    await saveMessageNode(userId, {
+      messageId: message?.message_id, role: 'user', text: transcription,
+      replyToMessageId: message?.reply_to_message?.message_id,
+    });
     await handleConversationTurn({ chatId, userId, text: transcription, message });
   } finally {
     stop();
@@ -2204,6 +2216,7 @@ async function handleSinglePhoto({
         caption,
         userId,
         language,
+        isolated: true,
       });
 
     await saveLastMedia(userId, {
@@ -3268,28 +3281,16 @@ async function handlePlainEmoji({ chatId, userId, text }) {
 
 async function handleConversationTurn({ chatId, userId, text, message }) {
   const reply = await buildReplyContext(userId, message);
-  const [history, stack, graph, longMemory, activeTask] = await Promise.all([
-    getHistory(userId), getMediaStack(userId), getMessageGraph(userId),
-    getLongMemory(userId), getActiveContext(userId),
+  const [stack, graph] = await Promise.all([
+    getMediaStack(userId), getMessageGraph(userId),
   ]);
-  const media = stack.map((item, index) => ({ ...item, id: `media-${index + 1}` }));
   const exact = mediaFromTelegramMessage(message?.reply_to_message) || reply.media;
-  if (exact) media.push({ ...exact, id: 'reply-media' });
   const result = await runConversation({
-    context: {
+    context: buildConversationContext({
       now: new Date().toLocaleString('ru-RU', { timeZone: 'Europe/Kyiv' }),
-      text,
-      longMemory,
-      activeTask,
-      reply: reply.text || null,
-      replyMediaId: exact ? 'reply-media' : null,
-      history: history.slice(-24),
-      messages: graph.slice(-24).map(item => ({
-        id: item.messageId, role: item.role, text: item.text,
-        replyTo: item.replyToMessageId, parent: item.parentMessageId,
-      })),
-      media,
-    },
+      text, stack, graph, exact, reply: reply.text || null,
+      messageId: message?.message_id || Number.MAX_SAFE_INTEGER,
+    }),
     request: async messages => {
       let response = await requestGroq({ model: TEXT_MODEL, messages, temperature: 0.2, maxTokens: 2000 });
       if (!response.ok) response = await requestGroq({ model: TEXT_FALLBACK_MODEL, messages, temperature: 0.2, maxTokens: 2000 });
@@ -3357,7 +3358,7 @@ export async function POST(
 ) {
   try {
     console.log(
-      "AI GUIDE VERSION: 7.9.0 CONVERSATION-TOOLS"
+      "AI GUIDE VERSION: 7.9.1 CHRONOLOGICAL-CONTEXT"
     );
 
     const update =
@@ -3771,7 +3772,7 @@ export async function GET() {
 
   return Response.json({
     version:
-      "AI GUIDE VERSION: 7.9.0 CONVERSATION-TOOLS",
+      "AI GUIDE VERSION: 7.9.1 CHRONOLOGICAL-CONTEXT",
 
     status:
       "Bot is running",
