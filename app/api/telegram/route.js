@@ -13,7 +13,7 @@ const ffmpegPath = path.join(process.cwd(), "ffmpeg-bin", "ffmpeg");
 export const runtime = "nodejs";
 
 // ======================================================
-// AI GUIDE V7.9.1 CHRONOLOGICAL-CONTEXT
+// AI GUIDE V7.9.2 VERIFIED-MEDIA
 //
 // Groq:
 // - Text: openai/gpt-oss-120b
@@ -483,7 +483,9 @@ function mediaFromTelegramMessage(message) {
   }
   if (message.sticker?.file_id) {
     const sticker = message.sticker;
-    const visualFileId = sticker.thumbnail?.file_id || sticker.thumb?.file_id || sticker.file_id;
+    const visualFileId = !sticker.is_video && !sticker.is_animated
+      ? sticker.file_id : sticker.thumbnail?.file_id || sticker.thumb?.file_id;
+    if (!visualFileId) return null;
     return {
       type: sticker.is_video ? "video_sticker" : sticker.is_animated ? "animated_sticker" : "sticker",
       fileId: visualFileId,
@@ -2007,12 +2009,12 @@ R = U / I
 
   if (result.status === 429) {
     return (
-      "⚠️ Сейчас Vision временно недоступен. Попробуй немного позже."
+      "⚠️ Не удалось обработать медиа. Попробуй позже повторить запрос."
     );
   }
 
   return (
-    "⚠️ Vision не смог обработать изображение."
+    "⚠️ Не удалось обработать медиа. Попробуй позже повторить запрос."
   );
 }
 
@@ -3293,7 +3295,8 @@ async function handleConversationTurn({ chatId, userId, text, message }) {
     }),
     request: async messages => {
       let response = await requestGroq({ model: TEXT_MODEL, messages, temperature: 0.2, maxTokens: 2000 });
-      if (!response.ok) response = await requestGroq({ model: TEXT_FALLBACK_MODEL, messages, temperature: 0.2, maxTokens: 2000 });
+      if (!response.ok || !response.text?.trim()) response = await requestGroq({ model: TEXT_FALLBACK_MODEL, messages, temperature: 0.2, maxTokens: 2000 });
+      if (!response.ok || !response.text?.trim()) throw new Error('Text providers unavailable');
       return response.text;
     },
     search: async query => {
@@ -3317,7 +3320,7 @@ async function handleConversationTurn({ chatId, userId, text, message }) {
       if (!images.length) return { error: 'Не удалось получить изображение. Его содержимое неизвестно.' };
       const observation = await askVisionAI({
         images, caption: question, userId, language: detectLanguage(text),
-        isolated: true, preferGemini: true,
+        isolated: true, preferGemini: false,
       });
       return isVisionFailure(observation) ? { error: observation } : { observation, mediaId: item.id };
     },
@@ -3358,7 +3361,7 @@ export async function POST(
 ) {
   try {
     console.log(
-      "AI GUIDE VERSION: 7.9.1 CHRONOLOGICAL-CONTEXT"
+      "AI GUIDE VERSION: 7.9.2 VERIFIED-MEDIA"
     );
 
     const update =
@@ -3428,7 +3431,7 @@ export async function POST(
     } : message.sticker?.file_id ? {
       type: message.sticker.is_video ? "video_sticker" : message.sticker.is_animated ? "animated_sticker" : "sticker",
       // Animated/video stickers are queried through their preview image.
-      fileId: message.sticker.thumbnail?.file_id || message.sticker.thumb?.file_id || message.sticker.file_id,
+      fileId: mediaFromTelegramMessage(message)?.fileId || null,
       caption: message.sticker.emoji || "",
     } : null;
 
@@ -3772,7 +3775,7 @@ export async function GET() {
 
   return Response.json({
     version:
-      "AI GUIDE VERSION: 7.9.1 CHRONOLOGICAL-CONTEXT",
+      "AI GUIDE VERSION: 7.9.2 VERIFIED-MEDIA",
 
     status:
       "Bot is running",
