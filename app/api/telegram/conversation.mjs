@@ -34,10 +34,11 @@ Reply указывает на точное сообщение: не заменя
 История передана в порядке сообщений с настоящими ролями. Продолжение, перевод и изменение формы относятся к ближайшей обсуждаемой задаче, если пользователь не выбрал другую. availableMedia — только каталог доступных файлов, не список текущих тем. Подпись и реакция бота не доказывают содержимое картинки. Не переноси текст реакции на само изображение. Не печатай технические ID и поля протокола пользователю.
 Ответ начинай с результата, обычно кратко, подробнее по необходимости. Не скрывай неопределённость. Уточняй только существенное; уместный вопрос в конце допустим, не добавляй его автоматически. Отвечай на языке пользователя.
 На каждом шаге верни ТОЛЬКО JSON одного вида:
-{"action":"answer","text":"готовый ответ пользователю"}
+{"action":"answer","basis":"conversation","text":"готовый ответ пользователю"}
+{"action":"answer","basis":"media","mediaId":"ID проверяемого файла","text":"ответ о содержимом файла"}
 {"action":"search","query":"самодостаточный запрос"}
 {"action":"inspect","mediaId":"ID из контекста","question":"что проверить","mode":"visual"}
-mode также может быть audio. Не выводи рассуждения или план. Доступные инструменты и бюджет ограничены; когда их нет, дай ответ с честным указанием пробелов.` },
+mode также может быть audio. basis обязателен: media для утверждений о видимом или слышимом содержимом, conversation для обычной беседы, перевода уже написанного, цитирования и объяснения своих предыдущих слов. Для media сначала inspect того же файла в этом запросе. Emoji стикера не является изображением. Если пользователь спрашивает, почему ты ошибся, точно сопоставь свои ответы; не придумывай техническую причину и не меняй местами ошибочный и исправленный ответ. Не выводи рассуждения или план. Доступные инструменты и бюджет ограничены; когда их нет, дай ответ с честным указанием пробелов.` },
     ...(context.turns || []),
     { role: 'user', content: JSON.stringify({
       text: context.text, now: context.now, reply: context.reply,
@@ -47,9 +48,12 @@ mode также может быть audio. Не выводи рассужден�
   ];
   let used = 0;
   const seen = new Set();
+  const verified = new Set();
   let selectedMedia = null;
   for (let step = 0; step < maxTools + 2; step++) {
-    const raw = await request(messages);
+    let raw;
+    try { raw = await request(messages); }
+    catch { return { text: 'Не удалось обработать запрос. Попробуй позже повторить запрос.', media: selectedMedia }; }
     let action;
     try { action = JSON.parse(String(raw || '').replace(/^```(?:json)?\s*|\s*```$/g, '').trim()); } catch { action = null; }
     if (!action || typeof action.action !== 'string') {
@@ -57,6 +61,15 @@ mode также может быть audio. Не выводи рассужден�
       continue;
     }
     if (action.action === 'answer' && typeof action.text === 'string' && action.text.trim()) {
+      if (!['conversation', 'media'].includes(action.basis)) {
+        messages.push({ role: 'user', content: 'Укажи basis: conversation или media по протоколу.' });
+        continue;
+      }
+      if (action.basis === 'media' && !verified.has(action.mediaId)) {
+        messages.push({ role: 'user', content: 'Этот ответ не подтверждён просмотром выбранного файла. Вызови inspect с точным mediaId. Если просмотр недоступен, сообщи об этом без описания содержимого, basis: conversation.' });
+        continue;
+      }
+      if (action.basis === 'media') selectedMedia = context.media.find(item => item.id === action.mediaId);
       return { text: action.text.trim(), media: selectedMedia };
     }
     messages.push({ role: 'assistant', content: JSON.stringify(action) });
@@ -73,11 +86,12 @@ mode также может быть audio. Не выводи рассужден�
           if (media && (!context.replyMediaId || media.id === context.replyMediaId)) {
             selectedMedia = media;
             result = await inspect(media, String(action.question || context.text).slice(0, 2000), action.mode === 'audio' ? 'audio' : 'visual');
+            if (result && !result.error && (result.observation || result.transcript)) verified.add(media.id);
           } else result = { error: 'Неизвестный ID или файл не относится к выбранному reply.' };
         }
       } catch { result = { error: 'Инструмент временно недоступен. Не придумывай результат.' }; }
     }
-    messages.push({ role: 'user', content: JSON.stringify({ toolResult: result, toolsRemaining: maxTools - used }) });
+    messages.push({ role: 'user', content: JSON.stringify({ tool: action.action, mediaId: action.mediaId || null, toolResult: result, toolsRemaining: maxTools - used }) });
   }
   return { text: 'Не удалось надёжно завершить проверку. Попробуй повторить запрос.', media: selectedMedia };
 }
