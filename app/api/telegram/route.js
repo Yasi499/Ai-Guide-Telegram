@@ -12,7 +12,7 @@ const ffmpegPath = path.join(process.cwd(), "ffmpeg-bin", "ffmpeg");
 export const runtime = "nodejs";
 
 // ======================================================
-// AI GUIDE V7.8.4 CURRENT-MEDIA-CONTEXT
+// AI GUIDE V7.8.5 WEB-IMAGE-NEWS
 //
 // Groq:
 // - Text: openai/gpt-oss-120b
@@ -739,6 +739,17 @@ async function sendMessage(
   return sent;
 }
 
+async function sendPhoto(chatId, photo, caption = "") {
+  const url = String(photo || "").trim();
+  if (!/^https?:\/\//i.test(url)) return null;
+  const result = await telegramRequest("sendPhoto", {
+    chat_id: chatId,
+    photo: url,
+    ...(caption ? { caption: String(caption).slice(0, 1024) } : {}),
+  });
+  return result?.ok ? result.result : null;
+}
+
 async function sendTrackedMessage(chatId, userId, text, context = {}) {
   if (context.turnMessageId && !(await isLatestTurn(userId, context.turnMessageId))) {
     console.log(`Skipping stale answer for Telegram message ${context.turnMessageId}`);
@@ -1303,6 +1314,11 @@ async function searchWeb(query) {
           max_results: 7,
           include_answer: true,
           include_raw_content: false,
+          // Tavily returns source-linked image URLs that Telegram can send
+          // directly. They are used only when the semantic selector below
+          // decides that visuals improve this particular answer.
+          include_images: true,
+          include_image_descriptions: true,
         }),
       }
     );
@@ -1357,6 +1373,51 @@ ${item.content || "Unknown"}
   }
 
   return output.trim() || null;
+}
+
+function getWebImageUrls(data, limit = 3) {
+  const images = Array.isArray(data?.images) ? data.images : [];
+  const seen = new Set();
+  const urls = [];
+  for (const image of images) {
+    const url = typeof image === "string"
+      ? image
+      : image?.url || image?.image_url || image?.src || "";
+    const clean = String(url || "").trim();
+    if (!/^https?:\/\//i.test(clean) || seen.has(clean)) continue;
+    seen.add(clean);
+    urls.push(clean);
+    if (urls.length >= limit) break;
+  }
+  return urls;
+}
+
+// Images are not tied to word markers. A small semantic decision prevents a
+// weather question or a simple fact from receiving random stock photos, while
+// fresh game/news/product/event requests can include useful visual context.
+async function shouldAttachWebImages({ query, answer, imageCount }) {
+  if (!imageCount) return false;
+  const result = await requestGroq({
+    model: TEXT_FALLBACK_MODEL,
+    temperature: 0,
+    maxTokens: 50,
+    messages: [{
+      role: "user",
+      content: `Определи, помогут ли пользователю 1–3 актуальные картинки из веб-поиска как дополнение к этому ответу Telegram.\nЗапрос: ${String(query || "").slice(0, 900)}\nОтвет: ${String(answer || "").slice(0, 1200)}\nКартинки нужны для новостей, обновлений игр, событий, товаров, мест, людей, дизайна или когда пользователь явно просит фото. Не нужны для погоды, времени, простого определения, разговора или когда они будут случайным украшением. Верни только JSON: {"sendImages":true} или {"sendImages":false}.`,
+    }],
+  });
+  const parsed = result.ok ? parseJsonObject(result.text) : null;
+  return parsed?.sendImages === true;
+}
+
+async function sendRelevantWebImages({ chatId, userId, turnMessageId, query, answer, search }) {
+  if (turnMessageId && !(await isLatestTurn(userId, turnMessageId))) return;
+  const urls = getWebImageUrls(search);
+  if (!(await shouldAttachWebImages({ query, answer, imageCount: urls.length }))) return;
+  for (const url of urls) {
+    if (turnMessageId && !(await isLatestTurn(userId, turnMessageId))) return;
+    await sendPhoto(chatId, url);
+  }
 }
 
 
@@ -2166,16 +2227,13 @@ async function handleVoice({
       await getConversationLanguage(userId, transcription);
 
     let webContext = null;
+    let webSearch = null;
 
     if (
       needsInternet(transcription)
     ) {
-      webContext =
-        makeWebContext(
-          await searchWeb(
-            transcription
-          )
-        );
+      webSearch = await searchWeb(transcription);
+      webContext = makeWebContext(webSearch);
     }
 
     const answer =
@@ -2200,6 +2258,14 @@ async function handleVoice({
       turnMessageId: message?.message_id || null,
       sourceMessageId: replyContext.sourceMessageId || null,
       media: replyContext.media || null,
+    });
+    await sendRelevantWebImages({
+      chatId,
+      userId,
+      turnMessageId: message?.message_id || null,
+      query: transcription,
+      answer,
+      search: webSearch,
     });
 
   } finally {
@@ -3380,13 +3446,11 @@ async function handleText({
       await getConversationLanguage(userId, text);
 
     let webContext = null;
+    let webSearch = null;
 
     if (needsInternet(effectiveText)) {
-      const search =
-        await searchWeb(effectiveText);
-
-      webContext =
-        makeWebContext(search);
+      webSearch = await searchWeb(effectiveText);
+      webContext = makeWebContext(webSearch);
     }
 
     const answer =
@@ -3417,6 +3481,14 @@ async function handleText({
       media: replyContext.media || null,
       task: activeContext || null,
     });
+    await sendRelevantWebImages({
+      chatId,
+      userId,
+      turnMessageId: messageId,
+      query: effectiveText,
+      answer,
+      search: webSearch,
+    });
 
   } finally {
     stop();
@@ -3433,7 +3505,7 @@ export async function POST(
 ) {
   try {
     console.log(
-      "AI GUIDE VERSION: 7.8.4 CURRENT-MEDIA-CONTEXT"
+      "AI GUIDE VERSION: 7.8.5 WEB-IMAGE-NEWS"
     );
 
     const update =
@@ -3847,7 +3919,7 @@ export async function GET() {
 
   return Response.json({
     version:
-      "AI GUIDE VERSION: 7.8.4 CURRENT-MEDIA-CONTEXT",
+      "AI GUIDE VERSION: 7.8.5 WEB-IMAGE-NEWS",
 
     status:
       "Bot is running",
