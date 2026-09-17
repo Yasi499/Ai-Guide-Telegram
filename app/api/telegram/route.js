@@ -12,7 +12,7 @@ const ffmpegPath = path.join(process.cwd(), "ffmpeg-bin", "ffmpeg");
 export const runtime = "nodejs";
 
 // ======================================================
-// AI GUIDE V7.8.0 SEMANTIC-CONTEXT-RESOLVER
+// AI GUIDE V7.8.3 DIRECT-REPLY-MEDIA
 //
 // Groq:
 // - Text: openai/gpt-oss-120b
@@ -152,6 +152,14 @@ function activeContextKey(userId) {
   return `ai-guide:active-context:${userId}`;
 }
 
+function geminiVisionCooldownKey() {
+  return "ai-guide:gemini-vision-cooldown";
+}
+
+function latestIncomingMessageKey(userId) {
+  return `ai-guide:latest-incoming:${userId}`;
+}
+
 
 // ======================================================
 // REDIS
@@ -197,6 +205,31 @@ async function redisCommand(command) {
     );
     return null;
   }
+}
+
+async function isGeminiVisionCoolingDown() {
+  return Boolean(await redisCommand(["GET", geminiVisionCooldownKey()]));
+}
+
+async function startGeminiVisionCooldown(seconds = 60) {
+  await redisCommand(["SET", geminiVisionCooldownKey(), "1", "EX", String(seconds)]);
+}
+
+// Vercel can process two Telegram updates in parallel. Without this guard a
+// slow answer to an older message can arrive after a reply to a newer one and
+// look as if the bot answered the wrong message.
+async function registerIncomingMessage(userId, messageId) {
+  if (!messageId) return;
+  const previous = Number(await redisCommand(["GET", latestIncomingMessageKey(userId)]) || 0);
+  if (Number(messageId) >= previous) {
+    await redisCommand(["SET", latestIncomingMessageKey(userId), String(messageId), "EX", "900"]);
+  }
+}
+
+async function isLatestTurn(userId, messageId) {
+  if (!messageId) return true;
+  const latest = Number(await redisCommand(["GET", latestIncomingMessageKey(userId)]) || 0);
+  return !latest || Number(messageId) >= latest;
 }
 
 
@@ -466,9 +499,23 @@ async function resolveSemanticContext({ userId, message, text, replyContext }) {
   const graphMedia = replyContext?.media || null;
   const stack = await getMediaStack(userId);
 
-  // Telegram itself gives an exact target for a direct reply to media.
-  if (directReplyMedia || graphMedia) {
-    const media = directReplyMedia || graphMedia;
+  // Telegram itself gives an exact target for a direct reply to media. It is
+  // never passed through a "last media" selector or a keyword classifier.
+  // The user made a Reply precisely so this file must be processed.
+  if (directReplyMedia) {
+    return {
+      media: directReplyMedia,
+      sourceMessageId: message?.reply_to_message?.message_id || null,
+      needsVision: true,
+      resolved: true,
+    };
+  }
+
+  // A reply to a bot text may be linked to earlier media in our graph. Here a
+  // short semantic decision is still useful: “what did you say?” needs the
+  // quoted bot text, while “what colour was it?” needs the source image.
+  if (graphMedia) {
+    const media = graphMedia;
     const result = await requestGroq({
       model: TEXT_FALLBACK_MODEL,
       temperature: 0,
@@ -597,6 +644,7 @@ async function clearHistory(userId) {
   await redisCommand(["DEL", mediaStackKey(userId)]);
   await redisCommand(["DEL", messageGraphKey(userId)]);
   await redisCommand(["DEL", activeContextKey(userId)]);
+  await redisCommand(["DEL", latestIncomingMessageKey(userId)]);
 }
 
 
@@ -678,6 +726,10 @@ async function sendMessage(
 }
 
 async function sendTrackedMessage(chatId, userId, text, context = {}) {
+  if (context.turnMessageId && !(await isLatestTurn(userId, context.turnMessageId))) {
+    console.log(`Skipping stale answer for Telegram message ${context.turnMessageId}`);
+    return [];
+  }
   const sent = await sendMessage(chatId, text);
   for (const item of sent || []) {
     await saveMessageNode(userId, {
@@ -1602,6 +1654,11 @@ async function requestGeminiVision({
 
     if (!response.ok) {
       console.error(`Gemini Vision ${GEMINI_VISION_MODEL}:`, raw);
+      // Google can return both 429 and temporary 503 when the free Vision
+      // quota is saturated. Do not waste several more user messages on it.
+      if (response.status === 429 || response.status === 503) {
+        await startGeminiVisionCooldown(60);
+      }
       return { ok: false, status: response.status, error: raw, text: null };
     }
 
@@ -1624,9 +1681,21 @@ async function requestGeminiVision({
 }
 
 async function requestVision({ messages, temperature = 0.1, maxTokens = 1200, preferGemini = false }) {
-  console.log(`V7.7.0 DEBUG: requestVision ENTER preferGemini=${preferGemini}`);
+  console.log(`V7.8.1 DEBUG: requestVision ENTER preferGemini=${preferGemini}`);
   // Follow-up re-analysis: Gemini first, then Groq.
   if (preferGemini) {
+    if (await isGeminiVisionCoolingDown()) {
+      console.log("Vision route: Gemini cooldown -> Groq (media follow-up)");
+      const groq = await requestGroq({
+        model: VISION_MODEL,
+        messages,
+        temperature,
+        maxTokens,
+        allowVisionFallback: false,
+      });
+      if (groq.ok && groq.text) return { ...groq, provider: "groq" };
+      return { ok: false, status: groq.status || 0, error: groq.error || "Groq Vision failed during Gemini cooldown", text: null };
+    }
     console.log("Vision route: Gemini -> Groq (media follow-up)");
     const gemini = await requestGeminiVision({ messages, temperature, maxTokens });
     if (gemini.ok && gemini.text) return { ...gemini, provider: "gemini" };
@@ -1712,9 +1781,10 @@ async function askTextAI({
   webContext = null,
   referenceContext = "",
   activeContext = null,
+  isolatedReply = false,
 }) {
   const history =
-    await getHistory(userId);
+    isolatedReply ? [] : await getHistory(userId);
   const longMemory = await getLongMemory(userId);
 
   const messages = [
@@ -1785,9 +1855,10 @@ async function askVisionAI({
   userId,
   language,
   preferGemini = false,
+  isolated = false,
 }) {
   const history =
-    await getHistory(userId);
+    isolated ? [] : await getHistory(userId);
 
   // Very small history for Vision
   const tinyHistory =
@@ -2101,6 +2172,7 @@ async function handleVoice({
         webContext,
         referenceContext: replyContext.text,
         activeContext: await getActiveContext(userId),
+        isolatedReply: Boolean(message?.reply_to_message),
       });
 
     await saveExchange(
@@ -2111,6 +2183,7 @@ async function handleVoice({
 
     await sendTrackedMessage(chatId, userId, answer, {
       parentMessageId: message?.message_id || null,
+      turnMessageId: message?.message_id || null,
       sourceMessageId: replyContext.sourceMessageId || null,
       media: replyContext.media || null,
     });
@@ -2205,6 +2278,7 @@ async function handleSinglePhoto({
 
     await sendTrackedMessage(chatId, userId, answer, {
       parentMessageId: messageId,
+      turnMessageId: messageId,
       sourceMessageId: messageId,
       media: { type: "photo", fileId, caption },
     });
@@ -2281,6 +2355,7 @@ async function handleReplyToPhoto({
 
     await sendTrackedMessage(chatId, userId, answer, {
       parentMessageId: message.message_id,
+      turnMessageId: message.message_id,
       sourceMessageId: reply.message_id,
       media: { type: "photo", fileId: photo.file_id, caption: reply.caption || "" },
     });
@@ -2584,6 +2659,7 @@ async function handleSticker({ chatId, userId, sticker, messageId = null }) {
         await saveExchange(userId, `[${kind}${emoji ? ` ${emoji}` : ""}]`, answer);
         await sendTrackedMessage(chatId, userId, answer, {
           parentMessageId: messageId,
+          turnMessageId: messageId,
           sourceMessageId: messageId,
           media,
         });
@@ -2591,17 +2667,13 @@ async function handleSticker({ chatId, userId, sticker, messageId = null }) {
       }
     }
 
-    // Если Vision словил 429 или Telegram не дал preview — не шлём пользователю
-    // унылое «Vision перегружен». Реагируем по контексту, не выдумывая картинку.
-    const fallback = await askTextAI({
-      userId,
-      language,
-      webContext: null,
-      text: `Пользователь отправил ${kind}${emoji ? `, связанный emoji: ${emoji}` : ""}. Реального изображения сейчас нет. Не придумывай, что нарисовано. Просто коротко и весело отреагируй как собеседник на текущий контекст: 2–8 слов, можно emoji. Не объясняй технические ограничения.`
-    });
+    // No usable pixels means no visual claim. A text model must never guess
+    // that an unavailable sticker is a cat, Shrek, or a previous image.
+    const fallback = emoji ? `${emoji} понял` : "Понял 😳";
     await saveExchange(userId, `[${kind}${emoji ? ` ${emoji}` : ""}]`, fallback);
     await sendTrackedMessage(chatId, userId, fallback, {
       parentMessageId: messageId,
+      turnMessageId: messageId,
       sourceMessageId: messageId,
       media,
     });
@@ -3002,6 +3074,7 @@ ${transcript ? `Надёжно распознанная речь: ${transcript.s
     await saveExchange(userId, userInstruction || `[${kind}]`, answer);
     await sendTrackedMessage(chatId, userId, answer, {
       parentMessageId: messageId,
+      turnMessageId: messageId,
       sourceMessageId: messageId,
       media: {
         type: kind === "Telegram-кружок" ? "video_note" : "video",
@@ -3108,6 +3181,7 @@ async function tryHandleMediaFollowup({ chatId, userId, text, messageId = null, 
       await saveExchange(userId, text, finalAnswer);
       await sendTrackedMessage(chatId, userId, finalAnswer, {
         parentMessageId: messageId,
+        turnMessageId: messageId,
         sourceMessageId: replyContext?.sourceMessageId || null,
         media: selected[0] || null,
       });
@@ -3123,6 +3197,7 @@ async function tryHandleMediaFollowup({ chatId, userId, text, messageId = null, 
         await saveExchange(userId, text, answer);
         await sendTrackedMessage(chatId, userId, answer, {
           parentMessageId: messageId,
+          turnMessageId: messageId,
           sourceMessageId: replyContext?.sourceMessageId || null,
           media,
         });
@@ -3156,8 +3231,8 @@ async function tryHandleMediaFollowup({ chatId, userId, text, messageId = null, 
       const prompt = `${languageInstruction(language)}
 Это повторный просмотр ${mediaName}.
 Вопрос пользователя: ${text}
-${media.description ? `Ранее было известно: ${String(media.description).slice(0, 1200)}` : "Предыдущего описания нет."}
-Ответь только на вопрос, кратко и конкретно. Если пользователь спрашивает «кто это», назови человека только при уверенности; иначе скажи, что это похоже на конкретного человека, но точно подтвердить нельзя. Если нужная деталь (бренд, логотип, надпись) неразличима — прямо скажи это и не перечисляй варианты.`;
+Не используй предыдущие ответы как доказательство: смотри только на переданный файл.
+Ответь только на вопрос, кратко и конкретно. Если пользователь спрашивает «кто это» о стикере/меме, не называй персонажа или человека, если это не видно однозначно по самому изображению или читаемой подписи. В сомнительном случае ответь: «Не могу точно определить персонажа по этому стикеру». Если нужная деталь (бренд, логотип, надпись) неразличима — прямо скажи это и не перечисляй варианты.`;
 
       // Follow-up question about saved media: really re-open it and let Gemini
       // inspect the frames first. If Gemini fails, Groq Vision is the fallback.
@@ -3167,6 +3242,7 @@ ${media.description ? `Ранее было известно: ${String(media.desc
         userId,
         language,
         preferGemini: true,
+        isolated: true,
       });
 
       if (!isVisionFailure(answer)) {
@@ -3196,6 +3272,7 @@ ${media.description ? `Ранее было известно: ${String(media.desc
     }
     await sendTrackedMessage(chatId, userId, finalAnswer, {
       parentMessageId: messageId,
+      turnMessageId: messageId,
       sourceMessageId: replyContext?.sourceMessageId || null,
       media: selected[0] || null,
     });
@@ -3306,6 +3383,7 @@ async function handleText({
         webContext,
         referenceContext: replyContext.text,
         activeContext,
+        isolatedReply: Boolean(message?.reply_to_message),
       });
 
     await saveExchange(
@@ -3320,6 +3398,7 @@ async function handleText({
 
     await sendTrackedMessage(chatId, userId, answer, {
       parentMessageId: messageId,
+      turnMessageId: messageId,
       sourceMessageId: replyContext.sourceMessageId || activeContext?.sourceMessageId || null,
       media: replyContext.media || null,
       task: activeContext || null,
@@ -3340,7 +3419,7 @@ export async function POST(
 ) {
   try {
     console.log(
-      "AI GUIDE VERSION: 7.8.0 SEMANTIC-CONTEXT-RESOLVER"
+      "AI GUIDE VERSION: 7.8.3 DIRECT-REPLY-MEDIA"
     );
 
     const update =
@@ -3390,6 +3469,8 @@ export async function POST(
     const text =
       message.text?.trim() ||
       "";
+
+    await registerIncomingMessage(userId, message.message_id);
 
     const incomingMedia = message.photo?.length ? {
       type: "photo",
@@ -3752,7 +3833,7 @@ export async function GET() {
 
   return Response.json({
     version:
-      "AI GUIDE VERSION: 7.8.0 SEMANTIC-CONTEXT-RESOLVER",
+      "AI GUIDE VERSION: 7.8.3 DIRECT-REPLY-MEDIA",
 
     status:
       "Bot is running",
