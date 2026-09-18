@@ -13,7 +13,7 @@ const ffmpegPath = path.join(process.cwd(), "ffmpeg-bin", "ffmpeg");
 export const runtime = "nodejs";
 
 // ======================================================
-// AI GUIDE V7.9.6 TEXT-FAILOVER
+// AI GUIDE V7.9.7 MEMES-AND-WEB-IMAGES
 //
 // Groq:
 // - Text: openai/gpt-oss-120b
@@ -772,6 +772,27 @@ async function sendTrackedMessage(chatId, userId, text, context = {}) {
   return sent;
 }
 
+async function sendTrackedPhoto(chatId, userId, photoUrl, caption = "", context = {}) {
+  if (context.turnMessageId && !(await isLatestTurn(userId, context.turnMessageId))) return null;
+  const result = await telegramRequest("sendPhoto", {
+    chat_id: chatId,
+    photo: photoUrl,
+    ...(caption ? { caption: String(caption).slice(0, 1024) } : {}),
+  });
+  if (!result?.ok || !result.result) return null;
+  const sizes = result.result.photo || [];
+  const fileId = sizes[sizes.length - 1]?.file_id || null;
+  await saveMessageNode(userId, {
+    messageId: result.result.message_id,
+    role: "assistant",
+    text: caption || "[Фото из веб-поиска]",
+    parentMessageId: context.parentMessageId || null,
+    sourceMessageId: context.sourceMessageId || null,
+    media: fileId ? { type: "photo", fileId, description: caption || "Фото из веб-поиска" } : null,
+  });
+  return result.result;
+}
+
 
 async function sendChatAction(
   chatId,
@@ -1294,7 +1315,7 @@ function needsInternet(text) {
 // TAVILY
 // ======================================================
 
-async function searchWeb(query) {
+async function searchWeb(query, { includeImages = false } = {}) {
   if (!TAVILY_API_KEY) {
     return null;
   }
@@ -1316,6 +1337,9 @@ async function searchWeb(query) {
           max_results: 7,
           include_answer: true,
           include_raw_content: false,
+          include_images: includeImages,
+          include_image_descriptions: includeImages,
+          safe_search: true,
         }),
       }
     );
@@ -2649,9 +2673,9 @@ async function askStickerVisionAI({ image, language, kind = "стикер", conv
     role: "user",
     content: [
       { type: "text", text: `${lang}
-Это ${kind} из Telegram. Всегда дай короткую живую реакцию на него как собеседник, 2–10 слов. Посмотри на реальные пиксели, а не на emoji стикера.
+Это ${kind} из Telegram. Всегда дай короткую живую МЕМНУЮ реакцию на него как собеседник, 2–14 слов. Посмотри на реальные пиксели, а не на emoji стикера.
 Контекст последних сообщений: ${conversation || "нет"}
-Реагируй на настроение, шутку, приветствие или ситуацию; не превращай реакцию в подробное описание картинки. Не начинай с «вижу», «на изображении», «на стикере». Не выдумывай движение по одному кадру и не упоминай Telegram/API/файл.` },
+Подхвати прикол, настроение, приветствие или ситуацию — как человек в чате, а не как подпись к картинке. Если персонаж или крупный текст видны однозначно, можно их назвать: «Соник в шоке 😂». Если не уверен — не угадывай персонажа. Не превращай реакцию в описание, не начинай с «вижу», «на изображении», «на стикере» и не упоминай Telegram/API/файл.` },
       { type: "image_url", image_url: { url: image.dataUrl } }
     ]
   }];
@@ -3386,6 +3410,24 @@ async function handleConversationTurn({ chatId, userId, text, message }) {
         excerpt: String(item.content || '').slice(0, 3500),
       })) };
     },
+    imageSearch: async query => {
+      const data = await searchWeb(query, { includeImages: true });
+      if (!data) return { error: 'Поиск изображений недоступен.' };
+      const candidates = [
+        ...(Array.isArray(data.images) ? data.images : []),
+        ...(data.results || []).flatMap(item => Array.isArray(item.images) ? item.images : []),
+      ];
+      const images = [];
+      const seen = new Set();
+      for (const item of candidates) {
+        const url = typeof item === 'string' ? item : item?.url;
+        if (typeof url !== 'string' || !/^https:\/\//i.test(url) || seen.has(url)) continue;
+        seen.add(url);
+        images.push({ url, description: typeof item === 'object' ? String(item.description || '') : '' });
+        if (images.length === 8) break;
+      }
+      return images.length ? { images } : { error: 'Подходящих изображений не найдено.' };
+    },
     inspect: async (item, question, mode) => {
       if (mode === 'audio') return getOrRefreshMediaTranscript(userId, item);
       let images = [];
@@ -3408,6 +3450,15 @@ async function handleConversationTurn({ chatId, userId, text, message }) {
   if (result.needsMedia) result = await run(createContext(true));
   if (!(await isLatestTurn(userId, message?.message_id))) return;
   await saveExchange(userId, text, result.text);
+  if (result.imageUrl) {
+    const sent = await sendTrackedPhoto(chatId, userId, result.imageUrl, result.text, {
+      parentMessageId: message?.message_id,
+      turnMessageId: message?.message_id,
+      sourceMessageId: reply.sourceMessageId,
+    });
+    if (sent) return;
+    result.text ||= "Не получилось отправить найденное фото. Попробуй другой запрос.";
+  }
   await sendTrackedMessage(chatId, userId, result.text, {
     parentMessageId: message?.message_id,
     turnMessageId: message?.message_id,
