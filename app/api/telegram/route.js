@@ -13,7 +13,7 @@ const ffmpegPath = path.join(process.cwd(), "ffmpeg-bin", "ffmpeg");
 export const runtime = "nodejs";
 
 // ======================================================
-// AI GUIDE V7.9.5 SINGLE-PASS-CONTEXT
+// AI GUIDE V7.9.6 TEXT-FAILOVER
 //
 // Groq:
 // - Text: openai/gpt-oss-120b
@@ -38,7 +38,7 @@ export const runtime = "nodejs";
 // - Better Telegram-safe math
 //
 // Ordinary VIDEO + video notes supported via FFmpeg frames + Whisper.
-// Gemini is used ONLY as Vision fallback.
+// Gemini is the final fallback for Vision and text.
 // OpenRouter disabled.
 // ======================================================
 
@@ -1709,6 +1709,72 @@ async function requestGeminiVision({
   }
 }
 
+// Text must have an independent provider fallback too.  The prior version only
+// retried two Groq models, so a temporary Groq error stopped the conversation
+// before it could decide to use Tavily search.
+async function requestGeminiText({ messages, temperature = 0.2, maxTokens = 900 }) {
+  if (!GEMINI_API_KEY) {
+    console.error("Gemini Text: GEMINI_API_KEY missing");
+    return { ok: false, status: 0, error: "GEMINI_API_KEY missing", text: null };
+  }
+
+  const systemParts = [];
+  const contents = [];
+  for (const message of messages || []) {
+    const text = typeof message?.content === "string" ? message.content.trim() : "";
+    if (!text) continue;
+    if (message.role === "system") {
+      systemParts.push({ text });
+      continue;
+    }
+    contents.push({
+      role: message.role === "assistant" ? "model" : "user",
+      parts: [{ text }],
+    });
+  }
+
+  if (!contents.length) {
+    return { ok: false, status: 0, error: "No Gemini text contents", text: null };
+  }
+
+  try {
+    const response = await fetch(GEMINI_GENERATE_API, {
+      method: "POST",
+      headers: {
+        "x-goog-api-key": GEMINI_API_KEY,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        ...(systemParts.length ? { systemInstruction: { parts: systemParts } } : {}),
+        contents,
+        generationConfig: {
+          temperature,
+          maxOutputTokens: maxTokens,
+          responseMimeType: "application/json",
+        },
+      }),
+    });
+    const raw = await response.text();
+    console.log(`Gemini Text ${GEMINI_VISION_MODEL}:`, response.status);
+
+    if (!response.ok) {
+      console.error(`Gemini Text ${GEMINI_VISION_MODEL}:`, raw);
+      return { ok: false, status: response.status, error: raw, text: null };
+    }
+
+    const data = JSON.parse(raw);
+    const text = (data?.candidates?.[0]?.content?.parts || [])
+      .map(part => part?.text || "")
+      .join("\n")
+      .trim();
+    if (!text) return { ok: false, status: 200, error: "Gemini returned empty text", text: null };
+    return { ok: true, status: 200, error: null, text, provider: "gemini" };
+  } catch (error) {
+    console.error("Gemini Text exception:", error);
+    return { ok: false, status: 0, error: String(error), text: null };
+  }
+}
+
 async function requestVision({ messages, temperature = 0.1, maxTokens = 1200, preferGemini = false }) {
   console.log(`V7.8.1 DEBUG: requestVision ENTER preferGemini=${preferGemini}`);
   // Follow-up re-analysis: Gemini first, then Groq.
@@ -3305,6 +3371,7 @@ async function handleConversationTurn({ chatId, userId, text, message }) {
   const request = async messages => {
     let response = await requestGroq({ model: TEXT_MODEL, messages, temperature: 0.2, maxTokens: 900, jsonMode: true });
     if (!response.ok || !response.text?.trim()) response = await requestGroq({ model: TEXT_FALLBACK_MODEL, messages, temperature: 0.2, maxTokens: 900, jsonMode: true });
+    if (!response.ok || !response.text?.trim()) response = await requestGeminiText({ messages, temperature: 0.2, maxTokens: 900 });
     if (!response.ok || !response.text?.trim()) throw new Error('Text providers unavailable');
     return response.text;
   };
